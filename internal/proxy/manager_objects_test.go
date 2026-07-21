@@ -24,6 +24,7 @@ import (
 	"go.uber.org/mock/gomock"
 
 	s3be "github.com/afreidah/s3-orchestrator/internal/backend"
+	"github.com/afreidah/s3-orchestrator/internal/compression"
 	"github.com/afreidah/s3-orchestrator/internal/config"
 	"github.com/afreidah/s3-orchestrator/internal/counter"
 	"github.com/afreidah/s3-orchestrator/internal/proxy/object"
@@ -104,6 +105,7 @@ type objectsCalls struct {
 type objRecordCall struct {
 	Key, Backend string
 	Size         int64
+	Meta         *core.EncryptionMeta
 }
 
 func stubObjGetBackend(c *objectsCalls, resp string, err error) func(context.Context, int64, []string) (string, error) {
@@ -130,20 +132,29 @@ func stubObjGetLeastUtilized(c *objectsCalls, resp string, err error) func(conte
 	}
 }
 
+func cloneTestMeta(meta *core.EncryptionMeta) *core.EncryptionMeta {
+	if meta == nil {
+		return nil
+	}
+	clone := *meta
+	clone.EncryptionKey = append([]byte(nil), meta.EncryptionKey...)
+	return &clone
+}
+
 func stubObjRecord(c *objectsCalls, err error) func(context.Context, string, string, int64, *core.EncryptionMeta) ([]core.DeletedCopy, error) {
-	return func(_ context.Context, key, backend string, size int64, _ *core.EncryptionMeta) ([]core.DeletedCopy, error) {
+	return func(_ context.Context, key, backend string, size int64, meta *core.EncryptionMeta) ([]core.DeletedCopy, error) {
 		c.mu.Lock()
 		defer c.mu.Unlock()
-		c.recordObject = append(c.recordObject, objRecordCall{Key: key, Backend: backend, Size: size})
+		c.recordObject = append(c.recordObject, objRecordCall{Key: key, Backend: backend, Size: size, Meta: cloneTestMeta(meta)})
 		return nil, err
 	}
 }
 
 func stubObjRecordAndClear(c *objectsCalls, err error) func(context.Context, string, string, int64, *core.EncryptionMeta, string) ([]core.DeletedCopy, error) {
-	return func(_ context.Context, key, backend string, size int64, _ *core.EncryptionMeta, _ string) ([]core.DeletedCopy, error) {
+	return func(_ context.Context, key, backend string, size int64, meta *core.EncryptionMeta, _ string) ([]core.DeletedCopy, error) {
 		c.mu.Lock()
 		defer c.mu.Unlock()
-		c.recordObject = append(c.recordObject, objRecordCall{Key: key, Backend: backend, Size: size})
+		c.recordObject = append(c.recordObject, objRecordCall{Key: key, Backend: backend, Size: size, Meta: cloneTestMeta(meta)})
 		return nil, err
 	}
 }
@@ -295,6 +306,202 @@ func TestPutObject_Success(t *testing.T) {
 	call := c.recordObject[0]
 	if call.Key != "mykey" || call.Backend != "b1" || call.Size != 5 {
 		t.Errorf("RecordObject called with %+v", call)
+	}
+}
+
+// TestTransparentCompression_PutGetHeadAndRange pins the public S3 contract:
+// backends and quota metadata see physical compressed bytes while clients see
+// the original body, original length, and logical byte ranges.
+func TestTransparentCompression_PutGetHeadAndRange(t *testing.T) {
+	t.Parallel()
+
+	backend := newMockBackend()
+	store := storetest.NewMockMetadataStore(gomock.NewController(t))
+	calls := objectsStubs(store)
+	store.EXPECT().GetBackendWithSpace(gomock.Any(), gomock.Any(), gomock.Any()).
+		DoAndReturn(stubObjGetBackend(calls, "b1", nil)).AnyTimes()
+	store.EXPECT().GetLeastUtilizedBackend(gomock.Any(), gomock.Any(), gomock.Any()).
+		DoAndReturn(stubObjGetLeastUtilized(calls, "b1", nil)).AnyTimes()
+	var readLocations []core.ObjectLocation
+	store.EXPECT().GetAllObjectLocations(gomock.Any(), gomock.Any()).
+		DoAndReturn(func(_ context.Context, _ string) ([]core.ObjectLocation, error) { return readLocations, nil }).AnyTimes()
+	storetest.Permissive(store)
+	mgr := newTestBackendManager(t, &BackendManagerConfig{
+		Storage: StorageDeps{
+			Backends: map[string]s3be.ObjectBackend{"b1": backend},
+			Order:    []string{"b1"},
+		},
+		Stores: StoreDeps{Metadata: testStoresFromMock(store), Dashboard: store},
+		Policies: PolicyConfig{
+			PendingEnabled:  true,
+			CacheTTL:        5 * time.Second,
+			BackendTimeout:  30 * time.Second,
+			RoutingStrategy: config.RoutingPack,
+		},
+		Features: FeatureDeps{
+			Compressor:       compression.New(3),
+			CompressWrites:   true,
+			CompressionLevel: 3,
+		},
+		Operations: OperationalDeps{Metrics: store},
+	})
+
+	original := bytes.Repeat([]byte("transparent-compression-contract\n"), 4096)
+	const key = "compressed.txt"
+	if _, err := mgr.objectManager.PutObject(context.Background(), key, bytes.NewReader(original), int64(len(original)), "text/plain", nil); err != nil {
+		t.Fatalf("PutObject: %v", err)
+	}
+
+	backend.mu.Lock()
+	stored := append([]byte(nil), backend.objects[key].data...)
+	backend.mu.Unlock()
+	if len(stored) >= len(original) {
+		t.Fatalf("stored size = %d, want smaller than logical size %d", len(stored), len(original))
+	}
+	if bytes.Equal(stored, original) {
+		t.Fatal("backend unexpectedly stored the original plaintext bytes")
+	}
+	if len(calls.recordObject) != 1 {
+		t.Fatalf("RecordObject calls = %d, want 1", len(calls.recordObject))
+	}
+	recorded := calls.recordObject[0]
+	if recorded.Size != int64(len(stored)) {
+		t.Fatalf("recorded physical size = %d, want %d", recorded.Size, len(stored))
+	}
+	if recorded.Meta == nil || recorded.Meta.CompressionAlgorithm != compression.AlgorithmZstd ||
+		recorded.Meta.CompressionLevel != 3 || recorded.Meta.CompressionVersion != compression.FormatVersion ||
+		recorded.Meta.LogicalSize != int64(len(original)) {
+		t.Fatalf("recorded compression metadata = %+v", recorded.Meta)
+	}
+
+	loc := core.ObjectLocation{
+		ObjectKey:            key,
+		BackendName:          "b1",
+		SizeBytes:            recorded.Size,
+		CompressionAlgorithm: recorded.Meta.CompressionAlgorithm,
+		CompressionLevel:     recorded.Meta.CompressionLevel,
+		CompressionVersion:   recorded.Meta.CompressionVersion,
+		LogicalSize:          recorded.Meta.LogicalSize,
+	}
+	readLocations = []core.ObjectLocation{loc}
+
+	got, err := mgr.objectManager.GetObject(context.Background(), key, "")
+	if err != nil {
+		t.Fatalf("GetObject: %v", err)
+	}
+	body, err := io.ReadAll(got.Body)
+	if err != nil {
+		t.Fatalf("read GET body: %v", err)
+	}
+	if err := got.Body.Close(); err != nil {
+		t.Fatalf("close GET body: %v", err)
+	}
+	if !bytes.Equal(body, original) || got.Size != int64(len(original)) {
+		t.Fatalf("GET returned %d bytes (size=%d), want %d", len(body), got.Size, len(original))
+	}
+
+	head, err := mgr.objectManager.HeadObject(context.Background(), key)
+	if err != nil {
+		t.Fatalf("HeadObject: %v", err)
+	}
+	if head.Size != int64(len(original)) {
+		t.Fatalf("HEAD size = %d, want %d", head.Size, len(original))
+	}
+
+	const start, end = int64(37), int64(113)
+	ranged, err := mgr.objectManager.GetObject(context.Background(), key, fmt.Sprintf("bytes=%d-%d", start, end))
+	if err != nil {
+		t.Fatalf("ranged GetObject: %v", err)
+	}
+	rangeBody, err := io.ReadAll(ranged.Body)
+	if err != nil {
+		t.Fatalf("read ranged body: %v", err)
+	}
+	_ = ranged.Body.Close()
+	if !bytes.Equal(rangeBody, original[start:end+1]) {
+		t.Fatal("ranged GET did not return the requested logical plaintext slice")
+	}
+	if ranged.Size != end-start+1 || ranged.ContentRange != fmt.Sprintf("bytes %d-%d/%d", start, end, len(original)) {
+		t.Fatalf("range metadata size=%d content-range=%q", ranged.Size, ranged.ContentRange)
+	}
+}
+
+// TestTransparentCompression_BeforeEncryption verifies the composed
+// representation stores a compressed plaintext length inside the encryption
+// metadata and reverses both transforms on GET.
+func TestTransparentCompression_BeforeEncryption(t *testing.T) {
+	t.Parallel()
+
+	provider, err := encryption.NewConfigKeyProvider("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", "test-0")
+	if err != nil {
+		t.Fatalf("NewConfigKeyProvider: %v", err)
+	}
+	encryptor, err := encryption.NewEncryptor(provider, 64*1024)
+	if err != nil {
+		t.Fatalf("NewEncryptor: %v", err)
+	}
+
+	backend := newMockBackend()
+	store := storetest.NewMockMetadataStore(gomock.NewController(t))
+	calls := objectsStubs(store)
+	store.EXPECT().GetBackendWithSpace(gomock.Any(), gomock.Any(), gomock.Any()).
+		DoAndReturn(stubObjGetBackend(calls, "b1", nil)).AnyTimes()
+	store.EXPECT().GetLeastUtilizedBackend(gomock.Any(), gomock.Any(), gomock.Any()).
+		DoAndReturn(stubObjGetLeastUtilized(calls, "b1", nil)).AnyTimes()
+	var readLocations []core.ObjectLocation
+	store.EXPECT().GetAllObjectLocations(gomock.Any(), gomock.Any()).
+		DoAndReturn(func(_ context.Context, _ string) ([]core.ObjectLocation, error) { return readLocations, nil }).AnyTimes()
+	storetest.Permissive(store)
+
+	mgr := newTestBackendManager(t, &BackendManagerConfig{
+		Storage: StorageDeps{Backends: map[string]s3be.ObjectBackend{"b1": backend}, Order: []string{"b1"}},
+		Stores:  StoreDeps{Metadata: testStoresFromMock(store), Dashboard: store},
+		Policies: PolicyConfig{
+			PendingEnabled: true, CacheTTL: 5 * time.Second, BackendTimeout: 30 * time.Second, RoutingStrategy: config.RoutingPack,
+		},
+		Features: FeatureDeps{
+			Encryptor: encryptor, Compressor: compression.New(3), CompressWrites: true, CompressionLevel: 3,
+		},
+		Operations: OperationalDeps{Metrics: store},
+	})
+
+	original := bytes.Repeat([]byte("compress-before-encrypt\n"), 4096)
+	const key = "compressed-encrypted.txt"
+	if _, err := mgr.objectManager.PutObject(context.Background(), key, bytes.NewReader(original), int64(len(original)), "text/plain", nil); err != nil {
+		t.Fatalf("PutObject: %v", err)
+	}
+	if len(calls.recordObject) != 1 || calls.recordObject[0].Meta == nil {
+		t.Fatalf("recorded calls = %+v", calls.recordObject)
+	}
+	recorded := calls.recordObject[0]
+	meta := recorded.Meta
+	if !meta.Encrypted || !meta.Compressed() || meta.LogicalSize != int64(len(original)) {
+		t.Fatalf("composed metadata = %+v", meta)
+	}
+	if meta.PlaintextSize <= 0 || meta.PlaintextSize >= meta.LogicalSize {
+		t.Fatalf("encrypted input size = %d, want compressed size below logical %d", meta.PlaintextSize, meta.LogicalSize)
+	}
+	if recorded.Size <= meta.PlaintextSize {
+		t.Fatalf("ciphertext size = %d, want larger than compressed plaintext %d", recorded.Size, meta.PlaintextSize)
+	}
+
+	readLocations = []core.ObjectLocation{{
+		ObjectKey: key, BackendName: "b1", SizeBytes: recorded.Size, Encrypted: true,
+		EncryptionKey: meta.EncryptionKey, KeyID: meta.KeyID, PlaintextSize: meta.PlaintextSize,
+		CompressionAlgorithm: meta.CompressionAlgorithm, CompressionLevel: meta.CompressionLevel,
+		CompressionVersion: meta.CompressionVersion, LogicalSize: meta.LogicalSize,
+	}}
+	got, err := mgr.objectManager.GetObject(context.Background(), key, "")
+	if err != nil {
+		t.Fatalf("GetObject: %v", err)
+	}
+	body, err := io.ReadAll(got.Body)
+	if err != nil {
+		t.Fatalf("read GET body: %v", err)
+	}
+	_ = got.Body.Close()
+	if !bytes.Equal(body, original) || got.Size != int64(len(original)) {
+		t.Fatalf("decoded GET size=%d bytes=%d, want %d", got.Size, len(body), len(original))
 	}
 }
 

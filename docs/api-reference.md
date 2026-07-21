@@ -406,8 +406,8 @@ Returns all copies of an object across backends. Backs the `s3-orchestrator tui`
 {
   "key": "my-bucket/path/to/file.txt",
   "locations": [
-    {"backend": "oci", "size_bytes": 51200, "created_at": "2026-01-15T10:30:00Z", "encrypted": true, "key_id": "config-0", "plaintext_size": 51100, "content_hash": "9f3a...c1"},
-    {"backend": "r2", "size_bytes": 51200, "created_at": "2026-01-15T10:35:00Z", "encrypted": true, "key_id": "config-0", "plaintext_size": 51100, "content_hash": "9f3a...c1"}
+    {"backend": "oci", "size_bytes": 18432, "created_at": "2026-01-15T10:30:00Z", "encrypted": true, "key_id": "config-0", "plaintext_size": 18384, "content_hash": "9f3a...c1", "compression_algorithm": "zstd", "compression_level": 3, "compression_version": 1, "logical_size": 51100},
+    {"backend": "r2", "size_bytes": 18432, "created_at": "2026-01-15T10:35:00Z", "encrypted": true, "key_id": "config-0", "plaintext_size": 18384, "content_hash": "9f3a...c1", "compression_algorithm": "zstd", "compression_level": 3, "compression_version": 1, "logical_size": 51100}
   ]
 }
 ```
@@ -415,14 +415,18 @@ Returns all copies of an object across backends. Backs the `s3-orchestrator tui`
 Each `locations[]` entry describes one backend copy:
 
 - `backend` — the backend the copy lives on.
-- `size_bytes` — stored object size (ciphertext size when the copy is encrypted).
+- `size_bytes` — physical bytes stored on the backend (ciphertext size when encrypted, compressed-frame size when compressed without encryption).
 - `created_at` — when the copy was recorded.
 - `encrypted` — whether the copy is envelope-encrypted.
 - `key_id` — id of the master key that wrapped the copy's data-encryption key (empty when not encrypted).
-- `plaintext_size` — original object size before encryption.
-- `content_hash` — SHA-256 of the plaintext, once a hash has been computed.
+- `plaintext_size` — bytes entering the encryption stage. For compressed-and-encrypted objects this is the compressed size; for legacy encrypted objects it is the original object size.
+- `content_hash` — SHA-256 of the original client-visible bytes, once a hash has been computed.
+- `compression_algorithm` — stored compression format (`zstd` for format version 1); omitted for uncompressed copies.
+- `compression_level` — Zstandard level used when this representation was written.
+- `compression_version` — orchestrator compression-container version.
+- `logical_size` — original client-visible S3 object size; present for compressed copies.
 
-The response carries encryption *metadata* only. The wrapped data-encryption key and any raw key material are never serialized; only `encrypted` and `key_id` are exposed.
+The response carries representation *metadata* only. Wrapped data-encryption keys and raw key material are never serialized.
 
 ### GET /admin/api/objects
 

@@ -17,28 +17,75 @@ import "time"
 // OBJECT METADATA
 // -------------------------------------------------------------------------
 
-// EncryptionMeta carries envelope-encryption metadata stored alongside an
-// object location. The zero value represents an unencrypted object.
+// EncryptionMeta carries persisted representation metadata stored alongside an
+// object location. The historical name is retained to avoid churning every
+// write-path API; the zero value is an ordinary unencrypted, uncompressed object.
 type EncryptionMeta struct {
-	Encrypted     bool
-	EncryptionKey []byte
-	KeyID         string
-	PlaintextSize int64
-	ContentHash   string
+	Encrypted            bool
+	EncryptionKey        []byte
+	KeyID                string
+	PlaintextSize        int64
+	ContentHash          string
+	CompressionAlgorithm string
+	CompressionLevel     int
+	CompressionVersion   int
+	LogicalSize          int64
+}
+
+// Compressed reports whether metadata describes a compressed representation.
+func (m *EncryptionMeta) Compressed() bool {
+	return m != nil && m.CompressionAlgorithm != ""
 }
 
 // ObjectLocation records that a backend currently holds a copy of a key,
-// along with the size and any encryption or integrity metadata.
+// along with its physical size and persisted representation metadata.
 type ObjectLocation struct {
-	ObjectKey     string
-	BackendName   string
-	SizeBytes     int64
-	CreatedAt     time.Time
-	Encrypted     bool
-	EncryptionKey []byte
-	KeyID         string
-	PlaintextSize int64
-	ContentHash   string
+	ObjectKey            string
+	BackendName          string
+	SizeBytes            int64
+	CreatedAt            time.Time
+	Encrypted            bool
+	EncryptionKey        []byte
+	KeyID                string
+	PlaintextSize        int64
+	ContentHash          string
+	CompressionAlgorithm string
+	CompressionLevel     int
+	CompressionVersion   int
+	LogicalSize          int64
+}
+
+// Compressed reports whether this location stores a compressed representation.
+func (l ObjectLocation) Compressed() bool { return l.CompressionAlgorithm != "" }
+
+// ClientSize returns the original byte count exposed through S3. For encrypted
+// compressed objects PlaintextSize is the compressed input to encryption, so
+// LogicalSize takes precedence.
+func (l ObjectLocation) ClientSize() int64 {
+	switch {
+	case l.Compressed():
+		return l.LogicalSize
+	case l.Encrypted:
+		return l.PlaintextSize
+	default:
+		return l.SizeBytes
+	}
+}
+
+// RepresentationMeta returns all metadata that must survive a raw stored-byte
+// copy. Nil means the location has no encryption, integrity, or compression state.
+func (l ObjectLocation) RepresentationMeta() *EncryptionMeta {
+	if !l.Encrypted && l.ContentHash == "" && !l.Compressed() {
+		return nil
+	}
+	return &EncryptionMeta{
+		Encrypted: l.Encrypted, EncryptionKey: l.EncryptionKey, KeyID: l.KeyID,
+		PlaintextSize: l.PlaintextSize, ContentHash: l.ContentHash,
+		CompressionAlgorithm: l.CompressionAlgorithm,
+		CompressionLevel:     l.CompressionLevel,
+		CompressionVersion:   l.CompressionVersion,
+		LogicalSize:          l.LogicalSize,
+	}
 }
 
 // ExistingCopy is the projection of an object_locations row that promotion
@@ -65,16 +112,20 @@ type DeletedCopy struct {
 // commit so a DB outage between PUT and RecordObject cannot silently
 // destroy the prior copy of an overwritten key.
 type PendingObject struct {
-	IntentID      string
-	ObjectKey     string
-	BackendName   string
-	SizeBytes     int64
-	Encrypted     bool
-	EncryptionKey []byte
-	KeyID         string
-	PlaintextSize int64
-	ContentHash   string
-	CreatedAt     time.Time
+	IntentID             string
+	ObjectKey            string
+	BackendName          string
+	SizeBytes            int64
+	Encrypted            bool
+	EncryptionKey        []byte
+	KeyID                string
+	PlaintextSize        int64
+	ContentHash          string
+	CompressionAlgorithm string
+	CompressionLevel     int
+	CompressionVersion   int
+	LogicalSize          int64
+	CreatedAt            time.Time
 }
 
 // PendingPromoteResult describes how PromotePending resolved an intent.
@@ -253,20 +304,28 @@ type EncryptedLocation struct {
 
 // UnencryptedLocation represents an unencrypted object location.
 type UnencryptedLocation struct {
-	ObjectKey   string
-	BackendName string
-	SizeBytes   int64
+	ObjectKey            string
+	BackendName          string
+	SizeBytes            int64
+	CompressionAlgorithm string
+	CompressionLevel     int
+	CompressionVersion   int
+	LogicalSize          int64
 }
 
 // DecryptableLocation represents an encrypted object location with all
 // metadata needed for decryption.
 type DecryptableLocation struct {
-	ObjectKey     string
-	BackendName   string
-	SizeBytes     int64
-	EncryptionKey []byte
-	KeyID         string
-	PlaintextSize int64
+	ObjectKey            string
+	BackendName          string
+	SizeBytes            int64
+	EncryptionKey        []byte
+	KeyID                string
+	PlaintextSize        int64
+	CompressionAlgorithm string
+	CompressionLevel     int
+	CompressionVersion   int
+	LogicalSize          int64
 }
 
 // -------------------------------------------------------------------------

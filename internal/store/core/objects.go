@@ -213,14 +213,14 @@ func MoveObjectLocation(ctx context.Context, runner Runner, key, fromBackend, to
 			return 0, err
 		}
 		dest := &ObjectLocation{
-			ObjectKey:     key,
-			BackendName:   toBackend,
-			SizeBytes:     src.SizeBytes,
-			Encrypted:     src.Encrypted,
-			EncryptionKey: src.EncryptionKey,
-			KeyID:         src.KeyID,
-			PlaintextSize: src.PlaintextSize,
-			ContentHash:   src.ContentHash,
+			ObjectKey: key, BackendName: toBackend, SizeBytes: src.SizeBytes,
+			Encrypted: src.Encrypted, EncryptionKey: src.EncryptionKey,
+			KeyID: src.KeyID, PlaintextSize: src.PlaintextSize,
+			ContentHash:          src.ContentHash,
+			CompressionAlgorithm: src.CompressionAlgorithm,
+			CompressionLevel:     src.CompressionLevel,
+			CompressionVersion:   src.CompressionVersion,
+			LogicalSize:          src.LogicalSize,
 		}
 		if err := tx.InsertObjectLocation(ctx, dest); err != nil {
 			return 0, err

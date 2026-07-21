@@ -1909,7 +1909,7 @@ func TestVerifySchemaVersion_OlderThanExpected(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 
-	// expectedSchemaVersion is 2, so 1 is older.
+	// Version 1 is older than every supported schema version.
 	if _, err := s.db.ExecContext(ctx, `UPDATE schema_version SET version = 1`); err != nil {
 		t.Fatalf("downgrade schema version: %v", err)
 	}

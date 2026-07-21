@@ -111,13 +111,17 @@ func objectLocationsResponse(key string, locations []core.ObjectLocation) admina
 	resp := adminapi.ObjectLocationsResponse{Key: key}
 	for i := range locations {
 		resp.Locations = append(resp.Locations, adminapi.ObjectLocation{
-			Backend:       locations[i].BackendName,
-			SizeBytes:     locations[i].SizeBytes,
-			CreatedAt:     locations[i].CreatedAt,
-			Encrypted:     locations[i].Encrypted,
-			KeyID:         locations[i].KeyID,
-			PlaintextSize: locations[i].PlaintextSize,
-			ContentHash:   locations[i].ContentHash,
+			Backend:              locations[i].BackendName,
+			SizeBytes:            locations[i].SizeBytes,
+			CreatedAt:            locations[i].CreatedAt,
+			Encrypted:            locations[i].Encrypted,
+			KeyID:                locations[i].KeyID,
+			PlaintextSize:        locations[i].PlaintextSize,
+			ContentHash:          locations[i].ContentHash,
+			CompressionAlgorithm: locations[i].CompressionAlgorithm,
+			CompressionLevel:     locations[i].CompressionLevel,
+			CompressionVersion:   locations[i].CompressionVersion,
+			LogicalSize:          locations[i].LogicalSize,
 		})
 	}
 	return resp

@@ -75,6 +75,11 @@ replication:
   concurrency: 4
   worker_interval: "10s"
 
+# --- Transparent Zstandard compression (disabled by default) ---
+# compression:
+#   enabled: true
+#   level: 3
+
 # --- Prometheus metrics ---
 telemetry:
   metrics:

@@ -31,8 +31,8 @@ import (
 // finalizePutSuccess emits success metrics, audit log, and an event
 // notification for a successful PutObject. Records failover spans when
 // retries occurred.
-func (o *Manager) finalizePutSuccess(ctx context.Context, span trace.Span, operation, key, backendName string, size int64, start time.Time, failedBackends []string) {
-	o.core.Acct().PutSuccess(operation, backendName, size, start)
+func (o *Manager) finalizePutSuccess(ctx context.Context, span trace.Span, operation, key, backendName string, storedSize, logicalSize int64, start time.Time, failedBackends []string) {
+	o.core.Acct().PutSuccess(operation, backendName, storedSize, start)
 	if len(failedBackends) > 0 {
 		for _, fb := range failedBackends {
 			telemetry.WriteFailoverTotal.WithLabelValues(operation, fb, backendName).Inc()
@@ -40,7 +40,7 @@ func (o *Manager) finalizePutSuccess(ctx context.Context, span trace.Span, opera
 		span.SetAttributes(telemetry.AttrWriteFailover.Bool(true))
 		span.SetAttributes(telemetry.AttrFailoverAttempts.Int(len(failedBackends)))
 	}
-	pobserve.PutCompleted(ctx, span, key, backendName, size)
+	pobserve.PutCompleted(ctx, span, key, backendName, logicalSize)
 	o.invalidateObjectCaches(key)
 }
 

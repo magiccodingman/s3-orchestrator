@@ -39,15 +39,16 @@ func intentSuperseded(existing []ExistingCopy, intentCreatedAt time.Time) bool {
 // metadata as the original PUT recorded. Returns nil when the pending row
 // carries no encryption or hash metadata.
 func pendingEncryptionMeta(p *PendingObject) *EncryptionMeta {
-	if !p.Encrypted && p.ContentHash == "" {
+	if !p.Encrypted && p.ContentHash == "" && p.CompressionAlgorithm == "" {
 		return nil
 	}
 	return &EncryptionMeta{
-		Encrypted:     p.Encrypted,
-		EncryptionKey: p.EncryptionKey,
-		KeyID:         p.KeyID,
-		PlaintextSize: p.PlaintextSize,
-		ContentHash:   p.ContentHash,
+		Encrypted: p.Encrypted, EncryptionKey: p.EncryptionKey, KeyID: p.KeyID,
+		PlaintextSize: p.PlaintextSize, ContentHash: p.ContentHash,
+		CompressionAlgorithm: p.CompressionAlgorithm,
+		CompressionLevel:     p.CompressionLevel,
+		CompressionVersion:   p.CompressionVersion,
+		LogicalSize:          p.LogicalSize,
 	}
 }
 
@@ -71,6 +72,10 @@ func objectFromEnc(key, backend string, size int64, enc *EncryptionMeta) *Object
 	if enc.ContentHash != "" {
 		loc.ContentHash = enc.ContentHash
 	}
+	loc.CompressionAlgorithm = enc.CompressionAlgorithm
+	loc.CompressionLevel = enc.CompressionLevel
+	loc.CompressionVersion = enc.CompressionVersion
+	loc.LogicalSize = enc.LogicalSize
 	return loc
 }
 

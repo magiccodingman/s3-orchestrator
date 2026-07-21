@@ -23,11 +23,15 @@ type ObjectLocationsResponse struct {
 // key is deliberately omitted from the wire; only the encrypted flag and the
 // key id are exposed so a secret never leaves the process.
 type ObjectLocation struct {
-	Backend       string    `json:"backend"`
-	SizeBytes     int64     `json:"size_bytes"`
-	CreatedAt     time.Time `json:"created_at"`
-	Encrypted     bool      `json:"encrypted"`
-	KeyID         string    `json:"key_id,omitempty"`
-	PlaintextSize int64     `json:"plaintext_size"`
-	ContentHash   string    `json:"content_hash,omitempty"`
+	Backend              string    `json:"backend"`
+	SizeBytes            int64     `json:"size_bytes"`
+	CreatedAt            time.Time `json:"created_at"`
+	Encrypted            bool      `json:"encrypted"`
+	KeyID                string    `json:"key_id,omitempty"`
+	PlaintextSize        int64     `json:"plaintext_size"`
+	ContentHash          string    `json:"content_hash,omitempty"`
+	CompressionAlgorithm string    `json:"compression_algorithm,omitempty"`
+	CompressionLevel     int       `json:"compression_level,omitempty"`
+	CompressionVersion   int       `json:"compression_version,omitempty"`
+	LogicalSize          int64     `json:"logical_size,omitempty"`
 }

@@ -3,11 +3,10 @@
 //
 // Author: Alex Freidah
 //
-// PutObject orchestration: body materialization, write failover across
-// eligible backends, per-attempt payload construction (encryption + integrity
-// hash), pending-intent recovery, and drain-race close. Successful PUT
-// finalization (accounting + observability + cache invalidation) lives in
-// mutation_finalize.go.
+// PutObject orchestration: body materialization, optional whole-object Zstandard
+// compression, write failover across eligible backends, per-attempt encryption,
+// pending-intent recovery, and drain-race close. Compression is prepared once and
+// replayed across retries; encryption retains fresh-nonce retry semantics.
 // -------------------------------------------------------------------------------
 
 package object
@@ -20,6 +19,7 @@ import (
 	"io"
 	"time"
 
+	"github.com/afreidah/s3-orchestrator/internal/compression"
 	"github.com/afreidah/s3-orchestrator/internal/observe"
 	"github.com/afreidah/s3-orchestrator/internal/observe/telemetry"
 	"github.com/afreidah/s3-orchestrator/internal/store/core"
@@ -28,46 +28,68 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
+// preparedPutBody is the replayable representation that enters optional
+// encryption. StorageInputSize preserves the historical declared size for
+// ordinary writes and records the actual encoded size for compressed writes;
+// LogicalSize is always the client-visible byte count.
+type preparedPutBody struct {
+	Body             *materialize.Body
+	StorageInputSize int64
+	LogicalSize      int64
+	ContentHash      string
+	Meta             *core.EncryptionMeta
+}
+
+func (p *preparedPutBody) Cleanup() { p.Body.Cleanup() }
+
 // PutObject uploads an object to the first backend with available quota.
-// If the upload fails, it retries on remaining eligible backends before
-// returning an error to the caller (write failover).
 func (o *Manager) PutObject(ctx context.Context, key string, body io.Reader, size int64, contentType string, metadata map[string]string) (string, error) {
 	const operation = "PutObject"
 	start := time.Now()
-
 	ctx, span := telemetry.StartSpan(ctx, managerSpanPrefix+operation,
-		telemetry.AttrObjectKey.String(key),
-		telemetry.AttrObjectSize.Int64(size),
-	)
+		telemetry.AttrObjectKey.String(key), telemetry.AttrObjectSize.Int64(size))
 	defer span.End()
 
-	eligible := o.core.EligibleForWrite(1, 0, size)
-	if len(eligible) == 0 {
-		telemetry.UsageLimitRejectionsTotal.WithLabelValues(operation, "write").Inc()
-		observe.MarkSpanError(span, "usage limits exceeded on all backends")
-		return "", core.ErrInsufficientStorage
+	// Preserve the early historical eligibility check for uncompressed writes.
+	// Compressed writes cannot know their backend ingress size until the stream
+	// has been encoded, so they perform the authoritative check below.
+	var eligible []string
+	if !o.compressWrites {
+		eligible = o.core.EligibleForWrite(1, 0, size)
+		if len(eligible) == 0 {
+			telemetry.UsageLimitRejectionsTotal.WithLabelValues(operation, "write").Inc()
+			observe.MarkSpanError(span, "usage limits exceeded on all backends")
+			return "", core.ErrInsufficientStorage
+		}
 	}
 
-	mbody, contentHash, err := o.bufferPutBody(span, body, size)
+	prepared, err := o.preparePutBody(span, body, size)
 	if err != nil {
 		return "", err
 	}
-	defer mbody.Cleanup()
+	defer prepared.Cleanup()
 
-	// DEK caching: encryptForPut wraps a fresh DEK on first call and
-	// reuses it on retries with a new base nonce, sparing the KeyProvider
-	// during failover storms.
+	// Compression materially changes backend ingress and quota size. Use the
+	// encoded size for the authoritative policy check and backend selection.
+	if prepared.Meta != nil && prepared.Meta.Compressed() {
+		eligible = o.core.EligibleForWrite(1, 0, prepared.Body.Size())
+		if len(eligible) == 0 {
+			telemetry.UsageLimitRejectionsTotal.WithLabelValues(operation, "write").Inc()
+			observe.MarkSpanError(span, "compressed object exceeds backend limits")
+			return "", core.ErrInsufficientStorage
+		}
+	}
+
 	var dekState putEncryptState
 	var failedBackends []string
 	var lastErr error
-
 	for len(eligible) > 0 {
-		res := o.attemptPutOnBackend(ctx, span, operation, key, mbody, size, contentType, metadata, contentHash, &dekState, eligible)
+		res := o.attemptPutOnBackend(ctx, span, operation, key, prepared, contentType, metadata, &dekState, eligible)
 		if res.fatalErr != nil {
 			return "", res.fatalErr
 		}
 		if res.putErr == nil {
-			o.finalizePutSuccess(ctx, span, operation, key, res.backend, size, start, failedBackends)
+			o.finalizePutSuccess(ctx, span, operation, key, res.backend, res.storedSize, prepared.LogicalSize, start, failedBackends)
 			return res.etag, nil
 		}
 		lastErr = res.putErr
@@ -77,32 +99,55 @@ func (o *Manager) PutObject(ctx context.Context, key string, body io.Reader, siz
 			"key", key, "failed_backend", res.backend, "error", res.putErr,
 			"remaining_backends", len(eligible))
 	}
-
 	observe.RecordSpanError(span, lastErr)
 	return "", lastErr
 }
 
-// putAttemptResult conveys the outcome of one backend PUT attempt back to
-// the failover loop. A non-nil fatalErr terminates the call. A non-nil
-// putErr signals a backend-side failure that should drop the chosen
-// backend and retry on the remainder.
 type putAttemptResult struct {
-	backend  string
-	etag     string
-	fatalErr error
-	putErr   error
+	backend    string
+	etag       string
+	storedSize int64
+	fatalErr   error
+	putErr     error
 }
 
-// bufferPutBody materializes the request body into a seekable form
-// (memory for small payloads, tempfile above materialize.MemThreshold)
-// so failover retries can replay the plaintext without holding the
-// full body on the heap. When integrity verification is enabled, the
-// SHA-256 is computed during the same single buffering pass via
-// io.MultiWriter so the body is not re-scanned after materialization.
-//
-// Returns the materialized body, the content hash (empty when
-// integrity verification is disabled), and a cleanup the caller must
-// invoke once the upload settles (safe to defer in every code path).
+func (o *Manager) preparePutBody(span trace.Span, body io.Reader, size int64) (*preparedPutBody, error) {
+	if !o.compressWrites {
+		mb, contentHash, err := o.bufferPutBody(span, body, size)
+		if err != nil {
+			return nil, err
+		}
+		return &preparedPutBody{Body: mb, StorageInputSize: size, LogicalSize: size, ContentHash: contentHash}, nil
+	}
+
+	// Stream the inbound plaintext directly through the hasher and compressor
+	// into the replayable encoded body. We never retain both a plaintext and a
+	// compressed materialization, which bounds disk/RAM use to one stored copy.
+	var hasher hash.Hash
+	icfg := o.integrityCfg.Load()
+	if icfg != nil && icfg.Enabled {
+		hasher = newSHA256()
+		body = io.TeeReader(body, hasher)
+	}
+	compressed, err := o.compressor.Compress(body, size)
+	if err != nil {
+		observe.RecordSpanError(span, err)
+		return nil, err
+	}
+	return &preparedPutBody{
+		Body:             compressed,
+		StorageInputSize: compressed.Size(),
+		LogicalSize:      size,
+		ContentHash:      sha256Hex(hasher),
+		Meta: &core.EncryptionMeta{
+			CompressionAlgorithm: compression.AlgorithmZstd,
+			CompressionLevel:     o.compressionLevel,
+			CompressionVersion:   compression.FormatVersion,
+			LogicalSize:          size,
+		},
+	}, nil
+}
+
 func (o *Manager) bufferPutBody(span trace.Span, body io.Reader, size int64) (*materialize.Body, string, error) {
 	var hasher hash.Hash
 	icfg := o.integrityCfg.Load()
@@ -117,32 +162,24 @@ func (o *Manager) bufferPutBody(span trace.Span, body io.Reader, size int64) (*m
 	return mb, sha256Hex(hasher), nil
 }
 
-// attemptPutOnBackend performs one backend PUT attempt: select a
-// destination, prepare the payload (encrypt/hash), insert a pending
-// intent, upload, then promote the intent on success.
-func (o *Manager) attemptPutOnBackend(ctx context.Context, span trace.Span, operation, key string, body *materialize.Body, size int64, contentType string, metadata map[string]string, contentHash string, dekState *putEncryptState, eligible []string) putAttemptResult {
-	backendName, err := o.coord.SelectBackendForWrite(ctx, size, eligible)
+func (o *Manager) attemptPutOnBackend(ctx context.Context, span trace.Span, operation, key string, prepared *preparedPutBody, contentType string, metadata map[string]string, dekState *putEncryptState, eligible []string) putAttemptResult {
+	inputSize := prepared.StorageInputSize
+	backendName, err := o.coord.SelectBackendForWrite(ctx, inputSize, eligible)
 	if err != nil {
 		return putAttemptResult{fatalErr: o.core.ClassifyWriteError(span, operation, err)}
 	}
 	span.SetAttributes(telemetry.AttrBackendName.String(backendName))
-
 	be, err := o.core.GetBackend(backendName)
 	if err != nil {
 		observe.RecordSpanError(span, err)
 		return putAttemptResult{backend: backendName, fatalErr: err}
 	}
 
-	uploadBody, uploadSize, enc, err := o.buildPutPayload(ctx, body, size, contentHash, dekState)
+	uploadBody, uploadSize, enc, err := o.buildPutPayload(ctx, prepared, dekState)
 	if err != nil {
 		observe.RecordSpanError(span, err)
 		return putAttemptResult{backend: backendName, fatalErr: err}
 	}
-
-	// Insert the pending intent before the backend PUT so a metadata
-	// commit failure after the bytes land has a recovery breadcrumb: the
-	// pending reaper promotes the intent on a later tick instead of the
-	// old failure path silently deleting the just-written copy.
 	intentID, err := o.coord.InsertPendingIntent(ctx, key, backendName, uploadSize, enc)
 	if err != nil {
 		observe.RecordSpanError(span, err)
@@ -154,73 +191,64 @@ func (o *Manager) attemptPutOnBackend(ctx context.Context, span trace.Span, oper
 	bcancel()
 	if err != nil {
 		o.core.Acct().APICall(backendName)
-		// Leave the pending row for the reaper. A backend PUT error does
-		// not reliably mean the bytes are absent: the response could have
-		// been lost mid-flight, so the reaper HEADs the backend on its
-		// next tick and either promotes or drops the intent.
 		return putAttemptResult{backend: backendName, putErr: err}
 	}
-
-	// Drain-race close: a drain that started after EligibleForWrite ran
-	// could have flipped this backend to draining while the backend PUT
-	// was in flight. If finalizeDrain's DeleteBackendData runs after the
-	// commit below, the just-promoted row gets wiped and the physical
-	// bytes are orphaned. Re-check before the commit so we land on a
-	// different backend instead; the pending intent stays for the
-	// reaper, which HEADs the backend, sees no object (we just deleted
-	// the bytes), and drops the intent.
 	if o.core.IsDraining(backendName) {
-		o.log.WarnContext(ctx, "drain started mid-write; aborting commit on draining backend",
-			"key", key, "backend", backendName)
+		o.log.WarnContext(ctx, "drain started mid-write; aborting commit on draining backend", "key", key, "backend", backendName)
 		telemetry.DrainRaceAbortedTotal.Inc()
 		o.coord.RecoverFromRecordFailure(ctx, be, backendName, key, "drain_race_aborted", uploadSize)
 		return putAttemptResult{backend: backendName, putErr: errDrainRaceAborted}
 	}
-
 	if err := o.coord.RecordObjectAndPromoteIntent(ctx, span, key, backendName, uploadSize, enc, intentID); err != nil {
 		return putAttemptResult{backend: backendName, fatalErr: err}
 	}
-	return putAttemptResult{backend: backendName, etag: etag}
+	return putAttemptResult{backend: backendName, etag: etag, storedSize: uploadSize}
 }
 
-// errDrainRaceAborted is the sentinel putErr the attemptPutOnBackend
-// drain-race close returns so the outer failover loop drops the
-// draining backend from the eligible set and retries elsewhere
-// instead of treating the abort as a generic backend failure.
 var errDrainRaceAborted = errors.New("aborted: drain started mid-write")
 
-// buildPutPayload prepares the upload body and EncryptionMeta for a
-// single attempt. The materialized body's Reader() rewinds on every
-// call so encryption and unencrypted paths both replay from offset 0
-// across failover retries. Encryption layering, when enabled, runs
-// through encryptForPut so the wrapped DEK is reused across retries.
-func (o *Manager) buildPutPayload(
-	ctx context.Context,
-	body *materialize.Body,
-	size int64,
-	contentHash string,
-	dekState *putEncryptState,
-) (io.Reader, int64, *core.EncryptionMeta, error) {
-	plain, err := body.Reader()
+func (o *Manager) buildPutPayload(ctx context.Context, prepared *preparedPutBody, dekState *putEncryptState) (io.Reader, int64, *core.EncryptionMeta, error) {
+	input, err := prepared.Body.Reader()
 	if err != nil {
 		return nil, 0, nil, err
 	}
+	inputSize := prepared.StorageInputSize
 	if o.encryptor != nil {
-		uploadBody, uploadSize, enc, err := encryptForPut(ctx, o.encryptor, plain, size, dekState)
+		uploadBody, uploadSize, enc, err := encryptForPut(ctx, o.encryptor, input, inputSize, dekState)
 		if err != nil {
 			return nil, 0, nil, err
 		}
-		enc.ContentHash = contentHash
+		mergeRepresentationMeta(enc, prepared.Meta, prepared.ContentHash)
 		return uploadBody, uploadSize, enc, nil
 	}
-	var enc *core.EncryptionMeta
-	if contentHash != "" {
-		enc = &core.EncryptionMeta{ContentHash: contentHash}
+	enc := cloneRepresentationMeta(prepared.Meta)
+	if prepared.ContentHash != "" {
+		if enc == nil {
+			enc = &core.EncryptionMeta{}
+		}
+		enc.ContentHash = prepared.ContentHash
 	}
-	return plain, size, enc, nil
+	return input, inputSize, enc, nil
 }
 
-// withoutBackend returns eligible with name removed in original order.
+func cloneRepresentationMeta(src *core.EncryptionMeta) *core.EncryptionMeta {
+	if src == nil {
+		return nil
+	}
+	clone := *src
+	return &clone
+}
+
+func mergeRepresentationMeta(dst, src *core.EncryptionMeta, contentHash string) {
+	if src != nil {
+		dst.CompressionAlgorithm = src.CompressionAlgorithm
+		dst.CompressionLevel = src.CompressionLevel
+		dst.CompressionVersion = src.CompressionVersion
+		dst.LogicalSize = src.LogicalSize
+	}
+	dst.ContentHash = contentHash
+}
+
 func withoutBackend(eligible []string, name string) []string {
 	remaining := make([]string, 0, len(eligible)-1)
 	for _, n := range eligible {

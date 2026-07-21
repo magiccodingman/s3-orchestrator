@@ -1,5 +1,5 @@
 -- ---------------------------------------------------------------------------
--- S3 Orchestrator — Consolidated SQLite Schema (v1)
+-- S3 Orchestrator - Consolidated SQLite Schema (v3)
 --
 -- Translates the PostgreSQL migrations into a single idempotent schema.
 -- Translation rules applied:
@@ -38,6 +38,10 @@ CREATE TABLE IF NOT EXISTS object_locations (
     key_id         TEXT,
     plaintext_size INTEGER,
     content_hash   TEXT,
+    compression_algorithm TEXT,
+    compression_level INTEGER,
+    compression_version INTEGER,
+    logical_size INTEGER,
     created_at     TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     PRIMARY KEY (object_key, backend_name)
 );
@@ -170,6 +174,10 @@ CREATE TABLE IF NOT EXISTS pending_objects (
     key_id         TEXT,
     plaintext_size INTEGER,
     content_hash   TEXT,
+    compression_algorithm TEXT,
+    compression_level INTEGER,
+    compression_version INTEGER,
+    logical_size INTEGER,
     created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
@@ -180,4 +188,4 @@ CREATE INDEX IF NOT EXISTS idx_pending_objects_backend
     ON pending_objects(backend_name);
 
 -- Stamp the schema version after all tables and indexes are created.
-INSERT INTO schema_version (version) VALUES (2);
+INSERT INTO schema_version (version) VALUES (3);

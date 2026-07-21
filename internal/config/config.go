@@ -48,29 +48,30 @@ const (
 
 // Config holds the complete service configuration.
 type Config struct {
-	Server         ServerConfig         `yaml:"server"`
-	Buckets        []BucketConfig       `yaml:"buckets"`
-	Database       DatabaseConfig       `yaml:"database"`
-	Backends       []BackendConfig      `yaml:"backends"`
-	Telemetry      TelemetryConfig      `yaml:"telemetry"`
-	Rebalance      RebalanceConfig      `yaml:"rebalance"`
-	Replication    ReplicationConfig    `yaml:"replication"`
-	RateLimit      RateLimitConfig      `yaml:"rate_limit"`
+	Server                ServerConfig                `yaml:"server"`
+	Buckets               []BucketConfig              `yaml:"buckets"`
+	Database              DatabaseConfig              `yaml:"database"`
+	Backends              []BackendConfig             `yaml:"backends"`
+	Telemetry             TelemetryConfig             `yaml:"telemetry"`
+	Rebalance             RebalanceConfig             `yaml:"rebalance"`
+	Replication           ReplicationConfig           `yaml:"replication"`
+	RateLimit             RateLimitConfig             `yaml:"rate_limit"`
 	CircuitBreaker        CircuitBreakerConfig        `yaml:"circuit_breaker"`
 	BackendCircuitBreaker BackendCircuitBreakerConfig `yaml:"backend_circuit_breaker"`
 	Encryption            EncryptionConfig            `yaml:"encryption"`
+	Compression           CompressionConfig           `yaml:"compression"`
 	UI                    UIConfig                    `yaml:"ui"`
-	CleanupQueue    CleanupQueueConfig   `yaml:"cleanup_queue"`
-	WritePath       WritePathConfig      `yaml:"write_path"`
-	UsageFlush      UsageFlushConfig     `yaml:"usage_flush"`
-	Lifecycle       LifecycleConfig      `yaml:"lifecycle"`
-	Reconcile       ReconcileConfig      `yaml:"reconcile"`
-	Integrity       IntegrityConfig      `yaml:"integrity"`
-	Cache           CacheConfig          `yaml:"cache"`
-	Redis           *RedisConfig         `yaml:"redis"`
-	Notifications   NotificationConfig   `yaml:"notifications"`
-	Debug           DebugConfig          `yaml:"debug"`
-	RoutingStrategy RoutingStrategy      `yaml:"routing_strategy"` // "pack" (default) or "spread"
+	CleanupQueue          CleanupQueueConfig          `yaml:"cleanup_queue"`
+	WritePath             WritePathConfig             `yaml:"write_path"`
+	UsageFlush            UsageFlushConfig            `yaml:"usage_flush"`
+	Lifecycle             LifecycleConfig             `yaml:"lifecycle"`
+	Reconcile             ReconcileConfig             `yaml:"reconcile"`
+	Integrity             IntegrityConfig             `yaml:"integrity"`
+	Cache                 CacheConfig                 `yaml:"cache"`
+	Redis                 *RedisConfig                `yaml:"redis"`
+	Notifications         NotificationConfig          `yaml:"notifications"`
+	Debug                 DebugConfig                 `yaml:"debug"`
+	RoutingStrategy       RoutingStrategy             `yaml:"routing_strategy"` // "pack" (default) or "spread"
 }
 
 // -------------------------------------------------------------------------
@@ -129,6 +130,7 @@ func (c *Config) validatePerTypeSections() []error {
 	errs = append(errs, c.Replication.setDefaultsAndValidate(len(c.Backends))...)
 	errs = append(errs, c.RateLimit.setDefaultsAndValidate()...)
 	errs = append(errs, c.Encryption.setDefaultsAndValidate()...)
+	errs = append(errs, c.Compression.setDefaultsAndValidate()...)
 	errs = append(errs, c.UI.setDefaultsAndValidate()...)
 	errs = append(errs, c.UsageFlush.setDefaultsAndValidate()...)
 	errs = append(errs, validateLifecycleRules(c.Lifecycle.Rules)...)
@@ -259,7 +261,7 @@ func serverFieldsChanged(old, new *ServerConfig) []string {
 
 // topLevelFieldsChanged enumerates non-reloadable top-level sub-configs
 // that differ (database, telemetry, UI, circuit breakers, encryption,
-// routing strategy).
+// compression, routing strategy).
 func topLevelFieldsChanged(old, new *Config) []string {
 	var changed []string
 	if old.Database != new.Database {
@@ -282,6 +284,9 @@ func topLevelFieldsChanged(old, new *Config) []string {
 		old.Encryption.MasterKeyFile != new.Encryption.MasterKeyFile ||
 		old.Encryption.ChunkSize != new.Encryption.ChunkSize {
 		changed = append(changed, "encryption")
+	}
+	if old.Compression != new.Compression {
+		changed = append(changed, "compression")
 	}
 	if old.RoutingStrategy != new.RoutingStrategy {
 		changed = append(changed, "routing_strategy")

@@ -30,6 +30,7 @@ func (s *Store) InsertPending(ctx context.Context, p *core.PendingObject) error 
 	keyID := nullableString(p.KeyID)
 	plaintextSize := nullableInt64(p.PlaintextSize)
 	contentHash := nullableString(p.ContentHash)
+	compressionAlgorithm := nullableString(p.CompressionAlgorithm)
 	encrypted := 0
 	if p.Encrypted {
 		encrypted = 1
@@ -37,10 +38,12 @@ func (s *Store) InsertPending(ctx context.Context, p *core.PendingObject) error 
 	if _, err := s.db.ExecContext(ctx,
 		`INSERT INTO pending_objects
 		   (intent_id, object_key, backend_name, size_bytes,
-		    encrypted, encryption_key, key_id, plaintext_size, content_hash)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		    encrypted, encryption_key, key_id, plaintext_size, content_hash,
+		    compression_algorithm, compression_level, compression_version, logical_size)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		p.IntentID, p.ObjectKey, p.BackendName, p.SizeBytes,
 		encrypted, p.EncryptionKey, keyID, plaintextSize, contentHash,
+		compressionAlgorithm, nullableInt(p.CompressionLevel), nullableInt(p.CompressionVersion), nullableInt64(p.LogicalSize),
 	); err != nil {
 		return fmt.Errorf("insert pending object: %w", err)
 	}
@@ -64,7 +67,8 @@ func (s *Store) GetStalePending(ctx context.Context, olderThan time.Time, limit 
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT intent_id, object_key, backend_name, size_bytes,
 		        encrypted, encryption_key, key_id, plaintext_size,
-		        content_hash, created_at
+		        content_hash, compression_algorithm, compression_level,
+		        compression_version, logical_size, created_at
 		   FROM pending_objects
 		  WHERE created_at <= ?
 		  ORDER BY created_at ASC
@@ -79,16 +83,21 @@ func (s *Store) GetStalePending(ctx context.Context, olderThan time.Time, limit 
 	var out []core.PendingObject
 	for rows.Next() {
 		var (
-			p             core.PendingObject
-			encrypted     int
-			keyID         sql.NullString
-			plaintextSize sql.NullInt64
-			contentHash   sql.NullString
-			createdAt     string
-			encKey        []byte
+			p                    core.PendingObject
+			encrypted            int
+			keyID                sql.NullString
+			plaintextSize        sql.NullInt64
+			contentHash          sql.NullString
+			compressionAlgorithm sql.NullString
+			compressionLevel     sql.NullInt64
+			compressionVersion   sql.NullInt64
+			logicalSize          sql.NullInt64
+			createdAt            string
+			encKey               []byte
 		)
 		if err := rows.Scan(&p.IntentID, &p.ObjectKey, &p.BackendName, &p.SizeBytes,
-			&encrypted, &encKey, &keyID, &plaintextSize, &contentHash, &createdAt,
+			&encrypted, &encKey, &keyID, &plaintextSize, &contentHash,
+			&compressionAlgorithm, &compressionLevel, &compressionVersion, &logicalSize, &createdAt,
 		); err != nil {
 			return nil, fmt.Errorf("scan pending row: %w", err)
 		}
@@ -97,6 +106,10 @@ func (s *Store) GetStalePending(ctx context.Context, olderThan time.Time, limit 
 		p.KeyID = nullStringValue(keyID)
 		p.PlaintextSize = nullInt64Value(plaintextSize)
 		p.ContentHash = nullStringValue(contentHash)
+		p.CompressionAlgorithm = nullStringValue(compressionAlgorithm)
+		p.CompressionLevel = int(nullInt64Value(compressionLevel))
+		p.CompressionVersion = int(nullInt64Value(compressionVersion))
+		p.LogicalSize = nullInt64Value(logicalSize)
 		if t, err := time.Parse(time.RFC3339Nano, createdAt); err == nil {
 			p.CreatedAt = t
 		}
@@ -151,4 +164,3 @@ func (s *Store) DeletePendingByBackend(ctx context.Context, backendName string) 
 func (s *Store) PromotePending(ctx context.Context, p *core.PendingObject) (core.PendingPromoteResult, []core.DeletedCopy, error) {
 	return core.PromotePending(ctx, s, p)
 }
-

@@ -25,6 +25,7 @@ import (
 	"github.com/afreidah/s3-orchestrator/internal/backend"
 	"github.com/afreidah/s3-orchestrator/internal/breaker"
 	objcache "github.com/afreidah/s3-orchestrator/internal/cache"
+	"github.com/afreidah/s3-orchestrator/internal/compression"
 	"github.com/afreidah/s3-orchestrator/internal/config"
 	"github.com/afreidah/s3-orchestrator/internal/counter"
 	"github.com/afreidah/s3-orchestrator/internal/encryption"
@@ -139,6 +140,17 @@ func ProvideBreakerRegistry(i do.Injector) (*breaker.Registry, error) {
 // -------------------------------------------------------------------------
 // OPTIONAL COMPONENT PROVIDERS
 // -------------------------------------------------------------------------
+
+// ProvideCompressor creates the concrete Zstandard codec. It is always
+// registered so objects written while compression was enabled remain readable
+// after future writes are disabled.
+func ProvideCompressor(i do.Injector) (*compression.Codec, error) {
+	cfg, err := do.Invoke[*config.Config](i)
+	if err != nil {
+		return nil, err
+	}
+	return compression.New(cfg.Compression.Level), nil
+}
 
 // ProvideEncryptor creates the envelope encryption engine.
 func ProvideEncryptor(i do.Injector) (*encryption.Encryptor, error) {
@@ -287,17 +299,24 @@ func ProvideMultipartManager(i do.Injector) (*multipart.Manager, error) {
 	if err != nil {
 		return nil, err
 	}
+	compressor, err := do.Invoke[*compression.Codec](i)
+	if err != nil {
+		return nil, err
+	}
 	// dekCacheTTL pegs how long cached unwrapped DEKs live so UploadPart
 	// need not re-unwrap the upload-level DEK on every part.
 	const dekCacheTTL = time.Hour
 	return multipart.New(&multipart.Deps{
-		Core:         rt,
-		Coord:        coord,
-		Stores:       stores,
-		Encryptor:    enc,
-		ObjectCache:  resolveOptionalCache(i),
-		DEKCacheTTL:  dekCacheTTL,
-		IntegrityCfg: integrityCfg,
+		Core:             rt,
+		Coord:            coord,
+		Stores:           stores,
+		Encryptor:        enc,
+		Compressor:       compressor,
+		CompressWrites:   cfg.Compression.Enabled,
+		CompressionLevel: cfg.Compression.Level,
+		ObjectCache:      resolveOptionalCache(i),
+		DEKCacheTTL:      dekCacheTTL,
+		IntegrityCfg:     integrityCfg,
 	}), nil
 }
 
@@ -384,6 +403,10 @@ func ProvideBackendManager(i do.Injector) (*proxy.BackendManager, error) {
 	if err != nil {
 		return nil, err
 	}
+	compressor, err := do.Invoke[*compression.Codec](i)
+	if err != nil {
+		return nil, err
+	}
 	dbBreaker, err := do.Invoke[*breaker.CircuitBreaker](i)
 	if err != nil {
 		return nil, err
@@ -427,9 +450,12 @@ func ProvideBackendManager(i do.Injector) (*proxy.BackendManager, error) {
 			MaxObjectSizes:               br.MaxObjectSizes,
 		},
 		Features: proxy.FeatureDeps{
-			Encryptor:      enc,
-			ObjectCache:    resolveOptionalCache(i),
-			CounterBackend: resolveOptionalCounterBackend(i),
+			Encryptor:        enc,
+			Compressor:       compressor,
+			CompressWrites:   cfg.Compression.Enabled,
+			CompressionLevel: cfg.Compression.Level,
+			ObjectCache:      resolveOptionalCache(i),
+			CounterBackend:   resolveOptionalCounterBackend(i),
 		},
 		Operations: proxy.OperationalDeps{
 			Metrics:           metricsDeps,

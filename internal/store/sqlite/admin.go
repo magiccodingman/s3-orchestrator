@@ -76,7 +76,9 @@ func (s *Store) UpdateEncryptionKey(ctx context.Context, objectKey, backendName 
 // encryption.
 func (s *Store) ListUnencryptedLocations(ctx context.Context, limit, offset int) ([]core.UnencryptedLocation, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT object_key, backend_name, size_bytes
+		SELECT object_key, backend_name, size_bytes,
+               COALESCE(compression_algorithm, ''), COALESCE(compression_level, 0),
+               COALESCE(compression_version, 0), COALESCE(logical_size, 0)
 		FROM object_locations
 		WHERE encrypted = 0
 		ORDER BY object_key, backend_name
@@ -91,7 +93,7 @@ func (s *Store) ListUnencryptedLocations(ctx context.Context, limit, offset int)
 	var locs []core.UnencryptedLocation
 	for rows.Next() {
 		var loc core.UnencryptedLocation
-		if err := rows.Scan(&loc.ObjectKey, &loc.BackendName, &loc.SizeBytes); err != nil {
+		if err := rows.Scan(&loc.ObjectKey, &loc.BackendName, &loc.SizeBytes, &loc.CompressionAlgorithm, &loc.CompressionLevel, &loc.CompressionVersion, &loc.LogicalSize); err != nil {
 			return nil, fmt.Errorf("scan unencrypted location: %w", err)
 		}
 		locs = append(locs, loc)
@@ -139,7 +141,9 @@ func (s *Store) MarkObjectEncrypted(ctx context.Context, objectKey, backendName 
 // with decryption metadata. Used by the decrypt-existing admin endpoint.
 func (s *Store) ListAllEncryptedLocations(ctx context.Context, limit, offset int) ([]core.DecryptableLocation, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT object_key, backend_name, size_bytes, encryption_key, key_id, plaintext_size
+		SELECT object_key, backend_name, size_bytes, encryption_key, key_id, plaintext_size,
+               COALESCE(compression_algorithm, ''), COALESCE(compression_level, 0),
+               COALESCE(compression_version, 0), COALESCE(logical_size, 0)
 		FROM object_locations
 		WHERE encrypted = 1
 		ORDER BY object_key, backend_name
@@ -154,7 +158,7 @@ func (s *Store) ListAllEncryptedLocations(ctx context.Context, limit, offset int
 	var locs []core.DecryptableLocation
 	for rows.Next() {
 		var loc core.DecryptableLocation
-		if err := rows.Scan(&loc.ObjectKey, &loc.BackendName, &loc.SizeBytes, &loc.EncryptionKey, &loc.KeyID, &loc.PlaintextSize); err != nil {
+		if err := rows.Scan(&loc.ObjectKey, &loc.BackendName, &loc.SizeBytes, &loc.EncryptionKey, &loc.KeyID, &loc.PlaintextSize, &loc.CompressionAlgorithm, &loc.CompressionLevel, &loc.CompressionVersion, &loc.LogicalSize); err != nil {
 			return nil, fmt.Errorf("scan decryptable location: %w", err)
 		}
 		locs = append(locs, loc)

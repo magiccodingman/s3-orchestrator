@@ -24,8 +24,8 @@ DELETE FROM object_locations
 WHERE object_key = $1;
 
 -- name: InsertObjectLocation :exec
-INSERT INTO object_locations (object_key, backend_name, size_bytes, encrypted, encryption_key, key_id, plaintext_size, content_hash, created_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW());
+INSERT INTO object_locations (object_key, backend_name, size_bytes, encrypted, encryption_key, key_id, plaintext_size, content_hash, compression_algorithm, compression_level, compression_version, logical_size, created_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW());
 
 -- name: ListObjectsByBackend :many
 SELECT object_key, backend_name, size_bytes, created_at
@@ -58,7 +58,7 @@ SELECT EXISTS(
 ) AS exists;
 
 -- name: LockObjectOnBackend :one
-SELECT size_bytes, encrypted, encryption_key, key_id, plaintext_size, content_hash
+SELECT size_bytes, encrypted, encryption_key, key_id, plaintext_size, content_hash, compression_algorithm, compression_level, compression_version, logical_size
 FROM object_locations
 WHERE object_key = $1 AND backend_name = $2
 FOR UPDATE;
@@ -68,7 +68,7 @@ DELETE FROM object_locations
 WHERE object_key = $1 AND backend_name = $2;
 
 -- name: ListObjectsByPrefix :many
-SELECT DISTINCT ON (object_key) object_key, backend_name, size_bytes, created_at
+SELECT DISTINCT ON (object_key) object_key, backend_name, COALESCE(logical_size, plaintext_size, size_bytes)::bigint AS size_bytes, created_at
 FROM object_locations
 WHERE object_key LIKE @prefix::text || '%' ESCAPE '\'
   AND object_key > @start_after
@@ -76,14 +76,14 @@ ORDER BY object_key, created_at ASC
 LIMIT @max_keys;
 
 -- name: GetAllObjectLocations :many
-SELECT object_key, backend_name, size_bytes, encrypted, encryption_key, key_id, plaintext_size, content_hash, created_at
+SELECT object_key, backend_name, size_bytes, encrypted, encryption_key, key_id, plaintext_size, content_hash, compression_algorithm, compression_level, compression_version, logical_size, created_at
 FROM object_locations
 WHERE object_key = $1
 ORDER BY created_at ASC;
 
 -- name: InsertObjectLocationIfNotExists :one
-INSERT INTO object_locations (object_key, backend_name, size_bytes, encrypted, encryption_key, key_id, plaintext_size, content_hash, created_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+INSERT INTO object_locations (object_key, backend_name, size_bytes, encrypted, encryption_key, key_id, plaintext_size, content_hash, compression_algorithm, compression_level, compression_version, logical_size, created_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW())
 ON CONFLICT (object_key, backend_name) DO NOTHING
 RETURNING true AS inserted;
 
@@ -142,7 +142,7 @@ SET encryption_key = $3, key_id = $4
 WHERE object_key = $1 AND backend_name = $2;
 
 -- name: ListUnencryptedLocations :many
-SELECT object_key, backend_name, size_bytes
+SELECT object_key, backend_name, size_bytes, compression_algorithm, compression_level, compression_version, logical_size
 FROM object_locations
 WHERE encrypted = FALSE
 ORDER BY object_key, backend_name
@@ -158,7 +158,7 @@ SET encrypted = TRUE,
 WHERE object_key = $1 AND backend_name = $2;
 
 -- name: ListAllEncryptedLocations :many
-SELECT object_key, backend_name, size_bytes, encryption_key, key_id, plaintext_size
+SELECT object_key, backend_name, size_bytes, encryption_key, key_id, plaintext_size, compression_algorithm, compression_level, compression_version, logical_size
 FROM object_locations
 WHERE encrypted = TRUE
 ORDER BY object_key, backend_name
@@ -178,14 +178,14 @@ WHERE object_key = $1 AND backend_name = $2;
 -- verification. Uses TABLESAMPLE to avoid a full table sort, then filters
 -- and limits. The sample percentage is generous (10%) to ensure enough rows
 -- pass the WHERE filter; the LIMIT caps the final result.
-SELECT object_key, backend_name, size_bytes, encrypted, encryption_key, key_id, plaintext_size, content_hash, created_at
+SELECT object_key, backend_name, size_bytes, encrypted, encryption_key, key_id, plaintext_size, content_hash, compression_algorithm, compression_level, compression_version, logical_size, created_at
 FROM object_locations TABLESAMPLE BERNOULLI (10)
 WHERE content_hash IS NOT NULL
 LIMIT $1;
 
 -- name: GetObjectsWithoutHash :many
 -- Return object locations that have no content hash, for backfill.
-SELECT object_key, backend_name, size_bytes, encrypted, encryption_key, key_id, plaintext_size, content_hash, created_at
+SELECT object_key, backend_name, size_bytes, encrypted, encryption_key, key_id, plaintext_size, content_hash, compression_algorithm, compression_level, compression_version, logical_size, created_at
 FROM object_locations
 WHERE content_hash IS NULL
 ORDER BY created_at ASC
@@ -283,7 +283,7 @@ SELECT
     COALESCE(leaf.created_at, to_timestamp(0)) AS created_at
 FROM walk w
 LEFT JOIN LATERAL (
-    SELECT backend_name, size_bytes, created_at
+    SELECT backend_name, COALESCE(logical_size, plaintext_size, size_bytes)::bigint AS size_bytes, created_at
       FROM object_locations o2
      WHERE o2.object_key = w.k
        AND position(@delim::text IN substr(w.k, length(@prefix::text) + 1)) = 0

@@ -4,7 +4,7 @@
 // Author: Alex Freidah
 //
 // HeadObject orchestration: per-attempt timeout, usage-limit gating, and
-// plaintext-size rewrite for encrypted objects. Drives readpath.Failover
+// client-visible size rewrite for encrypted or compressed objects. Drives readpath.Failover
 // the same way GetObject does but with no streaming body to keep alive.
 // -------------------------------------------------------------------------------
 
@@ -21,8 +21,8 @@ import (
 )
 
 // HeadObject retrieves object metadata. Tries the primary copy first, then
-// falls back to replicas if the primary fails. When the object is encrypted,
-// the reported size reflects the original plaintext size.
+// falls back to replicas if the primary fails. Representation metadata rewrites
+// the physical backend size to the original client-visible size.
 func (o *Manager) HeadObject(ctx context.Context, key string) (*s3be.HeadObjectResult, error) {
 	result, backendName, err := readpath.Read(ctx, o.failover, "HeadObject", key,
 		func(ctx context.Context, beName string, loc *core.ObjectLocation, backend s3be.ObjectBackend) (readpath.ProbeResult[*s3be.HeadObjectResult], error) {
@@ -36,9 +36,10 @@ func (o *Manager) HeadObject(ctx context.Context, key string) (*s3be.HeadObjectR
 				return fail, err
 			}
 
-			// Return plaintext size for encrypted objects
-			if loc != nil && loc.Encrypted {
-				r.Size = loc.PlaintextSize
+			// Preserve the backend size when a degraded-mode/test location carries
+			// no metadata; otherwise expose the client-visible logical size.
+			if loc != nil && (loc.SizeBytes > 0 || loc.Encrypted || loc.Compressed()) {
+				r.Size = loc.ClientSize()
 			}
 
 			// HEAD carries no streaming body, so a losing result has nothing to

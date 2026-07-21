@@ -101,13 +101,16 @@ func testCollaborators(cfg *BackendManagerConfig) Collaborators {
 	integrityCfg := &syncutil.AtomicConfig[config.IntegrityConfig]{}
 	coord := writepath.New(cfg.Runtime, cfg.Stores.Metadata, cfg.Policies.PendingEnabled)
 	mp := multipart.New(&multipart.Deps{
-		Core:         cfg.Runtime,
-		Coord:        coord,
-		Stores:       cfg.Stores.Metadata,
-		Encryptor:    cfg.Features.Encryptor,
-		ObjectCache:  cfg.Features.ObjectCache,
-		DEKCacheTTL:  time.Hour,
-		IntegrityCfg: integrityCfg,
+		Core:             cfg.Runtime,
+		Coord:            coord,
+		Stores:           cfg.Stores.Metadata,
+		Encryptor:        cfg.Features.Encryptor,
+		Compressor:       cfg.Features.Compressor,
+		CompressWrites:   cfg.Features.CompressWrites,
+		CompressionLevel: cfg.Features.CompressionLevel,
+		ObjectCache:      cfg.Features.ObjectCache,
+		DEKCacheTTL:      time.Hour,
+		IntegrityCfg:     integrityCfg,
 	})
 	return Collaborators{Coord: coord, Multipart: mp, IntegrityCfg: integrityCfg}
 }

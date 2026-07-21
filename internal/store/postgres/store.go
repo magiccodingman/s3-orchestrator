@@ -144,7 +144,7 @@ func (s *Store) RunMigrations(ctx context.Context) error {
 
 // ExpectedSchemaVersion is the migration version this binary expects.
 // Updated when new migration files are added.
-const ExpectedSchemaVersion = 13
+const ExpectedSchemaVersion = 14
 
 // VerifySchemaVersion checks that the database schema version matches
 // what this binary expects. Returns an error if the schema is older
@@ -235,6 +235,10 @@ type fatObjectRow interface {
 	GetKeyID() *string
 	GetPlaintextSize() *int64
 	GetContentHash() *string
+	GetCompressionAlgorithm() *string
+	GetCompressionLevel() *int32
+	GetCompressionVersion() *int32
+	GetLogicalSize() *int64
 }
 
 // toSlimObjectLocations converts a slice of slim sqlc rows. Encryption and
@@ -275,6 +279,18 @@ func toFatObjectLocations[T fatObjectRow](rows []T) []core.ObjectLocation {
 		}
 		if h := r.GetContentHash(); h != nil {
 			loc.ContentHash = *h
+		}
+		if algorithm := r.GetCompressionAlgorithm(); algorithm != nil {
+			loc.CompressionAlgorithm = *algorithm
+		}
+		if level := r.GetCompressionLevel(); level != nil {
+			loc.CompressionLevel = int(*level)
+		}
+		if version := r.GetCompressionVersion(); version != nil {
+			loc.CompressionVersion = int(*version)
+		}
+		if logicalSize := r.GetLogicalSize(); logicalSize != nil {
+			loc.LogicalSize = *logicalSize
 		}
 		out[i] = loc
 	}

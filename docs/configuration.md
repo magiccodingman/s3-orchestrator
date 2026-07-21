@@ -563,6 +563,24 @@ lifecycle:
 - Deletions go through the standard `DeleteObject` path — all copies removed, quotas decremented, failed deletes enqueued to the cleanup queue.
 - Hot-reloadable via `SIGHUP`.
 
+### compression
+
+Transparent whole-object Zstandard compression. When enabled, every new regular PUT and every completed multipart object is compressed before optional encryption. Existing objects are not rewritten; compressed and uncompressed rows can coexist safely because the representation is recorded per object location.
+
+```yaml
+compression:
+  enabled: true
+  level: 3                         # default: 3; accepted range: 1-19
+```
+
+- Compression is **disabled by default** and requires a restart to enable, disable, or change level. The configured level affects new writes only.
+- The write pipeline is `plaintext -> SHA-256 (when enabled) -> Zstandard -> encryption (when enabled)`. This preserves integrity hashes over the client-visible bytes and avoids trying to compress ciphertext.
+- `object_locations.size_bytes`, backend quota usage, ingress accounting, replication, copy, and cleanup all use the physical stored size. S3 `HEAD` and `ListObjects` continue to report the original logical size.
+- The v1 representation is one Zstandard frame for the complete object. A ranged GET therefore fetches and decodes the stored object from the beginning, then returns the requested logical byte slice. This is correct but can be expensive for very large objects with range-heavy workloads.
+- Multipart parts remain ordinary temporary objects; compression is applied once to the final concatenated object at completion.
+- Database migrations add nullable metadata columns. Rows written by older versions remain `NULL` and retain their original uncompressed meaning; no data rewrite is required.
+- Compressed objects require their metadata row to decode safely. During a metadata-store outage, degraded reads are rejected while compression writes are enabled rather than returning raw compressed bytes.
+
 ### encryption
 
 Server-side envelope encryption with chunked AES-256-GCM. When enabled, objects are encrypted before being stored on backends and decrypted transparently on read. Exactly one key source is required.
@@ -636,7 +654,7 @@ integrity:
 
 **How it works:**
 
-- **Write path:** SHA-256 is computed on the plaintext body (before encryption) and stored in `object_locations.content_hash`.
+- **Write path:** SHA-256 is computed on the original plaintext body (before compression or encryption) and stored in `object_locations.content_hash`.
 - **Read path (`verify_on_read`):** A `VerifyingReader` wraps the response body and computes the hash as data streams to the client. On mismatch at EOF, the corrupted copy is enqueued for cleanup.
 - **Scrubber:** A background worker periodically reads random objects from backends, decrypts if needed, and verifies their hash. Corrupted copies are enqueued for cleanup. Each read counts against the backend's usage quota.
 - **Backfill:** Objects written before integrity was enabled have no stored hash. Use `admin backfill-checksums` to read those objects and compute their hashes.

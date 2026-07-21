@@ -31,6 +31,7 @@ import (
 
 	s3be "github.com/afreidah/s3-orchestrator/internal/backend"
 	objcache "github.com/afreidah/s3-orchestrator/internal/cache"
+	"github.com/afreidah/s3-orchestrator/internal/compression"
 	"github.com/afreidah/s3-orchestrator/internal/config"
 	"github.com/afreidah/s3-orchestrator/internal/encryption"
 	"github.com/afreidah/s3-orchestrator/internal/internalkey"
@@ -42,6 +43,7 @@ import (
 	"github.com/afreidah/s3-orchestrator/internal/proxy/writepath"
 	"github.com/afreidah/s3-orchestrator/internal/store/core"
 	"github.com/afreidah/s3-orchestrator/internal/util/bufpool"
+	"github.com/afreidah/s3-orchestrator/internal/util/materialize"
 	"github.com/afreidah/s3-orchestrator/internal/util/must"
 	"github.com/afreidah/s3-orchestrator/internal/util/syncutil"
 )
@@ -71,14 +73,17 @@ type MultipartStores interface {
 }
 
 type Manager struct {
-	core         MultipartRuntime       // infrastructure subset: backends, usage, timeout, error classification, metrics
-	coord        *writepath.Coordinator // write-path helpers shared with BackendManager and ObjectManager
-	stores       MultipartStores        // multipart row/part operations and WithAdvisoryLock
-	encryptor    *encryption.Encryptor
-	objectCache  objcache.ObjectCache
-	dekCache     *syncutil.TTLCache[string, []byte]
-	integrityCfg *syncutil.AtomicConfig[config.IntegrityConfig] // nil-safe; controls plaintext SHA-256 on Complete
-	log          *slog.Logger
+	core             MultipartRuntime       // infrastructure subset: backends, usage, timeout, error classification, metrics
+	coord            *writepath.Coordinator // write-path helpers shared with BackendManager and ObjectManager
+	stores           MultipartStores        // multipart row/part operations and WithAdvisoryLock
+	encryptor        *encryption.Encryptor
+	compressor       *compression.Codec
+	compressWrites   bool
+	compressionLevel int
+	objectCache      objcache.ObjectCache
+	dekCache         *syncutil.TTLCache[string, []byte]
+	integrityCfg     *syncutil.AtomicConfig[config.IntegrityConfig] // nil-safe; controls plaintext SHA-256 on Complete
+	log              *slog.Logger
 }
 
 // New creates a Manager sharing the given core infrastructure and
@@ -93,15 +98,26 @@ func New(deps *Deps) *Manager {
 	must.NotNil("Core", deps.Core)
 	must.NotNil("Coord", deps.Coord)
 	must.NotNil("Stores", deps.Stores)
+	level := deps.CompressionLevel
+	if level == 0 {
+		level = 3
+	}
+	compressor := deps.Compressor
+	if compressor == nil {
+		compressor = compression.New(level)
+	}
 	return &Manager{
-		core:         deps.Core,
-		coord:        deps.Coord,
-		stores:       deps.Stores,
-		encryptor:    deps.Encryptor,
-		objectCache:  deps.ObjectCache,
-		dekCache:     syncutil.NewTTLCache[string, []byte](deps.DEKCacheTTL),
-		integrityCfg: deps.IntegrityCfg,
-		log:          slog.Default().With(logfmt.Component("multipart")),
+		core:             deps.Core,
+		coord:            deps.Coord,
+		stores:           deps.Stores,
+		encryptor:        deps.Encryptor,
+		compressor:       compressor,
+		compressWrites:   deps.CompressWrites,
+		compressionLevel: level,
+		objectCache:      deps.ObjectCache,
+		dekCache:         syncutil.NewTTLCache[string, []byte](deps.DEKCacheTTL),
+		integrityCfg:     deps.IntegrityCfg,
+		log:              slog.Default().With(logfmt.Component("multipart")),
 	}
 }
 
@@ -109,13 +125,16 @@ func New(deps *Deps) *Manager {
 // runtime, shared write coordinator, store surface, optional encryption /
 // object cache, the DEK-cache TTL, and the shared integrity config.
 type Deps struct {
-	Core         MultipartRuntime
-	Coord        *writepath.Coordinator
-	Stores       MultipartStores
-	Encryptor    *encryption.Encryptor // nil when encryption is disabled
-	ObjectCache  objcache.ObjectCache  // nil when object caching is disabled
-	DEKCacheTTL  time.Duration
-	IntegrityCfg *syncutil.AtomicConfig[config.IntegrityConfig]
+	Core             MultipartRuntime
+	Coord            *writepath.Coordinator
+	Stores           MultipartStores
+	Encryptor        *encryption.Encryptor // nil when encryption is disabled
+	Compressor       *compression.Codec
+	CompressWrites   bool
+	CompressionLevel int
+	ObjectCache      objcache.ObjectCache // nil when object caching is disabled
+	DEKCacheTTL      time.Duration
+	IntegrityCfg     *syncutil.AtomicConfig[config.IntegrityConfig]
 }
 
 // Close stops the per-upload DEK cache eviction loop.
@@ -676,7 +695,13 @@ func (mp *Manager) completeMultipartUploadLocked(
 		assembleReader = io.TeeReader(pr, hasher)
 	}
 
-	uploadBody, uploadSize, enc, err := mp.buildAssembledUpload(ctx, span, mu, assembleReader, totalPlaintextSize)
+	representation, err := mp.prepareAssembledRepresentation(assembleReader, totalPlaintextSize)
+	if err != nil {
+		return "", err
+	}
+	defer representation.Cleanup()
+
+	uploadBody, uploadSize, enc, err := mp.buildAssembledUpload(ctx, span, mu, representation)
 	if err != nil {
 		return "", err
 	}
@@ -783,31 +808,75 @@ func sumPlaintextSize(parts []core.MultipartPart) int64 {
 	return total
 }
 
-// buildAssembledUpload prepares the request body sent to the backend
-// during assembly. When the orchestrator encryptor is configured, the
-// pipe is wrapped in EncryptWithDEK using the upload-level DEK so the
-// assembled object lands as a single ciphertext that shares its DEK
-// with every part. Inline decryption already runs in
-// streamPartsThroughPipe so the pipe always emits plaintext. mu is
-// required when the encryptor is configured because the assembled
-// object must reuse mu.EncryptionKey / mu.KeyID rather than wrapping a
-// fresh DEK for the final write.
-func (mp *Manager) buildAssembledUpload(
-	ctx context.Context,
-	span trace.Span,
-	mu *core.MultipartUpload,
-	pr io.Reader,
-	totalPlaintextSize int64,
-) (io.Reader, int64, *core.EncryptionMeta, error) {
-	if mp.encryptor == nil {
-		return pr, totalPlaintextSize, nil, nil
+// assembledRepresentation is the replayable input to optional final-object
+// encryption. Only the compressed branch owns a materialized body.
+type assembledRepresentation struct {
+	body         io.Reader
+	size         int64
+	meta         *core.EncryptionMeta
+	materialized *materialize.Body
+}
+
+func (r *assembledRepresentation) Cleanup() {
+	if r.materialized != nil {
+		r.materialized.Cleanup()
 	}
-	out, ciphertextSize, enc, err := mp.encryptWithUploadDEK(ctx, mu, pr, totalPlaintextSize)
+}
+
+func (mp *Manager) prepareAssembledRepresentation(src io.Reader, logicalSize int64) (*assembledRepresentation, error) {
+	if !mp.compressWrites {
+		return &assembledRepresentation{body: src, size: logicalSize}, nil
+	}
+	body, err := mp.compressor.Compress(src, logicalSize)
+	if err != nil {
+		return nil, fmt.Errorf("compress final object: %w", err)
+	}
+	reader, err := body.Reader()
+	if err != nil {
+		body.Cleanup()
+		return nil, err
+	}
+	return &assembledRepresentation{
+		body: reader, size: body.Size(), materialized: body,
+		meta: &core.EncryptionMeta{
+			CompressionAlgorithm: compression.AlgorithmZstd,
+			CompressionLevel:     mp.compressionLevel,
+			CompressionVersion:   compression.FormatVersion,
+			LogicalSize:          logicalSize,
+		},
+	}, nil
+}
+
+// buildAssembledUpload applies optional encryption after compression.
+func (mp *Manager) buildAssembledUpload(ctx context.Context, span trace.Span, mu *core.MultipartUpload, representation *assembledRepresentation) (io.Reader, int64, *core.EncryptionMeta, error) {
+	if mp.encryptor == nil {
+		return representation.body, representation.size, cloneMeta(representation.meta), nil
+	}
+	out, ciphertextSize, enc, err := mp.encryptWithUploadDEK(ctx, mu, representation.body, representation.size)
 	if err != nil {
 		observe.RecordSpanError(span, err)
 		return nil, 0, nil, fmt.Errorf("encrypt final object: %w", err)
 	}
+	copyCompressionMeta(enc, representation.meta)
 	return out, ciphertextSize, enc, nil
+}
+
+func cloneMeta(src *core.EncryptionMeta) *core.EncryptionMeta {
+	if src == nil {
+		return nil
+	}
+	clone := *src
+	return &clone
+}
+
+func copyCompressionMeta(dst, src *core.EncryptionMeta) {
+	if src == nil {
+		return
+	}
+	dst.CompressionAlgorithm = src.CompressionAlgorithm
+	dst.CompressionLevel = src.CompressionLevel
+	dst.CompressionVersion = src.CompressionVersion
+	dst.LogicalSize = src.LogicalSize
 }
 
 // -------------------------------------------------------------------------
