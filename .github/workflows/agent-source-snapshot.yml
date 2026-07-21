@@ -4,6 +4,7 @@ on:
   pull_request:
     branches:
       - main
+      - agent/transparent-zstd-compression
   push:
     branches:
       - agent/transparent-zstd-compression
