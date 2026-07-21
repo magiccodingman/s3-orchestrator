@@ -1,0 +1,23 @@
+name: Agent Source Snapshot
+
+on:
+  push:
+    branches:
+      - agent/transparent-zstd-compression
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Upload source snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: s3-orchestrator-source
+          path: .
+          include-hidden-files: true
+          retention-days: 1
