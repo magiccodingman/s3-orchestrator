@@ -26,6 +26,7 @@ import (
 
 	"github.com/afreidah/s3-orchestrator/internal/backend"
 	objcache "github.com/afreidah/s3-orchestrator/internal/cache"
+	"github.com/afreidah/s3-orchestrator/internal/compression"
 	"github.com/afreidah/s3-orchestrator/internal/config"
 	"github.com/afreidah/s3-orchestrator/internal/counter"
 	"github.com/afreidah/s3-orchestrator/internal/encryption"
@@ -110,9 +111,12 @@ type PolicyConfig struct {
 // FeatureDeps groups optional capabilities. Each field is nil-able and
 // disables the corresponding feature when left zero.
 type FeatureDeps struct {
-	Encryptor      *encryption.Encryptor  // nil when encryption is disabled
-	CounterBackend counter.CounterBackend // nil uses LocalCounterBackend
-	ObjectCache    objcache.ObjectCache   // nil when object data caching is disabled
+	Encryptor        *encryption.Encryptor // nil when encryption is disabled
+	Compressor       *compression.Codec
+	CompressWrites   bool
+	CompressionLevel int
+	CounterBackend   counter.CounterBackend // nil uses LocalCounterBackend
+	ObjectCache      objcache.ObjectCache   // nil when object data caching is disabled
 }
 
 // OperationalDeps groups telemetry, concurrency, and observability
@@ -245,6 +249,9 @@ func NewBackendManager(cfg *BackendManagerConfig) *BackendManager {
 		Coord:                        collab.Coord,
 		Stores:                       stores.Metadata,
 		Encryptor:                    features.Encryptor,
+		Compressor:                   features.Compressor,
+		CompressWrites:               features.CompressWrites,
+		CompressionLevel:             features.CompressionLevel,
 		LocationCache:                cache,
 		ObjectCache:                  features.ObjectCache,
 		ParallelBroadcast:            policies.ParallelBroadcast,

@@ -128,9 +128,13 @@ func (s *Store) ListUnencryptedLocations(ctx context.Context, limit, offset int)
 // row to core.UnencryptedLocation.
 func unencryptedLocationFromRow(r *db.ListUnencryptedLocationsRow) core.UnencryptedLocation {
 	return core.UnencryptedLocation{
-		ObjectKey:   r.ObjectKey,
-		BackendName: r.BackendName,
-		SizeBytes:   r.SizeBytes,
+		ObjectKey:            r.ObjectKey,
+		BackendName:          r.BackendName,
+		SizeBytes:            r.SizeBytes,
+		CompressionAlgorithm: derefStr(r.CompressionAlgorithm),
+		CompressionLevel:     derefInt32(r.CompressionLevel),
+		CompressionVersion:   derefInt32(r.CompressionVersion),
+		LogicalSize:          derefInt64(r.LogicalSize),
 	}
 }
 
@@ -181,15 +185,19 @@ func (s *Store) ListAllEncryptedLocations(ctx context.Context, limit, offset int
 
 // decryptableLocationFromRow converts a sqlc ListAllEncryptedLocations
 // row to core.DecryptableLocation, safely dereferencing nullable
-// KeyID and PlaintextSize.
+// encryption and compression metadata.
 func decryptableLocationFromRow(r *db.ListAllEncryptedLocationsRow) core.DecryptableLocation {
 	return core.DecryptableLocation{
-		ObjectKey:     r.ObjectKey,
-		BackendName:   r.BackendName,
-		SizeBytes:     r.SizeBytes,
-		EncryptionKey: r.EncryptionKey,
-		KeyID:         derefStr(r.KeyID),
-		PlaintextSize: derefInt64(r.PlaintextSize),
+		ObjectKey:            r.ObjectKey,
+		BackendName:          r.BackendName,
+		SizeBytes:            r.SizeBytes,
+		EncryptionKey:        r.EncryptionKey,
+		KeyID:                derefStr(r.KeyID),
+		PlaintextSize:        derefInt64(r.PlaintextSize),
+		CompressionAlgorithm: derefStr(r.CompressionAlgorithm),
+		CompressionLevel:     derefInt32(r.CompressionLevel),
+		CompressionVersion:   derefInt32(r.CompressionVersion),
+		LogicalSize:          derefInt64(r.LogicalSize),
 	}
 }
 

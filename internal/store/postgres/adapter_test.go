@@ -316,3 +316,65 @@ func TestPgTxAdapter_SatisfiesCoreInterfaces(t *testing.T) {
 	var _ core.QuotaTxAdapter = a
 	var _ core.TxAdapter = a
 }
+
+// TestObjectInsertParams_CompressionFields verifies physical/logical size and
+// Zstandard representation metadata survive the core-to-sqlc boundary.
+func TestObjectInsertParams_CompressionFields(t *testing.T) {
+	t.Parallel()
+
+	got := objectInsertParams(&core.ObjectLocation{
+		ObjectKey:            "k",
+		BackendName:          "b1",
+		SizeBytes:            321,
+		CompressionAlgorithm: "zstd",
+		CompressionLevel:     3,
+		CompressionVersion:   1,
+		LogicalSize:          4096,
+	})
+	if got.CompressionAlgorithm == nil || *got.CompressionAlgorithm != "zstd" ||
+		got.CompressionLevel == nil || *got.CompressionLevel != 3 ||
+		got.CompressionVersion == nil || *got.CompressionVersion != 1 ||
+		got.LogicalSize == nil || *got.LogicalSize != 4096 {
+		t.Fatalf("compression params = %+v", got)
+	}
+}
+
+// TestPendingCompressionMetadataRoundTrip verifies crash-recovery rows carry
+// the same representation metadata the original PUT intended to commit.
+func TestPendingCompressionMetadataRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	pending := core.PendingObject{
+		IntentID:             "intent-1",
+		ObjectKey:            "k",
+		BackendName:          "b1",
+		SizeBytes:            321,
+		CompressionAlgorithm: "zstd",
+		CompressionLevel:     3,
+		CompressionVersion:   1,
+		LogicalSize:          4096,
+	}
+	params := pendingInsertParams(&pending)
+	if params.CompressionAlgorithm == nil || *params.CompressionAlgorithm != "zstd" ||
+		params.CompressionLevel == nil || *params.CompressionLevel != 3 ||
+		params.CompressionVersion == nil || *params.CompressionVersion != 1 ||
+		params.LogicalSize == nil || *params.LogicalSize != 4096 {
+		t.Fatalf("pending compression params = %+v", params)
+	}
+
+	row := db.PendingObject{
+		IntentID:             pending.IntentID,
+		ObjectKey:            pending.ObjectKey,
+		BackendName:          pending.BackendName,
+		SizeBytes:            pending.SizeBytes,
+		CompressionAlgorithm: params.CompressionAlgorithm,
+		CompressionLevel:     params.CompressionLevel,
+		CompressionVersion:   params.CompressionVersion,
+		LogicalSize:          params.LogicalSize,
+	}
+	got := pendingFromRow(&row)
+	if got.CompressionAlgorithm != "zstd" || got.CompressionLevel != 3 ||
+		got.CompressionVersion != 1 || got.LogicalSize != 4096 {
+		t.Fatalf("pending compression round trip = %+v", got)
+	}
+}

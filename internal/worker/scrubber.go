@@ -26,6 +26,7 @@ import (
 	"io"
 	"log/slog"
 
+	"github.com/afreidah/s3-orchestrator/internal/compression"
 	"github.com/afreidah/s3-orchestrator/internal/config"
 	"github.com/afreidah/s3-orchestrator/internal/encryption"
 	"github.com/afreidah/s3-orchestrator/internal/observe/audit"
@@ -33,6 +34,7 @@ import (
 	"github.com/afreidah/s3-orchestrator/internal/observe/telemetry"
 	"github.com/afreidah/s3-orchestrator/internal/progress"
 	"github.com/afreidah/s3-orchestrator/internal/store/core"
+	"github.com/afreidah/s3-orchestrator/internal/util/ioutilx"
 	"github.com/afreidah/s3-orchestrator/internal/util/must"
 	"github.com/afreidah/s3-orchestrator/internal/util/syncutil"
 )
@@ -49,21 +51,23 @@ type ScrubberStore interface {
 // stored content hash. Also supports backfilling hashes for objects that
 // were written before integrity was enabled.
 type Scrubber struct {
-	log       *slog.Logger
-	deps      ScrubberOps
-	placement Placement
-	store     ScrubberStore
-	encryptor *encryption.Encryptor
-	cfg       syncutil.AtomicConfig[config.IntegrityConfig]
+	log        *slog.Logger
+	deps       ScrubberOps
+	placement  Placement
+	store      ScrubberStore
+	encryptor  *encryption.Encryptor
+	compressor *compression.Codec
+	cfg        syncutil.AtomicConfig[config.IntegrityConfig]
 }
 
 // ScrubberDeps groups the scrubber's constructor dependencies. Encryptor
 // is optional (nil when encryption is disabled).
 type ScrubberDeps struct {
-	Ops       ScrubberOps
-	Placement Placement
-	Store     ScrubberStore
-	Encryptor *encryption.Encryptor
+	Ops        ScrubberOps
+	Placement  Placement
+	Store      ScrubberStore
+	Encryptor  *encryption.Encryptor
+	Compressor *compression.Codec
 }
 
 // NewScrubber creates a Scrubber with the given dependencies.
@@ -71,7 +75,11 @@ func NewScrubber(deps ScrubberDeps) *Scrubber {
 	must.NotNil("Ops", deps.Ops)
 	must.NotNil("Placement", deps.Placement)
 	must.NotNil("Store", deps.Store)
-	return &Scrubber{deps: deps.Ops, placement: deps.Placement, store: deps.Store, encryptor: deps.Encryptor, log: slog.Default().With(logfmt.Component("scrubber"))}
+	compressor := deps.Compressor
+	if compressor == nil {
+		compressor = compression.New(3)
+	}
+	return &Scrubber{deps: deps.Ops, placement: deps.Placement, store: deps.Store, encryptor: deps.Encryptor, compressor: compressor, log: slog.Default().With(logfmt.Component("scrubber"))}
 }
 
 // SetConfig atomically stores the integrity configuration.
@@ -253,7 +261,7 @@ func (s *Scrubber) readAndHash(ctx context.Context, loc *core.ObjectLocation) (s
 
 	s.deps.Acct().Egress(loc.BackendName, result.Size)
 
-	// Decrypt if the object is encrypted  -  hash is computed on plaintext
+	// Decode the stored representation before hashing original client bytes.
 	var reader io.Reader = result.Body
 	if loc.Encrypted && s.encryptor != nil {
 		decrypted, _, decErr := s.encryptor.DecryptStored(ctx, result.Body, loc.EncryptionKey, loc.KeyID, loc.PlaintextSize, nil)
@@ -262,8 +270,19 @@ func (s *Scrubber) readAndHash(ctx context.Context, loc *core.ObjectLocation) (s
 		}
 		reader = decrypted
 	}
+	if loc.Compressed() {
+		if loc.CompressionAlgorithm != compression.AlgorithmZstd || loc.CompressionVersion != compression.FormatVersion {
+			return "", fmt.Errorf("unsupported compression representation %q version %d", loc.CompressionAlgorithm, loc.CompressionVersion)
+		}
+		decoded, decErr := s.compressor.NewReader(ioutilx.ReadCloser(reader, result.Body))
+		if decErr != nil {
+			return "", fmt.Errorf("decompress: %w", decErr)
+		}
+		defer decoded.Close()
+		reader = decoded
+	}
 
-	// Compute SHA-256 of the (plaintext) body
+	// Compute SHA-256 of the original logical body.
 	h := sha256.New()
 	if _, err := io.Copy(h, reader); err != nil {
 		return "", fmt.Errorf("read body: %w", err)

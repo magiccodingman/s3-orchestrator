@@ -32,6 +32,16 @@ func int64Ptr(n int64) *int64 {
 	return &n
 }
 
+// int32Ptr returns a pointer to n narrowed to int32 when non-zero. Compression
+// levels and format versions are validated small integers before this boundary.
+func int32Ptr(n int) *int32 {
+	if n == 0 {
+		return nil
+	}
+	v := int32(n) //nolint:gosec // validated compression values are within int32
+	return &v
+}
+
 // derefOr returns *p when p is non-nil, otherwise zero. Replaces the
 // `if p != nil { return *p } return zero` boilerplate at every nullable
 // column read site so the caller is a single expression.
@@ -47,6 +57,9 @@ func derefStr(p *string) string { return derefOr(p, "") }
 
 // derefInt64 safely dereferences a nullable int64 pointer.
 func derefInt64(p *int64) int64 { return derefOr(p, 0) }
+
+// derefInt32 safely dereferences a nullable int32 pointer and widens it.
+func derefInt32(p *int32) int { return int(derefOr(p, 0)) }
 
 // mapSlice applies fn to every element of in and returns the resulting
 // slice. fn receives a pointer to each element so large sqlc row structs
@@ -79,7 +92,7 @@ func existingCopyFromRow(r *db.GetExistingCopiesForUpdateRow) core.ExistingCopy 
 }
 
 // objectInsertParams maps a core.ObjectLocation onto the sqlc insert
-// struct, attaching encryption + content-hash metadata when present.
+// struct, attaching all persisted representation metadata when present.
 func objectInsertParams(loc *core.ObjectLocation) db.InsertObjectLocationParams {
 	params := db.InsertObjectLocationParams{
 		ObjectKey:   loc.ObjectKey,
@@ -94,6 +107,12 @@ func objectInsertParams(loc *core.ObjectLocation) db.InsertObjectLocationParams 
 	}
 	if loc.ContentHash != "" {
 		params.ContentHash = strPtr(loc.ContentHash)
+	}
+	if loc.Compressed() {
+		params.CompressionAlgorithm = strPtr(loc.CompressionAlgorithm)
+		params.CompressionLevel = int32Ptr(loc.CompressionLevel)
+		params.CompressionVersion = int32Ptr(loc.CompressionVersion)
+		params.LogicalSize = int64Ptr(loc.LogicalSize)
 	}
 	return params
 }

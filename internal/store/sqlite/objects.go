@@ -78,7 +78,8 @@ func (s *Store) GetObjectBackendsForKeys(ctx context.Context, keys []string) (ma
 func (s *Store) GetAllObjectLocations(ctx context.Context, key string) ([]core.ObjectLocation, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT object_key, backend_name, size_bytes, encrypted, encryption_key,
-		       key_id, plaintext_size, content_hash, created_at
+		       key_id, plaintext_size, content_hash, compression_algorithm,
+		       compression_level, compression_version, logical_size, created_at
 		FROM object_locations
 		WHERE object_key = ?
 		ORDER BY created_at ASC`, key)
@@ -150,7 +151,7 @@ func (s *Store) ListObjects(ctx context.Context, prefix, startAfter string, maxK
 
 	// Subquery with GROUP BY + MIN(rowid) replaces DISTINCT ON (object_key).
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT ol.object_key, ol.backend_name, ol.size_bytes, ol.created_at
+		SELECT ol.object_key, ol.backend_name, COALESCE(ol.logical_size, ol.plaintext_size, ol.size_bytes), ol.created_at
 		FROM object_locations ol
 		INNER JOIN (
 			SELECT object_key, MIN(rowid) AS min_rowid
@@ -225,7 +226,7 @@ func (s *Store) ListObjectsDelimited(ctx context.Context, prefix, delimiter, sta
 					|| char(unicode(substr(w.k, length(:prefix) + instr(substr(w.k, length(:prefix) + 1), :delim) + length(:delim) - 1, 1)) + 1)
 				ELSE w.k
 			END AS skip_bound,
-			ol.backend_name, ol.size_bytes, ol.created_at
+			ol.backend_name, COALESCE(ol.logical_size, ol.plaintext_size, ol.size_bytes), ol.created_at
 		FROM walk w
 		LEFT JOIN object_locations ol ON ol.rowid = (
 			SELECT MIN(rowid) FROM object_locations o2
@@ -447,7 +448,8 @@ func (s *Store) DeleteBackendData(ctx context.Context, backendName string) error
 func (s *Store) GetRandomHashedObjects(ctx context.Context, limit int) ([]core.ObjectLocation, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT object_key, backend_name, size_bytes, encrypted, encryption_key,
-		       key_id, plaintext_size, content_hash, created_at
+		       key_id, plaintext_size, content_hash, compression_algorithm,
+		       compression_level, compression_version, logical_size, created_at
 		FROM object_locations
 		WHERE content_hash IS NOT NULL
 		ORDER BY RANDOM()
@@ -476,7 +478,8 @@ func (s *Store) GetRandomHashedObjects(ctx context.Context, limit int) ([]core.O
 func (s *Store) GetObjectsWithoutHash(ctx context.Context, limit, offset int) ([]core.ObjectLocation, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT object_key, backend_name, size_bytes, encrypted, encryption_key,
-		       key_id, plaintext_size, content_hash, created_at
+		       key_id, plaintext_size, content_hash, compression_algorithm,
+		       compression_level, compression_version, logical_size, created_at
 		FROM object_locations
 		WHERE content_hash IS NULL
 		ORDER BY created_at ASC
@@ -517,16 +520,21 @@ func (s *Store) UpdateContentHash(ctx context.Context, key, backendName, hash st
 // and integrity columns.
 func scanObjectLocation(rows *sql.Rows) (core.ObjectLocation, error) {
 	var (
-		loc           core.ObjectLocation
-		createdAt     string
-		keyID         *string
-		plaintextSize *int64
-		contentHash   *string
+		loc                  core.ObjectLocation
+		createdAt            string
+		keyID                *string
+		plaintextSize        *int64
+		contentHash          *string
+		compressionAlgorithm *string
+		compressionLevel     *int64
+		compressionVersion   *int64
+		logicalSize          *int64
 	)
 	if err := rows.Scan(
 		&loc.ObjectKey, &loc.BackendName, &loc.SizeBytes,
 		&loc.Encrypted, &loc.EncryptionKey,
 		&keyID, &plaintextSize, &contentHash,
+		&compressionAlgorithm, &compressionLevel, &compressionVersion, &logicalSize,
 		&createdAt,
 	); err != nil {
 		return core.ObjectLocation{}, fmt.Errorf("failed to scan object location: %w", err)
@@ -544,6 +552,18 @@ func scanObjectLocation(rows *sql.Rows) (core.ObjectLocation, error) {
 	}
 	if contentHash != nil {
 		loc.ContentHash = *contentHash
+	}
+	if compressionAlgorithm != nil {
+		loc.CompressionAlgorithm = *compressionAlgorithm
+	}
+	if compressionLevel != nil {
+		loc.CompressionLevel = int(*compressionLevel)
+	}
+	if compressionVersion != nil {
+		loc.CompressionVersion = int(*compressionVersion)
+	}
+	if logicalSize != nil {
+		loc.LogicalSize = *logicalSize
 	}
 	return loc, nil
 }

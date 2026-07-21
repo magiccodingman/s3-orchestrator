@@ -44,7 +44,7 @@ func (q *Queries) DeletePendingObjectsByBackend(ctx context.Context, backendName
 
 const getStalePendingObjects = `-- name: GetStalePendingObjects :many
 SELECT intent_id, object_key, backend_name, size_bytes,
-       encrypted, encryption_key, key_id, plaintext_size, content_hash, created_at
+       encrypted, encryption_key, key_id, plaintext_size, content_hash, compression_algorithm, compression_level, compression_version, logical_size, created_at
 FROM pending_objects
 WHERE created_at <= $1
 ORDER BY created_at ASC
@@ -56,17 +56,34 @@ type GetStalePendingObjectsParams struct {
 	MaxKeys   int32
 }
 
+type GetStalePendingObjectsRow struct {
+	IntentID             string
+	ObjectKey            string
+	BackendName          string
+	SizeBytes            int64
+	Encrypted            bool
+	EncryptionKey        []byte
+	KeyID                *string
+	PlaintextSize        *int64
+	ContentHash          *string
+	CompressionAlgorithm *string
+	CompressionLevel     *int32
+	CompressionVersion   *int32
+	LogicalSize          *int64
+	CreatedAt            pgtype.Timestamptz
+}
+
 // Return pending intents older than @older_than for reaper resolution.
 // Bounded by @max_keys per call so a backlog cannot starve other queries.
-func (q *Queries) GetStalePendingObjects(ctx context.Context, arg GetStalePendingObjectsParams) ([]PendingObject, error) {
+func (q *Queries) GetStalePendingObjects(ctx context.Context, arg GetStalePendingObjectsParams) ([]GetStalePendingObjectsRow, error) {
 	rows, err := q.db.Query(ctx, getStalePendingObjects, arg.OlderThan, arg.MaxKeys)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []PendingObject{}
+	items := []GetStalePendingObjectsRow{}
 	for rows.Next() {
-		var i PendingObject
+		var i GetStalePendingObjectsRow
 		if err := rows.Scan(
 			&i.IntentID,
 			&i.ObjectKey,
@@ -77,6 +94,10 @@ func (q *Queries) GetStalePendingObjects(ctx context.Context, arg GetStalePendin
 			&i.KeyID,
 			&i.PlaintextSize,
 			&i.ContentHash,
+			&i.CompressionAlgorithm,
+			&i.CompressionLevel,
+			&i.CompressionVersion,
+			&i.LogicalSize,
 			&i.CreatedAt,
 		); err != nil {
 			return nil, err
@@ -93,20 +114,25 @@ const insertPendingObject = `-- name: InsertPendingObject :exec
 
 INSERT INTO pending_objects (
     intent_id, object_key, backend_name, size_bytes,
-    encrypted, encryption_key, key_id, plaintext_size, content_hash
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+    encrypted, encryption_key, key_id, plaintext_size, content_hash,
+    compression_algorithm, compression_level, compression_version, logical_size
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 `
 
 type InsertPendingObjectParams struct {
-	IntentID      string
-	ObjectKey     string
-	BackendName   string
-	SizeBytes     int64
-	Encrypted     bool
-	EncryptionKey []byte
-	KeyID         *string
-	PlaintextSize *int64
-	ContentHash   *string
+	IntentID             string
+	ObjectKey            string
+	BackendName          string
+	SizeBytes            int64
+	Encrypted            bool
+	EncryptionKey        []byte
+	KeyID                *string
+	PlaintextSize        *int64
+	ContentHash          *string
+	CompressionAlgorithm *string
+	CompressionLevel     *int32
+	CompressionVersion   *int32
+	LogicalSize          *int64
 }
 
 // -----------------------------------------------------------------------------
@@ -131,25 +157,46 @@ func (q *Queries) InsertPendingObject(ctx context.Context, arg InsertPendingObje
 		arg.KeyID,
 		arg.PlaintextSize,
 		arg.ContentHash,
+		arg.CompressionAlgorithm,
+		arg.CompressionLevel,
+		arg.CompressionVersion,
+		arg.LogicalSize,
 	)
 	return err
 }
 
 const lockPendingForUpdate = `-- name: LockPendingForUpdate :one
 SELECT intent_id, object_key, backend_name, size_bytes,
-       encrypted, encryption_key, key_id, plaintext_size, content_hash, created_at
+       encrypted, encryption_key, key_id, plaintext_size, content_hash, compression_algorithm, compression_level, compression_version, logical_size, created_at
 FROM pending_objects
 WHERE intent_id = $1
 FOR UPDATE
 `
 
+type LockPendingForUpdateRow struct {
+	IntentID             string
+	ObjectKey            string
+	BackendName          string
+	SizeBytes            int64
+	Encrypted            bool
+	EncryptionKey        []byte
+	KeyID                *string
+	PlaintextSize        *int64
+	ContentHash          *string
+	CompressionAlgorithm *string
+	CompressionLevel     *int32
+	CompressionVersion   *int32
+	LogicalSize          *int64
+	CreatedAt            pgtype.Timestamptz
+}
+
 // Returns the pending row under FOR UPDATE so two concurrent reapers cannot
 // both attempt to promote the same intent. pgx.ErrNoRows means another
 // instance already resolved this intent (deleted the row); the caller
 // treats that as a benign no-op.
-func (q *Queries) LockPendingForUpdate(ctx context.Context, intentID string) (PendingObject, error) {
+func (q *Queries) LockPendingForUpdate(ctx context.Context, intentID string) (LockPendingForUpdateRow, error) {
 	row := q.db.QueryRow(ctx, lockPendingForUpdate, intentID)
-	var i PendingObject
+	var i LockPendingForUpdateRow
 	err := row.Scan(
 		&i.IntentID,
 		&i.ObjectKey,
@@ -160,6 +207,10 @@ func (q *Queries) LockPendingForUpdate(ctx context.Context, intentID string) (Pe
 		&i.KeyID,
 		&i.PlaintextSize,
 		&i.ContentHash,
+		&i.CompressionAlgorithm,
+		&i.CompressionLevel,
+		&i.CompressionVersion,
+		&i.LogicalSize,
 		&i.CreatedAt,
 	)
 	return i, err

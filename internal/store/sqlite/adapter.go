@@ -70,11 +70,13 @@ func (a *sqliteTxAdapter) InsertPending(ctx context.Context, p *core.PendingObje
 	if _, err := a.tx.ExecContext(ctx,
 		`INSERT INTO pending_objects
 		   (intent_id, object_key, backend_name, size_bytes,
-		    encrypted, encryption_key, key_id, plaintext_size, content_hash)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		p.IntentID, p.ObjectKey, p.BackendName, p.SizeBytes,
-		encrypted, p.EncryptionKey,
+		    encrypted, encryption_key, key_id, plaintext_size, content_hash,
+		    compression_algorithm, compression_level, compression_version, logical_size)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		p.IntentID, p.ObjectKey, p.BackendName, p.SizeBytes, encrypted, p.EncryptionKey,
 		nullableString(p.KeyID), nullableInt64(p.PlaintextSize), nullableString(p.ContentHash),
+		nullableString(p.CompressionAlgorithm), nullableInt(p.CompressionLevel),
+		nullableInt(p.CompressionVersion), nullableInt64(p.LogicalSize),
 	); err != nil {
 		return fmt.Errorf("insert pending object: %w", err)
 	}
@@ -204,12 +206,13 @@ func (a *sqliteTxAdapter) InsertObjectLocation(ctx context.Context, loc *core.Ob
 	if _, err := a.tx.ExecContext(ctx,
 		`INSERT INTO object_locations
 		   (object_key, backend_name, size_bytes, encrypted, encryption_key,
-		    key_id, plaintext_size, content_hash, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		loc.ObjectKey, loc.BackendName, loc.SizeBytes, encrypted,
-		loc.EncryptionKey,
+		    key_id, plaintext_size, content_hash, compression_algorithm,
+		    compression_level, compression_version, logical_size, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		loc.ObjectKey, loc.BackendName, loc.SizeBytes, encrypted, loc.EncryptionKey,
 		nullableString(loc.KeyID), nullableInt64(loc.PlaintextSize), nullableString(loc.ContentHash),
-		now,
+		nullableString(loc.CompressionAlgorithm), nullableInt(loc.CompressionLevel),
+		nullableInt(loc.CompressionVersion), nullableInt64(loc.LogicalSize), now,
 	); err != nil {
 		return fmt.Errorf("insert object location: %w", err)
 	}
@@ -248,20 +251,26 @@ func (a *sqliteTxAdapter) CheckObjectExistsOnBackend(ctx context.Context, object
 // gone - benign race.
 func (a *sqliteTxAdapter) LockObjectOnBackend(ctx context.Context, objectKey, backend string) (*core.ObjectLocation, bool, error) {
 	var (
-		size          int64
-		encrypted     int
-		encryptionKey []byte
-		keyID         sql.NullString
-		plaintextSize sql.NullInt64
-		contentHash   sql.NullString
+		size                 int64
+		encrypted            int
+		encryptionKey        []byte
+		keyID                sql.NullString
+		plaintextSize        sql.NullInt64
+		contentHash          sql.NullString
+		compressionAlgorithm sql.NullString
+		compressionLevel     sql.NullInt64
+		compressionVersion   sql.NullInt64
+		logicalSize          sql.NullInt64
 	)
 	err := a.tx.QueryRowContext(ctx,
 		`SELECT size_bytes, encrypted, encryption_key,
-		        key_id, plaintext_size, content_hash
+		        key_id, plaintext_size, content_hash, compression_algorithm,
+		        compression_level, compression_version, logical_size
 		 FROM object_locations
 		 WHERE object_key = ? AND backend_name = ?`,
 		objectKey, backend,
-	).Scan(&size, &encrypted, &encryptionKey, &keyID, &plaintextSize, &contentHash)
+	).Scan(&size, &encrypted, &encryptionKey, &keyID, &plaintextSize, &contentHash,
+		&compressionAlgorithm, &compressionLevel, &compressionVersion, &logicalSize)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, false, nil
 	}
@@ -269,14 +278,18 @@ func (a *sqliteTxAdapter) LockObjectOnBackend(ctx context.Context, objectKey, ba
 		return nil, false, fmt.Errorf("lock object on backend: %w", err)
 	}
 	loc := &core.ObjectLocation{
-		ObjectKey:     objectKey,
-		BackendName:   backend,
-		SizeBytes:     size,
-		Encrypted:     encrypted != 0,
-		EncryptionKey: encryptionKey,
-		KeyID:         nullStringValue(keyID),
-		PlaintextSize: nullInt64Value(plaintextSize),
-		ContentHash:   nullStringValue(contentHash),
+		ObjectKey:            objectKey,
+		BackendName:          backend,
+		SizeBytes:            size,
+		Encrypted:            encrypted != 0,
+		EncryptionKey:        encryptionKey,
+		KeyID:                nullStringValue(keyID),
+		PlaintextSize:        nullInt64Value(plaintextSize),
+		ContentHash:          nullStringValue(contentHash),
+		CompressionAlgorithm: nullStringValue(compressionAlgorithm),
+		CompressionLevel:     int(nullInt64Value(compressionLevel)),
+		CompressionVersion:   int(nullInt64Value(compressionVersion)),
+		LogicalSize:          nullInt64Value(logicalSize),
 	}
 	return loc, true, nil
 }
@@ -331,14 +344,18 @@ func (a *sqliteTxAdapter) InsertReplicaConditional(ctx context.Context, objectKe
 		return 0, false, nil
 	}
 	dest := &core.ObjectLocation{
-		ObjectKey:     objectKey,
-		BackendName:   targetBackend,
-		SizeBytes:     srcLoc.SizeBytes,
-		Encrypted:     srcLoc.Encrypted,
-		EncryptionKey: srcLoc.EncryptionKey,
-		KeyID:         srcLoc.KeyID,
-		PlaintextSize: srcLoc.PlaintextSize,
-		ContentHash:   srcLoc.ContentHash,
+		ObjectKey:            objectKey,
+		BackendName:          targetBackend,
+		SizeBytes:            srcLoc.SizeBytes,
+		Encrypted:            srcLoc.Encrypted,
+		EncryptionKey:        srcLoc.EncryptionKey,
+		KeyID:                srcLoc.KeyID,
+		PlaintextSize:        srcLoc.PlaintextSize,
+		ContentHash:          srcLoc.ContentHash,
+		CompressionAlgorithm: srcLoc.CompressionAlgorithm,
+		CompressionLevel:     srcLoc.CompressionLevel,
+		CompressionVersion:   srcLoc.CompressionVersion,
+		LogicalSize:          srcLoc.LogicalSize,
 	}
 	if err := a.InsertObjectLocation(ctx, dest); err != nil {
 		return 0, false, err

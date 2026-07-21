@@ -3,9 +3,9 @@
 //
 // Author: Alex Freidah
 //
-// Manages the SQLite schema lifecycle. Embeds the consolidated schema DDL and
-// applies it on first run. Subsequent starts verify the schema version matches
-// the expected version.
+// Manages the SQLite schema lifecycle. Embeds the consolidated schema DDL,
+// applies it on first run, and performs supported in-place upgrades for existing
+// single-instance deployments.
 // -------------------------------------------------------------------------------
 
 package sqlite
@@ -25,7 +25,7 @@ var schemaSQL string
 
 // expectedSchemaVersion is the SQLite schema version this binary expects.
 // Bump this when the embedded schema.sql is updated.
-const expectedSchemaVersion = 2
+const expectedSchemaVersion = 3
 
 // RunMigrations applies the embedded SQLite schema if the database has not
 // been initialised yet. If schema_version already exists and the version
@@ -38,17 +38,15 @@ func (s *Store) RunMigrations(ctx context.Context) error {
 	}
 
 	if exists {
-		if version == expectedSchemaVersion {
-			slog.InfoContext(ctx, "SQLite schema up to date",
-				logfmt.Component("sqlite_store"),
-				"version", version,
-			)
+		switch version {
+		case expectedSchemaVersion:
+			slog.InfoContext(ctx, "SQLite schema up to date", logfmt.Component("sqlite_store"), "version", version)
 			return nil
+		case 2:
+			return s.migrateV2ToV3(ctx)
+		default:
+			return fmt.Errorf("SQLite schema version %d does not match expected %d  -  manual migration required", version, expectedSchemaVersion)
 		}
-		return fmt.Errorf(
-			"SQLite schema version %d does not match expected %d  -  manual migration required",
-			version, expectedSchemaVersion,
-		)
 	}
 
 	// Fresh database: apply the full schema inside a transaction.
@@ -60,6 +58,36 @@ func (s *Store) RunMigrations(ctx context.Context) error {
 		logfmt.Component("sqlite_store"),
 		"version", expectedSchemaVersion,
 	)
+	return nil
+}
+
+// migrateV2ToV3 adds nullable compression metadata. Existing rows retain NULL
+// and therefore keep their historical uncompressed interpretation.
+func (s *Store) migrateV2ToV3(ctx context.Context) error {
+	err := s.withTx(ctx, func(tx *sql.Tx) error {
+		statements := []string{
+			"ALTER TABLE object_locations ADD COLUMN compression_algorithm TEXT",
+			"ALTER TABLE object_locations ADD COLUMN compression_level INTEGER",
+			"ALTER TABLE object_locations ADD COLUMN compression_version INTEGER",
+			"ALTER TABLE object_locations ADD COLUMN logical_size INTEGER",
+			"ALTER TABLE pending_objects ADD COLUMN compression_algorithm TEXT",
+			"ALTER TABLE pending_objects ADD COLUMN compression_level INTEGER",
+			"ALTER TABLE pending_objects ADD COLUMN compression_version INTEGER",
+			"ALTER TABLE pending_objects ADD COLUMN logical_size INTEGER",
+			"DELETE FROM schema_version",
+			"INSERT INTO schema_version (version) VALUES (3)",
+		}
+		for _, statement := range statements {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("migrate sqlite schema v2 to v3: %w", err)
+	}
+	slog.InfoContext(ctx, "SQLite schema migrated", logfmt.Component("sqlite_store"), "from_version", 2, "to_version", 3)
 	return nil
 }
 

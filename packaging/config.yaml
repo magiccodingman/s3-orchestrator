@@ -78,6 +78,13 @@ backends:
 # --- Object routing ---
 # routing_strategy: pack          # "pack" fills backends sequentially, "spread" distributes evenly
 
+# --- Transparent Zstandard compression (disabled by default) ---
+# New objects are compressed as one Zstandard frame before optional encryption.
+# Existing objects are unchanged and remain readable alongside compressed rows.
+# compression:
+#   enabled: true
+#   level: 3                       # 1-19 (default: 3)
+
 # --- Server-side encryption (disabled by default) ---
 # Envelope encryption with chunked AES-256-GCM. Each object gets a random
 # 256-bit DEK wrapped by the master key. Exactly one key source is required.

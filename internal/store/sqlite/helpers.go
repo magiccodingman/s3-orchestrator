@@ -53,6 +53,9 @@ func nullableInt64(n int64) sql.NullInt64 {
 	return sql.NullInt64{Int64: n, Valid: true}
 }
 
+// nullableInt adapts an int metadata field to the nullable integer helper.
+func nullableInt(n int) sql.NullInt64 { return nullableInt64(int64(n)) }
+
 // nullStringValue returns s.String when s.Valid, otherwise "". Pairs
 // with nullableString for round-tripping optional string columns
 // without the inline "if x.Valid { dst = x.String }" pattern at every

@@ -144,14 +144,18 @@ func (a *pgTxAdapter) LockObjectOnBackend(ctx context.Context, objectKey, backen
 		return nil, false, fmt.Errorf("lock object on backend: %w", err)
 	}
 	loc := &core.ObjectLocation{
-		ObjectKey:     objectKey,
-		BackendName:   backend,
-		SizeBytes:     row.SizeBytes,
-		Encrypted:     row.Encrypted,
-		EncryptionKey: row.EncryptionKey,
-		KeyID:         derefStr(row.KeyID),
-		PlaintextSize: derefInt64(row.PlaintextSize),
-		ContentHash:   derefStr(row.ContentHash),
+		ObjectKey:            objectKey,
+		BackendName:          backend,
+		SizeBytes:            row.SizeBytes,
+		Encrypted:            row.Encrypted,
+		EncryptionKey:        row.EncryptionKey,
+		KeyID:                derefStr(row.KeyID),
+		PlaintextSize:        derefInt64(row.PlaintextSize),
+		ContentHash:          derefStr(row.ContentHash),
+		CompressionAlgorithm: derefStr(row.CompressionAlgorithm),
+		CompressionLevel:     derefInt32(row.CompressionLevel),
+		CompressionVersion:   derefInt32(row.CompressionVersion),
+		LogicalSize:          derefInt64(row.LogicalSize),
 	}
 	return loc, true, nil
 }
@@ -172,10 +176,20 @@ func (a *pgTxAdapter) DeleteObjectFromBackend(ctx context.Context, objectKey, ba
 // already exist for (key, backend). Returns true when the row was newly
 // inserted.
 func (a *pgTxAdapter) InsertObjectLocationIfNotExists(ctx context.Context, loc *core.ObjectLocation) (bool, error) {
+	base := objectInsertParams(loc)
 	inserted, err := a.q.InsertObjectLocationIfNotExists(ctx, db.InsertObjectLocationIfNotExistsParams{
-		ObjectKey:   loc.ObjectKey,
-		BackendName: loc.BackendName,
-		SizeBytes:   loc.SizeBytes,
+		ObjectKey:            base.ObjectKey,
+		BackendName:          base.BackendName,
+		SizeBytes:            base.SizeBytes,
+		Encrypted:            base.Encrypted,
+		EncryptionKey:        base.EncryptionKey,
+		KeyID:                base.KeyID,
+		PlaintextSize:        base.PlaintextSize,
+		ContentHash:          base.ContentHash,
+		CompressionAlgorithm: base.CompressionAlgorithm,
+		CompressionLevel:     base.CompressionLevel,
+		CompressionVersion:   base.CompressionVersion,
+		LogicalSize:          base.LogicalSize,
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil

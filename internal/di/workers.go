@@ -21,6 +21,7 @@ import (
 
 	"github.com/samber/do/v2"
 
+	"github.com/afreidah/s3-orchestrator/internal/compression"
 	"github.com/afreidah/s3-orchestrator/internal/config"
 	"github.com/afreidah/s3-orchestrator/internal/encryption"
 	"github.com/afreidah/s3-orchestrator/internal/instanceid"
@@ -190,11 +191,13 @@ func ProvideScrubber(i do.Injector) (*worker.Scrubber, error) {
 			enc = e
 		}
 	}
+	compressor, err := do.Invoke[*compression.Codec](i)
+	if err != nil {
+		return nil, err
+	}
 	return worker.NewScrubber(worker.ScrubberDeps{
-		Ops:       c.Mgr.Runtime(),
-		Placement: c.Mgr,
-		Store:     c.Stores,
-		Encryptor: enc,
+		Ops: c.Mgr.Runtime(), Placement: c.Mgr, Store: c.Stores,
+		Encryptor: enc, Compressor: compressor,
 	}), nil
 }
 

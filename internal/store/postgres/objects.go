@@ -44,7 +44,7 @@ func (s *Store) RecordObjectAndClearPending(ctx context.Context, key, backend st
 }
 
 // insertParamsFromEnc builds InsertObjectLocationParams, attaching
-// encryption and content-hash metadata when provided.
+// all persisted representation metadata when provided.
 func insertParamsFromEnc(key, backend string, size int64, enc *core.EncryptionMeta) db.InsertObjectLocationParams {
 	params := db.InsertObjectLocationParams{
 		ObjectKey:   key,
@@ -61,6 +61,12 @@ func insertParamsFromEnc(key, backend string, size int64, enc *core.EncryptionMe
 		params.PlaintextSize = &enc.PlaintextSize
 	}
 	params.ContentHash = strPtr(enc.ContentHash)
+	if enc.Compressed() {
+		params.CompressionAlgorithm = strPtr(enc.CompressionAlgorithm)
+		params.CompressionLevel = int32Ptr(enc.CompressionLevel)
+		params.CompressionVersion = int32Ptr(enc.CompressionVersion)
+		params.LogicalSize = int64Ptr(enc.LogicalSize)
+	}
 	return params
 }
 

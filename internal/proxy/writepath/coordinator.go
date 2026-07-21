@@ -189,6 +189,10 @@ func (w *Coordinator) InsertPendingIntent(ctx context.Context, key, backendName 
 		p.KeyID = enc.KeyID
 		p.PlaintextSize = enc.PlaintextSize
 		p.ContentHash = enc.ContentHash
+		p.CompressionAlgorithm = enc.CompressionAlgorithm
+		p.CompressionLevel = enc.CompressionLevel
+		p.CompressionVersion = enc.CompressionVersion
+		p.LogicalSize = enc.LogicalSize
 	}
 	if err := w.stores.InsertPending(ctx, &p); err != nil {
 		return "", fmt.Errorf("insert pending intent: %w", err)

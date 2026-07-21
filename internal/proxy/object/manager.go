@@ -22,6 +22,7 @@ import (
 	"time"
 
 	objcache "github.com/afreidah/s3-orchestrator/internal/cache"
+	"github.com/afreidah/s3-orchestrator/internal/compression"
 	"github.com/afreidah/s3-orchestrator/internal/config"
 	"github.com/afreidah/s3-orchestrator/internal/encryption"
 	"github.com/afreidah/s3-orchestrator/internal/observe/logfmt"
@@ -52,6 +53,9 @@ type Manager struct {
 	coord             ObjectCoordinator // write-path helpers shared with BackendManager and MultipartManager
 	stores            ObjectStores      // direct store access for read paths and quota inspection
 	encryptor         *encryption.Encryptor
+	compressor        *compression.Codec
+	compressWrites    bool
+	compressionLevel  int
 	cache             *LocationCache
 	objectCache       objcache.ObjectCache // nil when object data caching is disabled
 	parallelBroadcast bool
@@ -71,6 +75,9 @@ type Deps struct {
 	Coord             ObjectCoordinator
 	Stores            ObjectStores
 	Encryptor         *encryption.Encryptor
+	Compressor        *compression.Codec
+	CompressWrites    bool
+	CompressionLevel  int
 	LocationCache     *LocationCache
 	ObjectCache       objcache.ObjectCache
 	ParallelBroadcast bool
@@ -99,11 +106,22 @@ func New(d *Deps) *Manager {
 	must.NotNil("d.Stores", d.Stores)
 	must.NotNil("d.LocationCache", d.LocationCache)
 	must.NotNil("d.IntegrityCfg", d.IntegrityCfg)
+	level := d.CompressionLevel
+	if level == 0 {
+		level = 3
+	}
+	compressor := d.Compressor
+	if compressor == nil {
+		compressor = compression.New(level)
+	}
 	return &Manager{
 		core:              d.Core,
 		coord:             d.Coord,
 		stores:            d.Stores,
 		encryptor:         d.Encryptor,
+		compressor:        compressor,
+		compressWrites:    d.CompressWrites,
+		compressionLevel:  level,
 		cache:             d.LocationCache,
 		objectCache:       d.ObjectCache,
 		parallelBroadcast: d.ParallelBroadcast,
@@ -147,6 +165,12 @@ func (o *Manager) LocationCache() *LocationCache {
 // size. Used by the HTTP handler to reject uploads before the request body
 // is transmitted (Expect: 100-Continue support).
 func (o *Manager) CanAcceptWrite(size int64) bool {
+	if o.compressWrites {
+		// The physical ingress size is unknowable before reading and encoding the
+		// request. Preserve the 100-continue fast rejection for unavailable/API-
+		// limited fleets, then apply byte and max-object limits after compression.
+		return len(o.core.EligibleForWrite(1, 0, 0)) > 0
+	}
 	return len(o.core.EligibleForWrite(1, 0, size)) > 0
 }
 
