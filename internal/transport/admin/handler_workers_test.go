@@ -23,6 +23,8 @@ import (
 	"net/http/httptest"
 	"testing"
 	"time"
+
+	"github.com/afreidah/s3-orchestrator/internal/transport/admin/adminapi"
 )
 
 // TestHandleWorkers_HappyPath drives the success branch. The handler
@@ -32,9 +34,9 @@ import (
 func TestHandleWorkers_HappyPath(t *testing.T) {
 	t.Parallel()
 	now := time.Unix(1715000000, 0)
-	h := newTestHandler()
-	h.workerHealth = func() []WorkerHealth {
-		return []WorkerHealth{
+	h := newTestHandler(t)
+	h.workerHealth = func() []adminapi.WorkerHealth {
+		return []adminapi.WorkerHealth{
 			{Name: "cleanup_queue", LastSuccess: now, ConsecutiveFailures: 0},
 			{Name: "replicator", LastFailure: now, LastError: "boom", ConsecutiveFailures: 3},
 		}
@@ -43,7 +45,7 @@ func TestHandleWorkers_HappyPath(t *testing.T) {
 	h.Register(mux)
 
 	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/admin/api/workers", nil)
-	req.Header.Set("X-Admin-Token", "test-token")
+	signRoot(t, req)
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
 
@@ -51,7 +53,7 @@ func TestHandleWorkers_HappyPath(t *testing.T) {
 		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
 	}
 	var resp struct {
-		Workers []WorkerHealth `json:"workers"`
+		Workers []adminapi.WorkerHealth `json:"workers"`
 	}
 	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
 		t.Fatalf("decode: %v", err)
@@ -76,12 +78,12 @@ func TestHandleWorkers_HappyPath(t *testing.T) {
 // "worker pool is healthy but reporting nothing".
 func TestHandleWorkers_NotWired(t *testing.T) {
 	t.Parallel()
-	h := newTestHandler() // workerHealth deliberately nil
+	h := newTestHandler(t) // workerHealth deliberately nil
 	mux := http.NewServeMux()
 	h.Register(mux)
 
 	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/admin/api/workers", nil)
-	req.Header.Set("X-Admin-Token", "test-token")
+	signRoot(t, req)
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
 
@@ -94,8 +96,8 @@ func TestHandleWorkers_NotWired(t *testing.T) {
 // is gated by the admin token like every other admin route.
 func TestHandleWorkers_RequiresToken(t *testing.T) {
 	t.Parallel()
-	h := newTestHandler()
-	h.workerHealth = func() []WorkerHealth { return nil }
+	h := newTestHandler(t)
+	h.workerHealth = func() []adminapi.WorkerHealth { return nil }
 	mux := http.NewServeMux()
 	h.Register(mux)
 

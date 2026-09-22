@@ -14,10 +14,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
-// QuotaBytesUsed and related package-level variables used by this package.
+// Per-backend quota usage metrics.
 var (
-	// --- Quota metrics ---
-
 	// QuotaBytesUsed tracks current bytes used per backend.
 	QuotaBytesUsed = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
@@ -54,17 +52,28 @@ var (
 		[]string{"backend"},
 	)
 
-	// UsageReconcileCorrectionsTotal counts per-backend bytes_used corrections
-	// applied by usage reconciliation. A steadily rising value means a write
-	// path is leaking the counter; the reconcile dashboard panel reads this.
+	// UsageReconcileCorrectionsTotal counts per-backend byte-total corrections
+	// applied by usage reconciliation. The counter moves inside the transaction
+	// that writes the rows it summarizes, so this should never rise: any
+	// increase means a mutation path is not charging what it stored.
 	UsageReconcileCorrectionsTotal = promauto.NewCounter(
 		prometheus.CounterOpts{
 			Name: "s3o_quota_reconcile_corrections_total",
-			Help: "Per-backend bytes_used drift corrections applied by usage reconciliation",
+			Help: "Byte-total drift corrections applied by usage reconciliation; expected to stay at zero",
 		},
 	)
 
-	// --- Object metrics ---
+	// QuotaClaimsDeclinedTotal counts writes a backend refused for want of
+	// room, judged by the insert that claims the space rather than by any
+	// in-memory figure. A backend appearing here is full: the write either
+	// moved to another candidate or, if none had room, failed with 507.
+	QuotaClaimsDeclinedTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "s3o_quota_claims_declined_total",
+			Help: "Write claims a backend declined for insufficient room",
+		},
+		[]string{"backend"},
+	)
 
 	// ObjectCount tracks the number of objects stored per backend.
 	ObjectCount = promauto.NewGaugeVec(
@@ -75,8 +84,6 @@ var (
 		[]string{"backend"},
 	)
 
-	// --- Multipart metrics ---
-
 	// ActiveMultipartUploads tracks in-progress multipart uploads per backend.
 	ActiveMultipartUploads = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
@@ -86,8 +93,6 @@ var (
 		[]string{"backend"},
 	)
 
-	// --- Usage tracking metrics ---
-
 	// UsageAPIRequests tracks the current month's API request count per backend.
 	UsageAPIRequests = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
@@ -95,6 +100,27 @@ var (
 			Help: "Current month API request count per backend (from DB)",
 		},
 		[]string{"backend"},
+	)
+
+	// UsagePoolRequests tracks the current month's request count per backend
+	// request pool. Pools are additive, so these do not sum to
+	// s3o_usage_api_requests.
+	UsagePoolRequests = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "s3o_usage_pool_requests",
+			Help: "Current month request count per backend request pool (from DB)",
+		},
+		[]string{"backend", "pool"},
+	)
+
+	// UsagePoolLimit publishes each pool's configured ceiling, so a dashboard
+	// can show headroom without the limit being hardcoded alongside it.
+	UsagePoolLimit = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "s3o_usage_pool_limit",
+			Help: "Configured monthly request ceiling per backend request pool (0 = unlimited)",
+		},
+		[]string{"backend", "pool"},
 	)
 
 	// UsageEgressBytes tracks the current month's egress bytes per backend.
@@ -115,8 +141,6 @@ var (
 		[]string{"backend"},
 	)
 
-	// --- Usage limit metrics ---
-
 	// UsageLimitRejectionsTotal counts operations rejected due to monthly usage limits.
 	UsageLimitRejectionsTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
@@ -125,5 +149,4 @@ var (
 		},
 		[]string{"operation", "limit_type"},
 	)
-
 )

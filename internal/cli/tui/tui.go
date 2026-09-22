@@ -8,17 +8,20 @@
 // tracking loading and error states through the Model / Update / View loop.
 // -------------------------------------------------------------------------------
 
-// Package tui implements the `s3-orchestrator tui` terminal browser.
 package tui
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
-	"strconv"
+	"os"
 	"strings"
+
+	"github.com/afreidah/s3-orchestrator/internal/cli/adminclient"
+	"github.com/afreidah/s3-orchestrator/internal/util/humanize"
 
 	"github.com/afreidah/s3-orchestrator/internal/cli/admintarget"
 	"github.com/afreidah/s3-orchestrator/internal/config"
@@ -43,38 +46,64 @@ type entry struct {
 type adminClient interface {
 	ListObjects(ctx context.Context, prefix, continuation string) (*adminapi.ObjectListResponse, error)
 	GetObjectLocations(ctx context.Context, key string) (*adminapi.ObjectLocationsResponse, error)
+	GetObjectTags(ctx context.Context, key string) (*adminapi.ObjectTagsResponse, error)
+	ScrubKey(ctx context.Context, key string) (*adminapi.ScrubKeyResponse, error)
 	GetStatus(ctx context.Context) (*adminapi.StatusResponse, error)
 	GetLogs(ctx context.Context, level string) (*adminapi.LogsResponse, error)
-	ReconcileUsage(ctx context.Context) error
-	FlushCache(ctx context.Context) error
+	GetReplicationStatus(ctx context.Context) (*adminapi.ReplicationStatusResponse, error)
+	GetWorkers(ctx context.Context) (*adminapi.WorkersResponse, error)
+	GetCleanupQueue(ctx context.Context) (*adminapi.CleanupQueueResponse, error)
+	GetCleanupDLQ(ctx context.Context) (*adminapi.CleanupDLQResponse, error)
+	GetCacheStats(ctx context.Context) (*adminapi.CacheStatsResponse, error)
+	GetProvisioning(ctx context.Context) (*adminapi.ProvisioningResponse, error)
+	RequeueCleanupDLQ(ctx context.Context, backend string) (*adminapi.CleanupDLQRequeueResponse, error)
+	RunOp(ctx context.Context, act *opsAction, req opsRequest) (adminclient.EventStream, error)
+	ListObjectsFlat(ctx context.Context, prefix, continuation string) (*adminapi.ObjectListResponse, error)
+	DownloadObject(ctx context.Context, key string) (io.ReadCloser, int64, error)
+	UploadObject(ctx context.Context, key string, body io.Reader, size int64) error
+	DeleteObject(ctx context.Context, key string) (*adminapi.ObjectDeleteResponse, error)
+	DeletePrefix(ctx context.Context, prefix string) (*adminapi.ObjectDeleteResponse, error)
+	StartDrain(ctx context.Context, backend string) (*adminapi.BackendOperationResponse, error)
+	DrainProgress(ctx context.Context, backend string) (*adminapi.DrainProgressResponse, error)
+	CancelDrain(ctx context.Context, backend string) (*adminapi.BackendOperationResponse, error)
+	ReconcileBackend(ctx context.Context, backend string) (*adminapi.ReconcileResponse, error)
 }
 
 // model is the Bubble Tea state for the browser.
 type model struct {
-	client    adminClient
-	section   section         // active left-nav destination (Files, Backends)
-	navFocus  bool            // the left nav has focus and is capturing keys
-	navCursor int             // highlighted nav entry while the nav is focused
-	mode      viewMode        // Files sub-state: the listing (browse) or the inspector
-	insp      inspector       // inspector pane state, populated when mode is modeInspect
-	backends  backendsView    // backends pane state, populated when section is sectionBackends
-	logs      logsView        // logs pane state, populated when section is sectionLogs
-	prefix    string          // the prefix currently listed ("" is the root)
-	entries   []entry         // every loaded row under the current prefix
-	visible   []entry         // entries after filter + sort, indexed by table cursor
-	table     table.Model     // scrolling, selectable listing table
-	filter    textinput.Model // substring filter over the current listing
-	filtering bool            // the filter input has focus and is capturing keys
-	sort      sortField       // ordering applied to visible
-	loading   bool            // a fresh (page-replacing) load is in flight
-	next      string          // continuation token for the current prefix ("" = no more)
-	more      bool            // a load-more (append) request is in flight
-	err       error           // last load error, if any
-	spinner   spinner.Model   // animated indicator shown while loading
-	confirm   *confirmPrompt  // armed confirmation for a pending write action, if any
-	status    *actionStatus   // result of the last action, shown until the next keypress
-	width     int             // terminal width from the last WindowSizeMsg
-	height    int             // terminal height from the last WindowSizeMsg
+	client      adminClient
+	section     section         // active left-nav destination (Files, Backends)
+	navFocus    bool            // the left nav has focus and is capturing keys
+	navCursor   int             // highlighted nav entry while the nav is focused
+	mode        viewMode        // Files sub-state: the listing (browse) or the inspector
+	insp        inspector       // inspector pane state, populated when mode is modeInspect
+	backends    backendsView    // backends pane state, populated when section is sectionBackends
+	buckets     bucketsView     // buckets pane state, populated when section is sectionBuckets
+	logs        logsView        // logs pane state, populated when section is sectionLogs
+	replication replicationView // replication pane state, populated when section is sectionReplication
+	workers     workersView     // workers pane state, populated when section is sectionWorkers
+	cleanup     cleanupView     // cleanup pane state, populated when section is sectionCleanup
+	cache       cacheView       // cache pane state, populated when section is sectionCache
+	ops         opsView         // ops pane state, populated when section is sectionOps
+	files       fileAction      // the Files pane's in-flight transfer, if any
+	prefix      string          // the prefix currently listed ("" is the root)
+	entries     []entry         // every loaded row under the current prefix
+	visible     []entry         // entries after filter + sort, indexed by table cursor
+	table       table.Model     // scrolling, selectable listing table
+	filter      textinput.Model // substring filter over the current listing
+	filtering   bool            // the filter input has focus and is capturing keys
+	sort        sortField       // ordering applied to visible
+	loading     bool            // a fresh (page-replacing) load is in flight
+	next        string          // continuation token for the current prefix ("" = no more)
+	more        bool            // a load-more (append) request is in flight
+	err         error           // last load error, if any
+	spinner     spinner.Model   // animated indicator shown while loading
+	confirm     *confirmPrompt  // armed confirmation for a pending write action, if any
+	prompt      *inputPrompt    // armed input prompt for an action that needs a value, if any
+	status      *actionStatus   // result of the last action, shown until the next keypress
+	dbHealthy   *bool           // metadata DB health from the last status fetch (nil = unknown)
+	width       int             // terminal width from the last WindowSizeMsg
+	height      int             // terminal height from the last WindowSizeMsg
 }
 
 // initialModel builds the starting state; loading is true because Init fires
@@ -84,10 +113,18 @@ func initialModel(client adminClient) *model {
 	fi.Prompt = ""
 	fi.Placeholder = "type to filter"
 	m := &model{client: client, loading: true, spinner: spinner.New(), table: newTable(), filter: fi}
-	// Seed the browser columns up front. The initial object load can be
+	m.backends = backendsView{table: newTable()}
+	m.buckets = bucketsView{table: newTable()}
+	m.workers = workersView{table: newTable()}
+	m.cleanup = cleanupView{queue: newTable(), dlq: newTable()}
+	// Seed the browser and backends columns up front. The initial loads can be
 	// delivered before the first WindowSizeMsg, and SetRows on a column-less
 	// table panics in the table's row renderer.
 	m.resizeTable()
+	m.resizeBackends()
+	m.resizeBuckets()
+	m.resizeWorkers()
+	m.resizeCleanup()
 	return m
 }
 
@@ -151,11 +188,22 @@ func entriesFromPage(prefix string, page *adminapi.ObjectListResponse) []entry {
 
 // Init fires the first load of the root prefix and starts the spinner ticking.
 func (m *model) Init() tea.Cmd {
-	return tea.Batch(m.loadObjects(m.prefix, ""), m.spinner.Tick)
+	// Fetch status alongside the first listing so the sidebar's DB-health
+	// indicator is populated from startup, on any section.
+	return tea.Batch(m.loadObjects(m.prefix, ""), m.loadStatus(), m.spinner.Tick)
 }
 
-// Update handles one message and returns the next state.
+// Update handles one message and returns the next state. The backends pane's
+// own messages are dispatched first, by the pane, so its drain bookkeeping
+// lives with the code that reads it rather than swelling this switch.
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if model, cmd, handled := m.updateBackends(msg); handled {
+		return model, cmd
+	}
+	if model, cmd, handled := m.updateFileActions(msg); handled {
+		return model, cmd
+	}
+
 	switch msg := msg.(type) {
 	case objectsLoadedMsg:
 		m.applyPage(msg)
@@ -171,6 +219,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.insp.loading = false
 		m.insp.err = msg.err
 		return m, nil
+	case tagsLoadedMsg:
+		m.applyTags(msg)
+		return m, nil
+	case scrubKeyMsg:
+		return m.applyScrubKey(msg)
 	case statusLoadedMsg:
 		m.applyStatus(msg.resp)
 		return m, nil
@@ -185,8 +238,47 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.logs.loading = false
 		m.logs.err = msg.err
 		return m, nil
-	case actionResultMsg:
-		return m.applyActionResult(msg)
+	case replicationLoadedMsg:
+		m.applyReplication(msg.resp)
+		return m, nil
+	case replicationErrMsg:
+		m.applyReplicationErr(msg.err)
+		return m, nil
+	case replicationTickMsg:
+		return m.onReplicationTick()
+	case workersLoadedMsg:
+		m.applyWorkers(msg.resp)
+		return m, nil
+	case workersErrMsg:
+		m.applyWorkersErr(msg.err)
+		return m, nil
+	case cleanupLoadedMsg:
+		m.applyCleanup(msg)
+		return m, nil
+	case cleanupErrMsg:
+		m.cleanup.loading = false
+		m.cleanup.err = msg.err
+		return m, nil
+	case cleanupRequeuedMsg:
+		return m.applyCleanupRequeued(msg)
+	case cacheLoadedMsg:
+		m.applyCache(msg.resp)
+		return m, nil
+	case cacheErrMsg:
+		m.applyCacheErr(msg.err)
+		return m, nil
+	case bucketsLoadedMsg:
+		m.applyBuckets(msg.resp)
+		return m, nil
+	case bucketsErrMsg:
+		m.applyBucketsErr(msg.err)
+		return m, nil
+	case opsStreamMsg:
+		return m.applyOpsStream(msg)
+	case opsEventMsg:
+		return m.applyOpsEvent(&msg.event)
+	case opsDoneMsg:
+		return m.applyOpsDone(msg)
 	case spinner.TickMsg:
 		var cmd tea.Cmd
 		m.spinner, cmd = m.spinner.Update(msg)
@@ -197,7 +289,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.resizeTable()
 		m.resizeInspector()
 		m.resizeBackends()
+		m.resizeBuckets()
+		m.resizeWorkers()
+		m.resizeCleanup()
 		m.resizeLogs()
+		m.resizeOps()
 		return m, nil
 	case tea.KeyMsg:
 		return m.handleKey(msg)
@@ -208,8 +304,45 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // handleKey applies global keys (quit, nav focus, section jumps) then routes the
 // rest to the focused nav or the active section's view. While the filter input
 // is capturing, the browser gets every key so typing is never intercepted.
+// handleGlobalKey applies the keys that mean the same thing in every pane:
+// quit, the nav toggle, and the single-letter section jumps. Reports whether
+// the key was one of them, so the caller can route on to the active pane.
+func (m *model) handleGlobalKey(key tea.KeyMsg) (tea.Model, tea.Cmd, bool) {
+	switch key.String() {
+	case "q", "ctrl+c":
+		return m, tea.Quit, true
+	case "tab":
+		m.navFocus = !m.navFocus
+		if m.navFocus {
+			m.navCursor = int(m.section)
+		}
+		return m, nil, true
+	}
+
+	sections := map[string]section{
+		"f": sectionFiles,
+		"b": sectionBackends,
+		"v": sectionBuckets,
+		"p": sectionReplication,
+		"w": sectionWorkers,
+		"u": sectionCleanup,
+		"c": sectionCache,
+		"l": sectionLogs,
+		"o": sectionOps,
+	}
+	if s, ok := sections[key.String()]; ok {
+		model, cmd := m.selectSection(s)
+		return model, cmd, true
+	}
+	return m, nil, false
+}
+
 func (m *model) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
-	// A pending confirmation captures the next key before anything else.
+	// An armed prompt captures the next key before anything else: the input
+	// first, since typing a key or prefix must never reach the pane below.
+	if m.prompt != nil {
+		return m.handleInputKey(key)
+	}
 	if m.confirm != nil {
 		return m.handleConfirmKey(key)
 	}
@@ -220,31 +353,8 @@ func (m *model) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleFilterKey(key)
 	}
 
-	switch key.String() {
-	case "q", "ctrl+c":
-		return m, tea.Quit
-	case "tab":
-		m.navFocus = !m.navFocus
-		if m.navFocus {
-			m.navCursor = int(m.section)
-		}
-		return m, nil
-	case "f":
-		return m.selectSection(sectionFiles)
-	case "b":
-		return m.selectSection(sectionBackends)
-	case "l":
-		return m.selectSection(sectionLogs)
-	case "R":
-		return m.startAction(adminAction{
-			confirm: "Reconcile usage counters across all backends?",
-			run:     m.runAction("usage-reconcile", m.client.ReconcileUsage),
-		})
-	case "F":
-		return m.startAction(adminAction{
-			confirm: "Flush the in-memory object cache?",
-			run:     m.runAction("cache-flush", m.client.FlushCache),
-		})
+	if model, cmd, handled := m.handleGlobalKey(key); handled {
+		return model, cmd
 	}
 
 	if m.navFocus {
@@ -253,8 +363,26 @@ func (m *model) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.section == sectionLogs {
 		return m.handleLogsKey(key)
 	}
+	if m.section == sectionReplication {
+		return m.handleReplicationKey(key)
+	}
+	if m.section == sectionOps {
+		return m.handleOpsKey(key)
+	}
 	if m.section == sectionBackends {
 		return m.handleBackendsKey(key)
+	}
+	if m.section == sectionBuckets {
+		return m.handleBucketsKey(key)
+	}
+	if m.section == sectionWorkers {
+		return m.handleWorkersKey(key)
+	}
+	if m.section == sectionCleanup {
+		return m.handleCleanupKey(key)
+	}
+	if m.section == sectionCache {
+		return m.handleCacheKey(key)
 	}
 	if m.mode == modeInspect {
 		return m.handleInspectKey(key)
@@ -288,6 +416,10 @@ func (m *model) handleBrowseKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.loading = true
 		cmd := m.loadObjects(m.prefix, "")
 		return m, cmd
+	}
+
+	if model, cmd, handled := m.handleFileActionKey(key.String()); handled {
+		return model, cmd
 	}
 
 	var cmd tea.Cmd
@@ -377,32 +509,17 @@ func rowsFromEntries(entries []entry) []table.Row {
 			rows = append(rows, table.Row{e.name, "dir", ""})
 			continue
 		}
-		rows = append(rows, table.Row{e.name, "obj", humanSize(e.size)})
+		rows = append(rows, table.Row{e.name, "obj", humanize.Bytes(e.size)})
 	}
 	return rows
-}
-
-// humanSize renders a byte count in IEC binary units (B, KiB, MiB, ...), with
-// one decimal place above bytes so sizes read at a glance.
-func humanSize(n int64) string {
-	const unit = 1024
-	if n < unit {
-		return strconv.FormatInt(n, 10) + " B"
-	}
-	div, exp := int64(unit), 0
-	for x := n / unit; x >= unit; x /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
 }
 
 // parentPrefix returns the parent of a delimiter-terminated prefix, or "" when
 // already at the root.
 func parentPrefix(prefix string) string {
 	p := strings.TrimSuffix(prefix, "/")
-	if i := strings.LastIndex(p, "/"); i >= 0 {
-		return p[:i+1]
+	if parent, _, ok := strings.CutLast(p, "/"); ok {
+		return parent + "/"
 	}
 	return ""
 }
@@ -421,8 +538,26 @@ func (m *model) contentView() string {
 	if m.section == sectionLogs {
 		return m.logsPaneView()
 	}
+	if m.section == sectionReplication {
+		return m.replicationPaneView()
+	}
+	if m.section == sectionOps {
+		return m.opsPaneView()
+	}
 	if m.section == sectionBackends {
 		return m.backendsPaneView()
+	}
+	if m.section == sectionBuckets {
+		return m.bucketsPaneView()
+	}
+	if m.section == sectionWorkers {
+		return m.workersPaneView()
+	}
+	if m.section == sectionCleanup {
+		return m.cleanupPaneView()
+	}
+	if m.section == sectionCache {
+		return m.cachePaneView()
 	}
 	if m.mode == modeInspect {
 		return m.inspectView()
@@ -436,6 +571,24 @@ func (m *model) frame(header, footer, body string) string {
 	bodyHeight := max(m.height-lipgloss.Height(header)-lipgloss.Height(footer), 1)
 	rendered := lipgloss.NewStyle().Width(m.contentWidth()).Height(bodyHeight).MaxHeight(bodyHeight).Render(body)
 	return lipgloss.JoinVertical(lipgloss.Left, header, rendered, footer)
+}
+
+// paneBody renders the three states every pane reports the same way - a load
+// that failed, a pane this deployment did not wire, and a load still in flight
+// - and defers to content for the pane's own rendering. Panes whose data is
+// always present pass an empty unavailable. Shared so the states a user reads
+// as "something is wrong" cannot drift apart between panes.
+func (m *model) paneBody(err error, unavailable string, loading bool, content func() string) string {
+	switch {
+	case err != nil:
+		return errStyle.Render("error: " + err.Error())
+	case unavailable != "":
+		return pathStyle.Render("(" + unavailable + ")")
+	case loading:
+		return m.spinner.View() + " loading..."
+	default:
+		return content()
+	}
 }
 
 // headerView renders the full-width title bar with the current prefix.
@@ -460,8 +613,14 @@ func (m *model) headerView() string {
 // footerView renders the status line (sort, filter, paging) above the key-hint
 // bar. Both lines are always present so the footer keeps a fixed height.
 func (m *model) footerView() string {
-	matches := pathStyle.Width(m.contentWidth()).Render(m.statusLine())
-	hints := m.footer("up/down move - enter open - / filter - s sort - tab nav - q quit")
+	status := m.statusLine()
+	// A running transfer takes the status line: how far it has got matters
+	// more than the match count while bytes are moving.
+	if line := m.fileTransferLine(); line != "" {
+		status = line
+	}
+	matches := pathStyle.Width(m.contentWidth()).Render(status)
+	hints := m.footer("up/down move - enter open - D download - U upload - X delete - / filter - tab nav - q quit")
 	return lipgloss.JoinVertical(lipgloss.Left, matches, hints)
 }
 
@@ -486,43 +645,71 @@ func (m *model) bodyView() string {
 // ENTRY POINT
 // -------------------------------------------------------------------------
 
+// target is the resolved admin endpoint and the keypair to reach it with.
+type target struct {
+	baseAddr    string
+	accessKeyID string
+	secretKey   string
+}
+
+// signs reports whether this target carries a keypair to sign with.
+func (t target) signs() bool {
+	return t.accessKeyID != "" && t.secretKey != ""
+}
+
 // resolveTarget parses the tui flags and resolves the admin base address and
-// token (flag -> env -> config), returning an http-prefixed base address or an
-// error describing what is missing.
-func resolveTarget(args []string) (baseAddr, token string, err error) {
+// credential (flag -> env -> config), returning an http-prefixed base address
+// or an error describing what is missing.
+func resolveTarget(args []string) (target, error) {
 	fs := flag.NewFlagSet("tui", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	configPath := fs.String("config", "config.yaml", "Path to config file (only loaded when -addr/-token or their env vars are unset)")
 	addr := fs.String("addr", "", "Server address (overrides $S3O_ADMIN_ADDR and config)")
-	tokenFlag := fs.String("token", "", "Admin API token (overrides $S3O_ADMIN_TOKEN and config)")
+	accessKey := fs.String("access-key", "", "Access key ID to sign with (overrides $S3O_ACCESS_KEY_ID)")
+	secretKey := fs.String("secret-key", "", "Secret access key to sign with (overrides $S3O_SECRET_ACCESS_KEY)")
 	if err := fs.Parse(args); err != nil {
-		return "", "", err
+		return target{}, err
 	}
 
-	baseAddr, token, err = admintarget.Resolve(*addr, *tokenFlag, func() (*config.Config, error) {
+	t := target{
+		accessKeyID: cmp.Or(*accessKey, os.Getenv(admintarget.EnvAccessKey)),
+		secretKey:   cmp.Or(*secretKey, os.Getenv(admintarget.EnvSecretKey)),
+	}
+	if !t.signs() {
+		return target{}, errors.New("a credential is required (set -access-key and -secret-key, " +
+			"or $S3O_ACCESS_KEY_ID and $S3O_SECRET_ACCESS_KEY)")
+	}
+	// The config file is only read when the address is still missing, so a
+	// keypair and an address given outright need no config on this machine.
+	baseAddr, err := admintarget.Resolve(*addr, func() (*config.Config, error) {
 		return config.LoadConfig(*configPath)
 	})
 	if err != nil {
-		return "", "", err
+		return target{}, err
 	}
-	if baseAddr == "" || token == "" {
-		return "", "", errors.New("admin address and token required (set -addr/-token, $S3O_ADMIN_ADDR/$S3O_ADMIN_TOKEN, or config)")
+	t.baseAddr = baseAddr
+	if t.baseAddr == "" {
+		return target{}, errors.New("admin address required (set -addr, $S3O_ADMIN_ADDR, or config)")
 	}
-	if !strings.HasPrefix(baseAddr, "http") {
-		baseAddr = "http://" + baseAddr
+	// A bare host:port defaults to http, because the common target is a local
+	// instance reached over a loopback or a private network. An operator
+	// pointing at a remote one supplies the scheme, and https is preserved
+	// exactly because the prefix check passes it through untouched.
+	if !strings.HasPrefix(t.baseAddr, "http") {
+		t.baseAddr = "http://" + t.baseAddr //nolint:gosec // NOSONAR S5332: scheme default for an operator-supplied address
 	}
-	return baseAddr, token, nil
+	return t, nil
 }
 
 // Run resolves the admin target, starts the TUI, and returns a process exit
 // code.
 func Run(args []string, _, stderr io.Writer) int { // codecov:ignore -- TUI entry point
-	baseAddr, token, err := resolveTarget(args)
+	t, err := resolveTarget(args)
 	if err != nil {
 		fmt.Fprintf(stderr, "error: %v\n", err)
 		return 1
 	}
-	if _, err := tea.NewProgram(initialModel(newAPIClient(baseAddr, token)), tea.WithAltScreen()).Run(); err != nil {
+	if _, err := tea.NewProgram(initialModel(newAPIClient(t)), tea.WithAltScreen()).Run(); err != nil {
 		fmt.Fprintf(stderr, "tui error: %v\n", err)
 		return 1
 	}

@@ -9,8 +9,6 @@
 // with an "audit" marker for log pipeline filtering.
 // -------------------------------------------------------------------------------
 
-// Package audit provides request ID propagation and structured audit logging
-// for security-relevant operations.
 package audit
 
 import (
@@ -19,16 +17,7 @@ import (
 	"encoding/hex"
 	"log/slog"
 	"sync/atomic"
-
-	"github.com/afreidah/s3-orchestrator/internal/observe/logfmt"
 )
-
-// init registers RequestID with logfmt so operational log helpers can
-// surface the request ID without importing this package directly. Avoids
-// the audit -> logfmt -> audit cycle that a direct import would create.
-func init() {
-	logfmt.SetRequestIDFunc(RequestID)
-}
 
 // onEvent holds an optional callback invoked for each audit event with the
 // event name. Set via SetOnEvent at startup to integrate audit logging with
@@ -55,9 +44,11 @@ func SetOnEvent(fn func(event string)) {
 // guarantees no other package can collide with these keys.
 type contextKey int
 
-// requestIDKey and related constants used by this package.
+// requestIDKey and userKey are the context keys the correlation ID and the
+// authenticated identity are stored under.
 const (
 	requestIDKey contextKey = iota
+	userKey
 )
 
 // -------------------------------------------------------------------------
@@ -88,12 +79,39 @@ func RequestID(ctx context.Context) string {
 }
 
 // -------------------------------------------------------------------------
+// USER
+// -------------------------------------------------------------------------
+
+// WithUser stores the identity a request authenticated as, so every audit
+// entry the request produces names it without any of them being handed a user.
+//
+// One S3 request writes two correlated entries: the HTTP-layer one the
+// transport emits, and a storage-layer one emitted several packages deeper,
+// where no identity is in scope and passing one would mean a signature change
+// on the whole write path. The request id already crosses that distance on the
+// context, and the identity travels the same way for the same reason.
+func WithUser(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, userKey, id)
+}
+
+// User extracts the authenticated identity from the context. Returns empty
+// string for a request that has not authenticated yet, or one that failed to,
+// which is what keeps a rejected request from claiming an identity it never
+// proved.
+func User(ctx context.Context) string {
+	if id, ok := ctx.Value(userKey).(string); ok {
+		return id
+	}
+	return ""
+}
+
+// -------------------------------------------------------------------------
 // AUDIT LOGGING
 // -------------------------------------------------------------------------
 
 // Log emits a structured audit log entry at Info level. Automatically
-// includes the request ID from context. If OnEvent is set, it is called
-// with the event name for metrics integration.
+// includes the request ID and the authenticated identity from context. If
+// OnEvent is set, it is called with the event name for metrics integration.
 func Log(ctx context.Context, event string, attrs ...slog.Attr) {
 	if fn := onEvent.Load(); fn != nil {
 		(*fn)(event)
@@ -102,6 +120,10 @@ func Log(ctx context.Context, event string, attrs ...slog.Attr) {
 	base := []slog.Attr{
 		slog.Bool("audit", true),
 		slog.String("event", event),
+	}
+
+	if id := User(ctx); id != "" {
+		base = append(base, slog.String("user", id))
 	}
 
 	if id := RequestID(ctx); id != "" {

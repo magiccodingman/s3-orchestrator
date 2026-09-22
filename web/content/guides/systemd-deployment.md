@@ -1,5 +1,6 @@
 ---
 title: "Deploying with systemd"
+description: "Install as a systemd service on bare metal or a VM using the Debian package, which ships a unit file, sample config, and directories."
 weight: 7
 ---
 
@@ -169,10 +170,13 @@ rate_limit:
     - "192.168.0.0/16"
     - "127.0.0.1/32"
 
+auth:
+  root:
+    access_key_id: ${ROOT_ACCESS_KEY_ID}
+    secret_access_key: ${ROOT_SECRET_ACCESS_KEY}
+
 ui:
   enabled: true
-  admin_key: ${UI_ADMIN_KEY}
-  admin_secret: ${UI_ADMIN_SECRET}
   session_secret: ${UI_SESSION_SECRET}
   force_secure_cookies: true   # unconditionally sets Secure on session cookies; if the
                                # service runs behind a TLS-terminating reverse proxy you

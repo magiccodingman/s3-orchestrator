@@ -1,17 +1,16 @@
 ---
-title: "Notifications"
+description: "Outbound webhooks for object mutations and operational events, delivered from a durable outbox so nothing is lost across a restart."
+title: "Webhook Notifications"
 linkTitle: "Notifications"
-weight: 31
+weight: 33
 ---
-
-# Webhook Notifications
 
 Optional outbound webhooks for object mutations and operational events. Events are written to a durable `notification_outbox` table inside the same transaction as the originating change, then a background drainer POSTs them as CloudEvents-formatted JSON to each configured endpoint. The outbox pattern means events are never lost on crash and never sent twice for the same change.
 
 ## Event categories
 
-- **Data events** — S3-style object mutations (`s3:ObjectCreated:Put`, `s3:ObjectRemoved:Delete`, etc.) carrying the bucket and key.
-- **Operational events** — backend health (`backend.circuit.opened`, `backend.capacity.warning`), integrity (`integrity.corruption_detected`), cleanup (`cleanup.exhausted`), replication and lifecycle completions.
+- **Data events** - S3-style object mutations (`s3:ObjectCreated:Put`, `s3:ObjectRemoved:Delete`, etc.) carrying the bucket and key.
+- **Operational events** - backend health (`backend.circuit.opened`, `backend.capacity.warning`), integrity (`integrity.corruption_detected`), cleanup (`cleanup.exhausted`), replication and lifecycle completions.
 
 The full event catalog and signature-verification recipe live in the [Event Notifications guide](/guides/event-notifications/) on the project website.
 
@@ -46,17 +45,19 @@ notifications:
 ## Delivery semantics
 
 - Events are appended to `notification_outbox` in the same DB transaction as the originating mutation. If the transaction rolls back, no event is queued.
-- The notification drainer ticks every 5 seconds (no advisory lock — one drainer per instance is fine because each row is claimed via row-level locking before POST).
-- Failed deliveries retry with exponential backoff. After `max_retries`, the row is dropped and an audit warning emitted; counted in the `s3o_notifications_dropped_total` Prometheus metric.
-- The drainer never sends the same event twice — `notification_outbox` rows are deleted on successful POST and the row claim survives crashes.
+- The notification drainer ticks every 5 seconds (no advisory lock - one drainer per instance is fine because each row is claimed via row-level locking before POST).
+- Failed deliveries retry with exponential backoff. After `max_retries`, the row is dropped and an audit warning emitted; counted in the `s3o_notification_dropped_total` Prometheus metric.
+- The drainer never sends the same event twice - `notification_outbox` rows are deleted on successful POST and the row claim survives crashes.
 
 ## Operational observability
 
 | Metric | Meaning |
 |---|---|
-| `s3o_notification_outbox_depth` | Current queued rows |
-| `s3o_notifications_delivered_total` | Successful POSTs by endpoint |
-| `s3o_notifications_failed_total` | POST failures (counted before retry) |
-| `s3o_notifications_dropped_total` | Rows that exceeded `max_retries` and were dropped |
+| `s3o_notification_queue_depth` | Current queued rows |
+| `s3o_notification_sent_total` | Successful POSTs by endpoint and event type |
+| `s3o_notification_failed_total` | POST failures (counted before retry) |
+| `s3o_notification_dropped_total` | Rows that exceeded `max_retries` and were dropped |
+| `s3o_notification_store_errors_total` | Outbox reads or writes that failed, by operation. Non-zero means events are being lost before anyone tries to deliver them |
+| `s3o_notification_duration_seconds` | POST latency by endpoint. A slow endpoint backs the queue up, so watch it alongside the depth gauge |
 
 See [docs/monitoring.md](monitoring.md) for the full metric set.

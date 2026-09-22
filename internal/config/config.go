@@ -9,11 +9,10 @@
 // and hot-reload change detection.
 // -------------------------------------------------------------------------------
 
-// Package config provides YAML configuration loading with environment variable
-// expansion, validation, and hot-reload support via SIGHUP.
 package config
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -33,13 +32,10 @@ import (
 // RoutingStrategy determines how write operations select a target backend.
 type RoutingStrategy string
 
-// RoutingPack and related constants used by this package.
+// RoutingPack and RoutingSpread are the supported routing strategies.
 const (
-	// RoutingPack fills backends in order, returning the first with space.
-	RoutingPack RoutingStrategy = "pack"
-
-	// RoutingSpread distributes writes across backends by utilization ratio.
-	RoutingSpread RoutingStrategy = "spread"
+	RoutingPack   RoutingStrategy = "pack"   // fills backends in order, first with space wins
+	RoutingSpread RoutingStrategy = "spread" // distributes writes by utilization ratio
 )
 
 // -------------------------------------------------------------------------
@@ -48,29 +44,31 @@ const (
 
 // Config holds the complete service configuration.
 type Config struct {
-	Server         ServerConfig         `yaml:"server"`
-	Buckets        []BucketConfig       `yaml:"buckets"`
-	Database       DatabaseConfig       `yaml:"database"`
-	Backends       []BackendConfig      `yaml:"backends"`
-	Telemetry      TelemetryConfig      `yaml:"telemetry"`
-	Rebalance      RebalanceConfig      `yaml:"rebalance"`
-	Replication    ReplicationConfig    `yaml:"replication"`
-	RateLimit      RateLimitConfig      `yaml:"rate_limit"`
+	Server                ServerConfig                `yaml:"server"`
+	Buckets               []BucketConfig              `yaml:"buckets"`
+	Database              DatabaseConfig              `yaml:"database"`
+	Backends              []BackendConfig             `yaml:"backends"`
+	Telemetry             TelemetryConfig             `yaml:"telemetry"`
+	Rebalance             RebalanceConfig             `yaml:"rebalance"`
+	Replication           ReplicationConfig           `yaml:"replication"`
+	RateLimit             RateLimitConfig             `yaml:"rate_limit"`
 	CircuitBreaker        CircuitBreakerConfig        `yaml:"circuit_breaker"`
 	BackendCircuitBreaker BackendCircuitBreakerConfig `yaml:"backend_circuit_breaker"`
 	Encryption            EncryptionConfig            `yaml:"encryption"`
+	Compression           CompressionConfig           `yaml:"compression"`
 	UI                    UIConfig                    `yaml:"ui"`
-	CleanupQueue    CleanupQueueConfig   `yaml:"cleanup_queue"`
-	WritePath       WritePathConfig      `yaml:"write_path"`
-	UsageFlush      UsageFlushConfig     `yaml:"usage_flush"`
-	Lifecycle       LifecycleConfig      `yaml:"lifecycle"`
-	Reconcile       ReconcileConfig      `yaml:"reconcile"`
-	Integrity       IntegrityConfig      `yaml:"integrity"`
-	Cache           CacheConfig          `yaml:"cache"`
-	Redis           *RedisConfig         `yaml:"redis"`
-	Notifications   NotificationConfig   `yaml:"notifications"`
-	Debug           DebugConfig          `yaml:"debug"`
-	RoutingStrategy RoutingStrategy      `yaml:"routing_strategy"` // "pack" (default) or "spread"
+	Auth                  AuthConfig                  `yaml:"auth"`
+	CleanupQueue          CleanupQueueConfig          `yaml:"cleanup_queue"`
+	WritePath             WritePathConfig             `yaml:"write_path"`
+	UsageFlush            UsageFlushConfig            `yaml:"usage_flush"`
+	Lifecycle             LifecycleConfig             `yaml:"lifecycle"`
+	Reconcile             ReconcileConfig             `yaml:"reconcile"`
+	Integrity             IntegrityConfig             `yaml:"integrity"`
+	Cache                 CacheConfig                 `yaml:"cache"`
+	Redis                 *RedisConfig                `yaml:"redis"`
+	Notifications         NotificationConfig          `yaml:"notifications"`
+	Debug                 DebugConfig                 `yaml:"debug"`
+	RoutingStrategy       RoutingStrategy             `yaml:"routing_strategy"` // "pack" (default) or "spread"
 }
 
 // -------------------------------------------------------------------------
@@ -90,6 +88,14 @@ func LoadConfig(path string) (*Config, error) {
 	var cfg Config
 	if err := yaml.Unmarshal([]byte(expanded), &cfg); err != nil {
 		return nil, wrappedPath(ErrParseConfig, path, err)
+	}
+
+	// Checked against the document rather than the parsed struct: the fields are
+	// gone, and YAML drops what it cannot map, so a removed key would otherwise
+	// be ignored and the deployment would run with authentication it thinks it
+	// configured.
+	if errs := checkRemovedKeys([]byte(expanded)); len(errs) > 0 {
+		return nil, wrappedPath(ErrInvalidConfig, path, errors.Join(errs...))
 	}
 
 	if err := cfg.SetDefaultsAndValidate(); err != nil {
@@ -112,7 +118,61 @@ func (c *Config) SetDefaultsAndValidate() error {
 	c.applyDefaultsOnlyTypes()
 	errs = append(errs, c.validateRoutingStrategy()...)
 	errs = append(errs, c.validateQuotaReplicationCombo()...)
+	errs = append(errs, c.validateParallelCopies()...)
 	return errors.Join(errs...)
+}
+
+// CopiesPerWrite reports how many copies a single-object PUT places itself,
+// which is 1 unless an operator turned the fan-out on. A replication factor of
+// 1 answers 1 whatever the count says: there is no second copy to place, and
+// the over-replication cleaner would remove one that appeared.
+//
+// The write path takes this rather than the config section, so what "off" means
+// is settled in one place instead of at every consumer.
+func (c *Config) CopiesPerWrite() int {
+	pc := c.WritePath.ParallelCopies
+	if !pc.Enabled || c.Replication.Factor <= 1 {
+		return 1
+	}
+	return min(pc.Count, c.Replication.Factor)
+}
+
+// validateParallelCopies settles how many copies a write places itself. The
+// count defaults to the replication factor and may never exceed it, since the
+// over-replication cleaner deletes anything past the factor about as fast as
+// writes could create it.
+//
+// Runs after the replication section, which is where the factor's own default
+// is applied.
+func (c *Config) validateParallelCopies() []error {
+	pc := &c.WritePath.ParallelCopies
+	pc.Count = cmp.Or(pc.Count, c.Replication.Factor)
+	pc.MaxInFlight = cmp.Or(pc.MaxInFlight, c.writeAdmissionCapacity())
+	if !pc.Enabled {
+		return nil
+	}
+	var errs []error
+	if pc.Count < 1 {
+		errs = append(errs, ErrParallelCopiesMin)
+	}
+	if pc.Count > c.Replication.Factor {
+		errs = append(errs, ErrParallelCopiesOverFactor)
+	}
+	if pc.MaxInFlight < 1 {
+		errs = append(errs, ErrParallelCopiesInFlightMin)
+	}
+	return errs
+}
+
+// writeAdmissionCapacity is how many writes this instance admits at once, which
+// is what the in-flight ceiling defaults to: a tail is the residue of a write,
+// so an instance carrying more of them than it would admit writes is one whose
+// backends have stopped keeping up.
+//
+// The write-specific limit if there is one, the shared request limit otherwise,
+// and a floor for a deployment that caps neither.
+func (c *Config) writeAdmissionCapacity() int {
+	return cmp.Or(c.Server.MaxConcurrentWrites, c.Server.MaxConcurrentRequests, DefaultDetachedUploadCeiling)
 }
 
 // validatePerTypeSections delegates to each sub-type's
@@ -129,7 +189,14 @@ func (c *Config) validatePerTypeSections() []error {
 	errs = append(errs, c.Replication.setDefaultsAndValidate(len(c.Backends))...)
 	errs = append(errs, c.RateLimit.setDefaultsAndValidate()...)
 	errs = append(errs, c.Encryption.setDefaultsAndValidate()...)
+	errs = append(errs, c.Compression.setDefaultsAndValidate()...)
 	errs = append(errs, c.UI.setDefaultsAndValidate()...)
+	// The dashboard's token is the same authority as a root credential, so it
+	// The root credential is what administers a deployment, and it is now the
+	// only thing that can: without it the admin API authenticates nobody and the
+	// dashboard has no login, so a deployment enabling either would start with
+	// no way to provision its first user.
+	errs = append(errs, c.Auth.setDefaultsAndValidate(c.UI.Enabled)...)
 	errs = append(errs, c.UsageFlush.setDefaultsAndValidate()...)
 	errs = append(errs, validateLifecycleRules(c.Lifecycle.Rules)...)
 	errs = append(errs, c.Integrity.setDefaultsAndValidate()...)
@@ -162,9 +229,7 @@ func (c *Config) applyDefaultsOnlyTypes() {
 
 // validateRoutingStrategy applies the default and enforces the enum.
 func (c *Config) validateRoutingStrategy() []error {
-	if c.RoutingStrategy == "" {
-		c.RoutingStrategy = RoutingPack
-	}
+	c.RoutingStrategy = cmp.Or(c.RoutingStrategy, RoutingPack)
 	if c.RoutingStrategy != RoutingPack && c.RoutingStrategy != RoutingSpread {
 		return []error{ErrInvalidRoutingStrategy}
 	}
@@ -236,6 +301,12 @@ func serverFieldsChanged(old, new *ServerConfig) []string {
 	if old.MaxConcurrentWrites != new.MaxConcurrentWrites {
 		changed = append(changed, "server.max_concurrent_writes")
 	}
+	if old.MaxHeaderBytes != new.MaxHeaderBytes {
+		changed = append(changed, "server.max_header_bytes")
+	}
+	if old.MaxHeaderValueCount != new.MaxHeaderValueCount {
+		changed = append(changed, "server.max_header_value_count")
+	}
 	if old.LoadShedThreshold != new.LoadShedThreshold {
 		changed = append(changed, "server.load_shed_threshold")
 	}
@@ -282,6 +353,12 @@ func topLevelFieldsChanged(old, new *Config) []string {
 		old.Encryption.MasterKeyFile != new.Encryption.MasterKeyFile ||
 		old.Encryption.ChunkSize != new.Encryption.ChunkSize {
 		changed = append(changed, "encryption")
+	}
+	// The codec is built once at startup from level and chunk_size, and
+	// enabling compression mid-flight would leave the write path without one,
+	// so the whole block follows encryption in requiring a restart.
+	if old.Compression != new.Compression {
+		changed = append(changed, "compression")
 	}
 	if old.RoutingStrategy != new.RoutingStrategy {
 		changed = append(changed, "routing_strategy")
@@ -338,7 +415,8 @@ func backendStructuralChanges(old, new []BackendConfig) []string {
 			o.SecretAccessKey != n.SecretAccessKey || o.ForcePathStyle != n.ForcePathStyle ||
 			boolDefault(o.UnsignedPayload, true) != boolDefault(n.UnsignedPayload, true) ||
 			o.DisableChecksum != n.DisableChecksum ||
-			o.StripSDKHeaders != n.StripSDKHeaders {
+			o.StripSDKHeaders != n.StripSDKHeaders ||
+			httpTransportChanged(o.HTTP, n.HTTP) {
 			changed = append(changed, fmt.Sprintf("backends[%d] (%s) structural fields", i, o.Name))
 		}
 	}
@@ -348,6 +426,18 @@ func backendStructuralChanges(old, new []BackendConfig) []string {
 // -------------------------------------------------------------------------
 // HELPERS
 // -------------------------------------------------------------------------
+
+// httpTransportChanged reports whether a backend's transport settings differ.
+// The transport is built once when the backend client is constructed, so a
+// changed pool size or HTTP/2 setting needs a restart to take effect - which
+// the reload path reports rather than silently ignoring.
+func httpTransportChanged(o, n BackendHTTPConfig) bool {
+	return o.MaxIdleConns != n.MaxIdleConns ||
+		o.MaxIdleConnsPerHost != n.MaxIdleConnsPerHost ||
+		o.MaxConnsPerHost != n.MaxConnsPerHost ||
+		o.ResponseHeaderTimeout != n.ResponseHeaderTimeout ||
+		o.HTTP2Enabled() != n.HTTP2Enabled()
+}
 
 // boolDefault returns the value of a *bool, or the given default if nil.
 func boolDefault(p *bool, def bool) bool {

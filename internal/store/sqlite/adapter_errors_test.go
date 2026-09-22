@@ -51,32 +51,11 @@ func TestAdapterErr_ClaimPending(t *testing.T) {
 	}
 }
 
-// TestAdapterErr_InsertPending verifies the Exec error is wrapped.
-func TestAdapterErr_InsertPending(t *testing.T) {
-	t.Parallel()
-	a := closedAdapter(t, newTestStore(t))
-	err := a.InsertPending(context.Background(), &core.PendingObject{
-		IntentID: "i", ObjectKey: "k", BackendName: "backend-a", SizeBytes: 1,
-	})
-	if err == nil {
-		t.Error("expected error from closed tx")
-	}
-}
-
 // TestAdapterErr_DeletePending verifies the Exec error is wrapped.
 func TestAdapterErr_DeletePending(t *testing.T) {
 	t.Parallel()
 	a := closedAdapter(t, newTestStore(t))
 	if err := a.DeletePending(context.Background(), "i"); err == nil {
-		t.Error("expected error from closed tx")
-	}
-}
-
-// TestAdapterErr_DeletePendingByBackend verifies the Exec error is wrapped.
-func TestAdapterErr_DeletePendingByBackend(t *testing.T) {
-	t.Parallel()
-	a := closedAdapter(t, newTestStore(t))
-	if err := a.DeletePendingByBackend(context.Background(), "backend-a"); err == nil {
 		t.Error("expected error from closed tx")
 	}
 }
@@ -188,22 +167,11 @@ func TestAdapterErr_SumAndDeleteCleanupQueueRows(t *testing.T) {
 // QUOTA TX ERRORS
 // -------------------------------------------------------------------------
 
-// TestAdapterErr_IncrementBackendQuota verifies the Exec error is
-// wrapped.
-func TestAdapterErr_IncrementBackendQuota(t *testing.T) {
+// TestAdapterErr_AdjustQuotaStripe verifies the Exec error is wrapped.
+func TestAdapterErr_AdjustQuotaStripe(t *testing.T) {
 	t.Parallel()
 	a := closedAdapter(t, newTestStore(t))
-	if err := a.IncrementBackendQuota(context.Background(), "backend-a", 100); err == nil {
-		t.Error("expected error from closed tx")
-	}
-}
-
-// TestAdapterErr_DecrementBackendQuota verifies the Exec error is
-// wrapped.
-func TestAdapterErr_DecrementBackendQuota(t *testing.T) {
-	t.Parallel()
-	a := closedAdapter(t, newTestStore(t))
-	if err := a.DecrementBackendQuota(context.Background(), "backend-a", 100); err == nil {
+	if err := a.AdjustQuotaStripe(context.Background(), "backend-a", 0, 100); err == nil {
 		t.Error("expected error from closed tx")
 	}
 }

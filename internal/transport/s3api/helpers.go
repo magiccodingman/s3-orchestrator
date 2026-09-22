@@ -16,10 +16,13 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"sort"
+	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/afreidah/s3-orchestrator/internal/util/humanize"
 
 	"github.com/afreidah/s3-orchestrator/internal/observe/telemetry"
 	"github.com/afreidah/s3-orchestrator/internal/store/core"
@@ -41,6 +44,19 @@ const s3XMLNS = "http://s3.amazonaws.com/doc/2006-03-01/"
 // headerContentType is the canonical HTTP header name; using a single
 // constant avoids string-literal duplication across handlers.
 const headerContentType = "Content-Type"
+
+// headerTaggingCount reports how many tags an object carries on GET and HEAD.
+// The wire name is "tagging-count" even though the SDKs expose the field as
+// TagCount.
+const headerTaggingCount = "x-amz-tagging-count"
+
+// headerCopySource names the source object of a CopyObject or UploadPartCopy.
+// Its presence is what distinguishes both from the PUT they share a route with.
+const headerCopySource = "X-Amz-Copy-Source"
+
+// headerCopySourceRange is the byte range of the source an UploadPartCopy
+// takes as the part. Absent, the part is the whole source object.
+const headerCopySourceRange = "x-amz-copy-source-range"
 
 // -------------------------------------------------------------------------
 // REQUEST GUARDS
@@ -105,15 +121,6 @@ func findInvalidMetadataByte(s string) (pos int, b byte) {
 	return -1, 0
 }
 
-// validMetadataToken reports whether s contains only printable ASCII
-// characters suitable for use in an HTTP header field (no CR, LF, or
-// other control characters). This prevents HTTP header injection via
-// user-supplied metadata keys and values.
-func validMetadataToken(s string) bool {
-	pos, _ := findInvalidMetadataByte(s)
-	return pos < 0
-}
-
 // validateUserMetadata checks that metadata keys and values contain only
 // safe characters (no CR/LF/control bytes) and that total size does not
 // exceed the S3-specified 2 KB limit. Validation errors include the
@@ -140,26 +147,6 @@ func validateUserMetadata(meta map[string]string) error {
 // CAPACITY HINT FORMATTING
 // -------------------------------------------------------------------------
 
-// humanBytes formats a byte count as a base-1024 string with one
-// decimal of precision (e.g. 1.5 GiB). Mirrors the formatBytes helper
-// used by the dashboard template; kept locally here to avoid pulling
-// the ui package into the s3api dependency graph for one tiny helper.
-func humanBytes(b int64) string {
-	if b < 0 {
-		return "0 B"
-	}
-	const unit = 1024
-	if b < unit {
-		return fmt.Sprintf("%d B", b)
-	}
-	div, exp := int64(unit), 0
-	for n := b / unit; n >= unit; n /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f %ciB", float64(b)/float64(div), "KMGTPE"[exp])
-}
-
 // formatCapacityHint renders a quota-stats snapshot as a comma-separated
 // "name=used/limit" summary suitable for inclusion in the
 // InsufficientStorage error body. Returns the empty string when stats
@@ -170,15 +157,30 @@ func formatCapacityHint(stats map[string]core.QuotaStat) string {
 	}
 	parts := make([]string, 0, len(stats))
 	for name, s := range stats {
-		parts = append(parts, fmt.Sprintf("%s=%s/%s", name, humanBytes(s.BytesUsed), humanBytes(s.BytesLimit)))
+		parts = append(parts, fmt.Sprintf("%s=%s/%s", name,
+			humanize.Bytes(max(0, s.BytesUsed)), humanize.Bytes(max(0, s.BytesLimit))))
 	}
-	sort.Strings(parts)
+	slices.Sort(parts)
 	return strings.Join(parts, ", ")
 }
 
 // -------------------------------------------------------------------------
 // PATH AND QUERY PARSING
 // -------------------------------------------------------------------------
+
+// BucketFromPath reports the virtual bucket a request path addresses,
+// discarding the key.
+//
+// Exported for the middleware that runs ahead of authentication and so cannot
+// resolve the bucket from the credential the way a routed request does.
+// Keeping it a wrapper over parsePath means the path convention has one
+// definition: a second copy would be free to drift into disagreeing about
+// which bucket a request names, and the two would then authorize and
+// preflight different buckets for the same URL.
+func BucketFromPath(path string) (string, bool) {
+	bucket, _, ok := parsePath(path)
+	return bucket, ok
+}
 
 // parsePath extracts bucket and key from the URL path.
 // Expected format: /{bucket} or /{bucket}/{key...}
@@ -199,18 +201,98 @@ func parsePath(path string) (bucket string, key string, ok bool) {
 	return parts[0], parts[1], true
 }
 
-// parseQueryInt parses an integer query parameter, clamping it to [1, max].
+// parseQueryInt parses an integer query parameter, clamping it to [1, maxVal].
 // Returns defaultVal when the parameter is absent or invalid.
-func parseQueryInt(r *http.Request, param string, defaultVal, max int) int {
+func parseQueryInt(r *http.Request, param string, defaultVal, maxVal int) int {
 	s := r.URL.Query().Get(param)
 	if s == "" {
 		return defaultVal
 	}
 	v, err := strconv.Atoi(s)
-	if err != nil || v < 1 || v > max {
+	if err != nil || v < 1 || v > maxVal {
 		return defaultVal
 	}
 	return v
+}
+
+// Query keys an object request may carry. S3 selects the operation from the
+// query string, not just the method, so a key absent from this set names an
+// operation this server does not implement.
+//
+// Allow-listed rather than deny-listed on purpose. Enumerating the
+// subresources we reject means a missed one keeps falling through to the data
+// path, and AWS keeps adding them; enumerating what we understand means a
+// missed one is a rejected request instead of a destroyed object.
+var supportedObjectQueryKeys = map[string]bool{
+	"uploads":    true, // CreateMultipartUpload / ListMultipartUploads
+	"uploadId":   true, // per-upload multipart operations
+	"partNumber": true, // UploadPart
+	"tagging":    true, // Put/Get/DeleteObjectTagging
+
+	// x-id names the SDK operation that built the request (x-id=PutObject).
+	// Added by the AWS SDKs, carries no meaning for the server, and appears on
+	// ordinary data-path calls, so refusing it rejects normal traffic.
+	"x-id": true,
+}
+
+// Query key prefixes an object request may carry. Matched as prefixes so a
+// parameter within either family that is not named individually still passes.
+//
+// X-Amz- covers presigned URL credentials, which travel in the query string;
+// rejecting them would break every presigned URL. response- covers S3's
+// response-header overrides, of which response-content-disposition appears on
+// most presigned download links.
+var supportedObjectQueryPrefixes = []string{"X-Amz-", "response-"}
+
+// Query keys a bucket request may carry: the four subresources this server
+// serves, the parameters its two listings and its upload listing read, and
+// x-id. Allow-listed for the same reason the object set is - a bucket
+// subresource absent from here would otherwise be answered by ListObjects,
+// so a client asking for versions or a lifecycle configuration would parse a
+// ListBucketResult as an empty answer instead of learning the operation is
+// unavailable.
+var supportedBucketQueryKeys = map[string]bool{
+	"delete":             true, // DeleteObjects
+	"location":           true, // GetBucketLocation
+	"uploads":            true, // ListMultipartUploads
+	"versioning":         true, // GetBucketVersioning
+	"list-type":          true, // selects ListObjectsV2 over V1
+	"prefix":             true,
+	"delimiter":          true,
+	"marker":             true,
+	"max-keys":           true,
+	"encoding-type":      true,
+	"continuation-token": true,
+	"start-after":        true,
+	"fetch-owner":        true,
+	"key-marker":         true, // ListMultipartUploads paging
+	"upload-id-marker":   true,
+	"max-uploads":        true,
+	"x-id":               true, // SDK-supplied operation name, meaningless here
+}
+
+// Query key prefixes a bucket request may carry. A presigned listing puts its
+// credentials in the query string, so refusing the X-Amz- family would break
+// every presigned ListObjects. The response- overrides are object-only.
+var supportedBucketQueryPrefixes = []string{"X-Amz-"}
+
+// unsupportedQuery returns the first query key outside allowed, so a router can
+// refuse before dispatch rather than fall through to the data path. prefixes
+// are matched as prefixes, which is what lets a whole parameter family pass
+// without naming each member. Returns ok=false when every key is recognised.
+func unsupportedQuery(query url.Values, allowed map[string]bool, prefixes []string) (string, bool) {
+	for key := range query {
+		if allowed[key] {
+			continue
+		}
+		if slices.ContainsFunc(prefixes, func(p string) bool {
+			return strings.HasPrefix(key, p)
+		}) {
+			continue
+		}
+		return key, true
+	}
+	return "", false
 }
 
 // -------------------------------------------------------------------------
@@ -228,6 +310,15 @@ func writeS3Error(w http.ResponseWriter, code int, errCode, message string) {
 	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	w.WriteHeader(code)
 	_, _ = io.WriteString(w, body) //nolint:gosec // G705: output is XML-escaped via xmlEscape before writing
+}
+
+// s3CodeAccessDenied is the S3 error code a refused request carries.
+const s3CodeAccessDenied = "AccessDenied"
+
+// writeAccessDenied writes the 403 an authorization refusal ends with. The
+// refusals differ in what they log, not in what the client is told.
+func writeAccessDenied(w http.ResponseWriter) {
+	writeS3Error(w, http.StatusForbidden, s3CodeAccessDenied, "Access denied")
 }
 
 // WriteS3Error is the exported form of writeS3Error so other transport
@@ -271,6 +362,70 @@ func writeStorageError(w http.ResponseWriter, err error, fallbackMsg string) int
 	}
 	writeS3Error(w, http.StatusBadGateway, "InternalError", fallbackMsg)
 	return http.StatusBadGateway
+}
+
+// Request-body ceilings for the two XML control-plane operations. Both sit
+// above the largest request the S3 API permits, so a legal client is never
+// rejected: a 1000-object delete with maximum-length keys is roughly 1.05 MB,
+// and a 10000-part manifest roughly 900 KB before SDK indentation.
+const (
+	maxDeleteObjectsBody     = 4 << 20
+	maxCompleteMultipartBody = 2 << 20
+)
+
+// decodeXMLBody reads exactly one XML document from the request body into v,
+// writes the matching S3 error response on failure, and returns the status it
+// used.
+//
+// MaxBytesReader rather than io.LimitReader: a LimitReader silently truncates
+// at the ceiling, which reports an oversized body as malformed XML and, worse,
+// accepts it outright whenever the prefix happens to be a complete document.
+// MaxBytesReader fails instead, and lets the server close the connection
+// rather than leaving unread bytes in the pipe.
+//
+// The second decode is what rejects trailing content. Decode stops at the end
+// of the first document, so without this a second document or any junk after
+// the first is accepted and silently discarded - and what the orchestrator
+// then acts on is not what anything upstream inspected.
+func decodeXMLBody(w http.ResponseWriter, r *http.Request, limit int64, v any) (int, error) {
+	dec := xml.NewDecoder(http.MaxBytesReader(w, r.Body, limit))
+
+	if err := dec.Decode(v); err != nil {
+		return xmlBodyError(w, err)
+	}
+
+	// Walk what remains rather than decoding again: a second Decode skips
+	// character data looking for a start element, so bare junk after the
+	// document reads as a clean EOF. Trailing whitespace is tolerated because
+	// SDKs routinely append a newline; anything else is refused.
+	for {
+		tok, err := dec.Token()
+		if errors.Is(err, io.EOF) {
+			return http.StatusOK, nil
+		}
+		if err != nil {
+			return xmlBodyError(w, err)
+		}
+		text, isText := tok.(xml.CharData)
+		if !isText || len(bytes.TrimSpace(text)) > 0 {
+			writeS3Error(w, http.StatusBadRequest, "MalformedXML",
+				"Request body must contain exactly one XML document")
+			return http.StatusBadRequest, errors.New("trailing content after XML document")
+		}
+	}
+}
+
+// xmlBodyError renders a request-body failure, separating a body that ran past
+// its ceiling from one that is simply not valid XML. A LimitReader could not
+// tell those apart, so an oversized request was reported as malformed.
+func xmlBodyError(w http.ResponseWriter, err error) (int, error) {
+	if maxErr, ok := errors.AsType[*http.MaxBytesError](err); ok {
+		writeS3Error(w, http.StatusRequestEntityTooLarge, "MaxMessageLengthExceeded",
+			"Request body exceeds the maximum allowed size")
+		return http.StatusRequestEntityTooLarge, fmt.Errorf("request body over %d bytes: %w", maxErr.Limit, err)
+	}
+	writeS3Error(w, http.StatusBadRequest, "MalformedXML", "Failed to parse request body")
+	return http.StatusBadRequest, fmt.Errorf("decode request body: %w", err)
 }
 
 // writeXML writes an S3-compatible XML response with the standard XML header.

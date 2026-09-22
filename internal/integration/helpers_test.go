@@ -22,6 +22,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -42,11 +43,14 @@ import (
 	s3be "github.com/afreidah/s3-orchestrator/internal/backend"
 	"github.com/afreidah/s3-orchestrator/internal/breaker"
 	"github.com/afreidah/s3-orchestrator/internal/config"
-	"github.com/afreidah/s3-orchestrator/internal/proxy"
+	"github.com/afreidah/s3-orchestrator/internal/provisioning"
 	"github.com/afreidah/s3-orchestrator/internal/proxy/proxytest"
+	"github.com/afreidah/s3-orchestrator/internal/proxy/reconcile"
+	"github.com/afreidah/s3-orchestrator/internal/proxy/writepath"
 	"github.com/afreidah/s3-orchestrator/internal/store"
 	"github.com/afreidah/s3-orchestrator/internal/store/core"
 	"github.com/afreidah/s3-orchestrator/internal/store/postgres"
+	"github.com/afreidah/s3-orchestrator/internal/store/storetest"
 	"github.com/afreidah/s3-orchestrator/internal/transport/auth"
 	"github.com/afreidah/s3-orchestrator/internal/transport/s3api"
 )
@@ -55,11 +59,19 @@ import (
 // the surrounding lifecycle the helpers participate in.
 const virtualBucket = "test-bucket"
 
-// proxyAddr and related package-level variables used by this package.
+// The shared suite fixture, set up once by TestMain and read by every test.
+//
+// testDBConfig and minioEndpoints describe the containers rather than the
+// shared fixture built on them, so a harness can provision its own database and
+// its own buckets alongside it. See harness_test.go.
 var (
 	proxyAddr         string
+	testDBConfig      config.DatabaseConfig
+	minioEndpoints    []string
 	testDB            *sql.DB
-	testManager       *proxy.BackendManager
+	testStack         *proxytest.Stack
+	testReconciler    *reconcile.Manager
+	testCoord         *writepath.Coordinator
 	testWorkers       *proxytest.Workers
 	testStore         *postgres.Store
 	testFailableStore *FailableStore
@@ -81,8 +93,11 @@ type minioInstance struct {
 // integration test. Bails the process on any failure because there is
 // no useful test run without a database.
 func mustStartPostgres(ctx context.Context) *tcpostgres.PostgresContainer {
+	// Debian rather than alpine, matching the store package's fixture: musl
+	// has no locale data, so text sorts by byte there whatever collation a
+	// query asks for, and an ordering regression would go unnoticed.
 	c, err := tcpostgres.Run(ctx,
-		"postgres:16-alpine",
+		"postgres:16",
 		tcpostgres.WithDatabase("s3proxy_test"),
 		tcpostgres.WithUsername("s3proxy"),
 		tcpostgres.WithPassword("s3proxy"),
@@ -96,6 +111,17 @@ func mustStartPostgres(ctx context.Context) *tcpostgres.PostgresContainer {
 	}
 	return c
 }
+
+// minioImage is the image the fleet's backends run.
+//
+// Pulled from quay.io rather than Docker Hub, where minio/minio stopped serving
+// anonymous pulls: a machine with the image already cached kept working while
+// every clean runner failed to start the suite at all.
+//
+// Pinned rather than tracking latest, which is what let that break arrive
+// silently, and what would otherwise let the backends' behaviour change under
+// the suite between one run and the next.
+const minioImage = "quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z"
 
 // mustStartMinios launches the three MinIO testcontainers the suite
 // uses to model a multi-backend fleet, sets MINIO{N}_ENDPOINT env vars
@@ -112,7 +138,7 @@ func mustStartMinios(ctx context.Context) []minioInstance {
 	}
 	minios := make([]minioInstance, len(specs))
 	for i, spec := range specs {
-		ctr, err := tcminio.Run(ctx, "minio/minio:latest")
+		ctr, err := tcminio.Run(ctx, minioImage)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to start %s: %v\n", spec.name, err)
 			os.Exit(1)
@@ -128,6 +154,7 @@ func mustStartMinios(ctx context.Context) []minioInstance {
 			bucket:    spec.bucket,
 		}
 		os.Setenv(spec.envKey, minios[i].endpoint)
+		minioEndpoints = append(minioEndpoints, minios[i].endpoint)
 	}
 	return minios
 }
@@ -273,6 +300,8 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
+	testDBConfig = cfg.Database
+
 	dbCB := store.NewDatabaseBreaker(cfg.CircuitBreaker)
 	testDatabaseCB = dbCB
 
@@ -322,33 +351,38 @@ func TestMain(m *testing.M) {
 
 	stores := newStores(failableStore)
 
-	manager := proxytest.BuildManager(&proxy.BackendManagerConfig{
-		Storage: proxy.StorageDeps{
-			Backends: testBackends,
-			Order:    testBackendOrder,
-		},
-		Stores: proxy.StoreDeps{
-			Metadata:  stores,
-			Dashboard: failableStore,
-		},
-		Policies: proxy.PolicyConfig{
-			PendingEnabled:  true,
-			CacheTTL:        60 * time.Second,
+	stack := proxytest.Build(stores, &proxytest.StackOptions{
+		Runtime: proxytest.NewRuntime(&proxytest.RuntimeOptions{
+			Backends:        testBackends,
+			Order:           testBackendOrder,
 			BackendTimeout:  30 * time.Second,
 			RoutingStrategy: config.RoutingPack,
-		},
-		Operations: proxy.OperationalDeps{
-			Metrics: newMetricsAdapter(failableStore),
-		},
+			Metrics:         newMetricsAdapter(failableStore),
+		}),
+		CacheTTL:       60 * time.Second,
+		BackendTimeout: 30 * time.Second,
 	})
-	workers := proxytest.BuildWorkers(manager, stores)
-	testManager = manager
+	workers := proxytest.BuildWorkers(stack, stores)
+	testStack = stack
+	testCoord = writepath.New(stack.Runtime, db)
+	testReconciler = reconcile.NewManager(&reconcile.Deps{
+		Backends: stack.Runtime, Stores: db, Usage: stack.Runtime.Acct(), Quota: stack.Runtime.Quota(),
+	})
 	testWorkers = workers
 
 	srv := &s3api.Server{
-		Manager: manager,
+		Objects:   stack.Objects,
+		Multipart: stack.Multipart,
 	}
-	srv.SetBucketAuth(auth.NewBucketRegistry(cfg.Buckets))
+	// The root credential is what every admin request in these tests signs
+	// with, so the view has to declare it or they are all refused.
+	view := provisioning.Merge(cfg.Buckets, rootAuthConfig(), &provisioning.Snapshot{})
+	bucketAuth, err := auth.NewBucketRegistry(&view)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to build bucket registry: %v\n", err)
+		os.Exit(1)
+	}
+	srv.SetBucketAuth(bucketAuth)
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -442,12 +476,139 @@ func queryObjectBackend(t *testing.T, key string) string {
 // queryQuotaUsed returns the bytes_used value for a backend.
 func queryQuotaUsed(t *testing.T, backendName string) int64 {
 	t.Helper()
+	flushQuota(t)
 	var bytesUsed int64
-	err := testDB.QueryRow("SELECT bytes_used FROM backend_quotas WHERE backend_name = $1", backendName).Scan(&bytesUsed)
+	err := testDB.QueryRow(
+		`SELECT GREATEST(0, COALESCE(SUM(bytes_used), 0)) FROM backend_quota_stripes WHERE backend_name = $1`,
+		backendName).Scan(&bytesUsed)
 	if err != nil {
 		t.Fatalf("queryQuotaUsed(%q): %v", backendName, err)
 	}
 	return bytesUsed
+}
+
+// queryStoredSize returns size_bytes for a key: what the backend actually
+// holds, which for an encoded object is smaller than what the client wrote.
+func queryStoredSize(t *testing.T, key string) int64 {
+	t.Helper()
+	var size int64
+	err := testDB.QueryRow(
+		"SELECT size_bytes FROM object_locations WHERE object_key = $1",
+		virtualBucket+"/"+key).Scan(&size)
+	if err != nil {
+		t.Fatalf("queryStoredSize(%q): %v", key, err)
+	}
+	return size
+}
+
+// queryCompressionAlgorithm returns the encoding a key is stored in, or "" for
+// a copy held verbatim. Tests that mean to exercise the compressed path assert
+// on this: an object the ratio floor declined is stored plain, and every
+// compressed-read assertion would then pass without the encoded path running.
+func queryCompressionAlgorithm(t *testing.T, key string) string {
+	t.Helper()
+	var algorithm sql.NullString
+	err := testDB.QueryRow(
+		"SELECT compression_algorithm FROM object_locations WHERE object_key = $1",
+		virtualBucket+"/"+key).Scan(&algorithm)
+	if err != nil {
+		t.Fatalf("queryCompressionAlgorithm(%q): %v", key, err)
+	}
+	return algorithm.String
+}
+
+// queryLogicalSize returns logical_size for a key: the size the client wrote
+// and the size the object is known by, whatever form it is stored in.
+func queryLogicalSize(t *testing.T, key string) int64 {
+	t.Helper()
+	var size sql.NullInt64
+	err := testDB.QueryRow(
+		"SELECT logical_size FROM object_locations WHERE object_key = $1",
+		virtualBucket+"/"+key).Scan(&size)
+	if err != nil {
+		t.Fatalf("queryLogicalSize(%q): %v", key, err)
+	}
+	return size.Int64
+}
+
+// backendObjectSize reports how many bytes a backend physically holds for an
+// object key. Every other size in the system - the ledger's size_bytes, the
+// quota, the usage counters - is a derived number that can drift from this one,
+// so accounting assertions measure against it rather than against each other.
+func backendObjectSize(t *testing.T, backendName, key string) int64 {
+	t.Helper()
+	return backendRawObjectSize(t, backendName, internalKey(key))
+}
+
+// backendRawObjectSize is backendObjectSize for a key the orchestrator stores
+// outside a virtual bucket, which multipart part objects are.
+func backendRawObjectSize(t *testing.T, backendName, storedKey string) int64 {
+	t.Helper()
+	be, ok := allBackends[backendName]
+	if !ok {
+		t.Fatalf("backendRawObjectSize: backend %q is not configured", backendName)
+	}
+	head, err := be.HeadObject(context.Background(), storedKey)
+	if err != nil {
+		t.Fatalf("backendRawObjectSize(%s, %s): %v", backendName, storedKey, err)
+	}
+	return head.Size
+}
+
+// queryMultipartBackend returns the backend an in-flight upload is pinned to.
+func queryMultipartBackend(t *testing.T, uploadID string) string {
+	t.Helper()
+	var backendName string
+	err := testDB.QueryRow(
+		"SELECT backend_name FROM multipart_uploads WHERE upload_id = $1", uploadID).Scan(&backendName)
+	if err != nil {
+		t.Fatalf("queryMultipartBackend(%q): %v", uploadID, err)
+	}
+	return backendName
+}
+
+// setQuotaLimits gives every backend the same capacity for the duration of one
+// test and puts the configured values back afterwards.
+//
+// The fleet is provisioned at one and two kilobytes, which is what the spread
+// and rebalance tests do their arithmetic against. A test needing room for a
+// multi-chunk object, or needing a limit pitched at one exact size, has to move
+// them, and leaving them moved would quietly change the placement decisions
+// every later test asserts on.
+func setQuotaLimits(tb testing.TB, limit int64) {
+	tb.Helper()
+	original := map[string]int64{}
+	rows, err := testDB.Query("SELECT backend_name, bytes_limit FROM backend_quotas")
+	if err != nil {
+		tb.Fatalf("read quota limits: %v", err)
+	}
+	for rows.Next() {
+		var name string
+		var value int64
+		if err := rows.Scan(&name, &value); err != nil {
+			rows.Close()
+			tb.Fatalf("scan quota limit: %v", err)
+		}
+		original[name] = value
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		tb.Fatalf("read quota limits: %v", err)
+	}
+
+	if _, err := testDB.Exec("UPDATE backend_quotas SET bytes_limit = $1", limit); err != nil {
+		tb.Fatalf("set quota limits: %v", err)
+	}
+	refreshQuota(tb)
+	tb.Cleanup(func() {
+		for name, value := range original {
+			if _, err := testDB.Exec(
+				"UPDATE backend_quotas SET bytes_limit = $1 WHERE backend_name = $2", value, name); err != nil {
+				tb.Errorf("restore quota limit for %s: %v", name, err)
+			}
+		}
+		refreshQuota(tb)
+	})
 }
 
 // resetState truncates all object/multipart tables and re-establishes the
@@ -477,11 +638,76 @@ func resetState(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("resetState: SyncQuotaLimits: %v", err)
 	}
-	if _, err := testDB.Exec("UPDATE backend_quotas SET bytes_used = 0, orphan_bytes = 0, updated_at = NOW()"); err != nil {
+	if _, err := testDB.Exec("UPDATE backend_quotas SET orphan_bytes = 0, updated_at = NOW()"); err != nil {
 		t.Fatalf("resetState: %v", err)
 	}
-	testManager.ClearCache()
-	testManager.ClearDrainState()
+	if _, err := testDB.Exec("DELETE FROM backend_quota_stripes"); err != nil {
+		t.Fatalf("resetState: %v", err)
+	}
+	// Each stack ranks against its own snapshot, so every one of them has to
+	// reload or placement keeps ordering backends by the rows just deleted.
+	refreshQuota(t)
+	testStack.Objects.LocationCache().Clear()
+	testStack.Drain.ClearState()
+}
+
+// extraStacks holds the test-owned stacks built alongside the shared fixture.
+// Each carries its own in-memory byte counter, so a helper that touches
+// backend_quotas has to reach all of them and not just testStack.
+var (
+	extraStacksMu sync.Mutex
+	extraStacks   []*proxytest.Stack
+)
+
+// registerStack primes a test-owned stack's quota baselines the way production
+// does at startup and makes it visible to flushQuota and refreshQuota for as
+// long as the test runs.
+func registerStack(t *testing.T, st *proxytest.Stack) *proxytest.Stack {
+	t.Helper()
+	if err := st.Usage.RefreshQuotaBaselines(context.Background()); err != nil {
+		t.Fatalf("prime stack quota baselines: %v", err)
+	}
+	extraStacksMu.Lock()
+	extraStacks = append(extraStacks, st)
+	extraStacksMu.Unlock()
+	t.Cleanup(func() {
+		extraStacksMu.Lock()
+		defer extraStacksMu.Unlock()
+		extraStacks = slices.DeleteFunc(extraStacks, func(s *proxytest.Stack) bool { return s == st })
+	})
+	return st
+}
+
+// quotaStacks returns every stack whose counter is live right now.
+func quotaStacks() []*proxytest.Stack {
+	extraStacksMu.Lock()
+	defer extraStacksMu.Unlock()
+	return append([]*proxytest.Stack{testStack}, extraStacks...)
+}
+
+// refreshQuota reloads the trackers' baselines from backend_quotas. Admission
+// judges a write against the snapshot, not the row, so a test that edits the
+// table behind the proxy has to say so or the change stays invisible.
+func refreshQuota(tb testing.TB) {
+	tb.Helper()
+	for _, st := range quotaStacks() {
+		if err := st.Usage.RefreshQuotaBaselines(context.Background()); err != nil {
+			tb.Fatalf("refreshQuota: %v", err)
+		}
+	}
+}
+
+// flushQuota drains the in-memory byte counter into backend_quotas and
+// re-primes the baselines from the rows it wrote. bytes_used is eventually
+// consistent, so anything reading that column has to ask for the flush the
+// usage service would otherwise run on its own tick.
+func flushQuota(t *testing.T) {
+	t.Helper()
+	for _, st := range quotaStacks() {
+		if err := st.Usage.FlushQuota(context.Background()); err != nil {
+			t.Fatalf("flushQuota: %v", err)
+		}
+	}
 }
 
 // uniqueKey generates a collision-free object key.
@@ -569,42 +795,36 @@ func setOrphanBytes(t *testing.T, backendName string, amount int64) {
 	if err != nil {
 		t.Fatalf("setOrphanBytes(%q, %d): %v", backendName, amount, err)
 	}
+	refreshQuota(t)
 }
 
-// newThreeBackendManager creates a BackendManager with all 3 backends for
+// newThreeBackendStack creates a proxy stack with all 3 backends for
 // tests that need more than 2 backends (e.g., over-replication with factor=3).
-// Returns the manager and its fully-wired worker bundle so callers that need
+// Returns the stack and its fully-wired worker bundle so callers that need
 // a specific worker (Replicator/OverReplicationCleaner/...) can reach it
-// directly, since these are no longer fields on BackendManager.
-func newThreeBackendManager(t *testing.T) (*proxy.BackendManager, *proxytest.Workers) {
+// directly.
+func newThreeBackendStack(t *testing.T) (*proxytest.Stack, *proxytest.Workers) {
 	t.Helper()
 	stores := newStores(testFailableStore)
-	mgr := proxytest.NewManager(t, &proxy.BackendManagerConfig{
-		Storage: proxy.StorageDeps{
-			Backends: allBackends,
-			Order:    allBackendOrder,
-		},
-		Stores: proxy.StoreDeps{
-			Metadata:  stores,
-			Dashboard: testFailableStore,
-		},
-		Policies: proxy.PolicyConfig{
-			CacheTTL:        60 * time.Second,
+	st := proxytest.New(t, stores, &proxytest.StackOptions{
+		Runtime: proxytest.NewRuntime(&proxytest.RuntimeOptions{
+			Backends:        allBackends,
+			Order:           allBackendOrder,
 			BackendTimeout:  30 * time.Second,
 			RoutingStrategy: config.RoutingPack,
-		},
-		Operations: proxy.OperationalDeps{
-			Metrics: newMetricsAdapter(testFailableStore),
-		},
+			Metrics:         newMetricsAdapter(testFailableStore),
+		}),
+		CacheTTL:       60 * time.Second,
+		BackendTimeout: 30 * time.Second,
 	})
-	workers := proxytest.BuildWorkers(mgr, stores)
-	return mgr, workers
+	registerStack(t, st)
+	return st, proxytest.BuildWorkers(st, stores)
 }
 
 // newStores returns src typed as the wide metadata-store contract every
 // proxy consumer depends on. Identity at the type level - kept so the
 // call sites read uniformly with the production DI wiring.
-func newStores(src core.MetadataStore) core.MetadataStore { return src }
+func newStores(src storetest.MetadataStore) storetest.MetadataStore { return src }
 
 // roleStore names the role union tests need on a single source value.
 type roleStore interface {
@@ -673,11 +893,11 @@ var errSimulatedCommitFailure = errors.New("simulated commit failure")
 // to is an integration-test fixture helper; see file header for
 // the surrounding lifecycle the helpers participate in.
 type FailableStore struct {
-	core.MetadataStore // embedded inner satisfies every method by default
-	inner              *postgres.Store
-	mu                 sync.Mutex
-	failing            bool
-	failCommitOnce     bool // when true, RecordObjectAndClearPending fails once, then auto-clears
+	storetest.MetadataStore // embedded inner satisfies every method by default
+	inner                   *postgres.Store
+	mu                      sync.Mutex
+	failing                 bool
+	failCommitOnce          bool // when true, RecordObjectAndClearPending fails once, then auto-clears
 }
 
 // newFailableStore returns a FailableStore whose role views all resolve to
@@ -713,11 +933,30 @@ func (f *FailableStore) GetAllObjectLocations(ctx context.Context, key string) (
 
 // RecordObject is an integration-test fixture helper; see file header for
 // the surrounding lifecycle the helpers participate in.
-func (f *FailableStore) RecordObject(ctx context.Context, key, backend string, size int64, enc *core.EncryptionMeta) ([]core.DeletedCopy, error) {
+// A commit carrying a pending intent also honours the one-shot fail-commit
+// flag: sustained outages surface as errSimulatedDBOutage (wraps
+// ErrDBUnavailable, triggers degraded-mode fallbacks), while the one-shot blip
+// surfaces as errSimulatedCommitFailure (plain) so the caller fails the PUT
+// instead of reading the error as a degraded-mode signal.
+func (f *FailableStore) RecordObject(ctx context.Context, req *core.RecordObjectRequest) ([]core.DeletedCopy, core.QuotaDeltas, error) {
 	if f.isFailing() {
-		return nil, errSimulatedDBOutage
+		return nil, nil, errSimulatedDBOutage
 	}
-	return f.inner.RecordObject(ctx, key, backend, size, enc)
+	if commitCarriesIntent(req) && f.consumeFailCommitOnce() {
+		return nil, nil, errSimulatedCommitFailure
+	}
+	return f.inner.RecordObject(ctx, req)
+}
+
+// commitCarriesIntent reports whether any copy the commit records resolves a
+// pending intent, which is what the one-shot failure is armed against.
+func commitCarriesIntent(req *core.RecordObjectRequest) bool {
+	for _, c := range req.Copies {
+		if c.IntentID != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // SetFailCommitOnce arms a one-shot failure on RecordObjectAndClearPending
@@ -743,27 +982,11 @@ func (f *FailableStore) consumeFailCommitOnce() bool {
 	return false
 }
 
-// RecordObjectAndClearPending honours both the global failing flag and
-// the one-shot fail-commit flag. Sustained outages surface as
-// errSimulatedDBOutage (wraps ErrDBUnavailable, triggers degraded-mode
-// fallbacks); the one-shot blip surfaces as errSimulatedCommitFailure
-// (plain) so the caller fails the PUT instead of treating the error as
-// a degraded-mode signal.
-func (f *FailableStore) RecordObjectAndClearPending(ctx context.Context, key, backend string, size int64, enc *core.EncryptionMeta, intentID string) ([]core.DeletedCopy, error) {
-	if f.isFailing() {
-		return nil, errSimulatedDBOutage
-	}
-	if f.consumeFailCommitOnce() {
-		return nil, errSimulatedCommitFailure
-	}
-	return f.inner.RecordObjectAndClearPending(ctx, key, backend, size, enc, intentID)
-}
-
 // DeleteObject is an integration-test fixture helper; see file header for
 // the surrounding lifecycle the helpers participate in.
-func (f *FailableStore) DeleteObject(ctx context.Context, key string) ([]core.DeletedCopy, error) {
+func (f *FailableStore) DeleteObject(ctx context.Context, key string) ([]core.DeletedCopy, core.QuotaDeltas, error) {
 	if f.isFailing() {
-		return nil, errSimulatedDBOutage
+		return nil, nil, errSimulatedDBOutage
 	}
 	return f.inner.DeleteObject(ctx, key)
 }
@@ -777,22 +1000,13 @@ func (f *FailableStore) ListObjects(ctx context.Context, prefix, startAfter stri
 	return f.inner.ListObjects(ctx, prefix, startAfter, maxKeys)
 }
 
-// GetBackendWithSpace is an integration-test fixture helper; see file header for
-// the surrounding lifecycle the helpers participate in.
-func (f *FailableStore) GetBackendWithSpace(ctx context.Context, size int64, backendOrder []string) (string, error) {
+// ListBackendQuotaUsage is an integration-test fixture helper; see file header
+// for the surrounding lifecycle the helpers participate in.
+func (f *FailableStore) ListBackendQuotaUsage(ctx context.Context) ([]core.BackendQuotaUsage, error) {
 	if f.isFailing() {
-		return "", errSimulatedDBOutage
+		return nil, errSimulatedDBOutage
 	}
-	return f.inner.GetBackendWithSpace(ctx, size, backendOrder)
-}
-
-// GetLeastUtilizedBackend is an integration-test fixture helper; see file header for
-// the surrounding lifecycle the helpers participate in.
-func (f *FailableStore) GetLeastUtilizedBackend(ctx context.Context, size int64, eligible []string) (string, error) {
-	if f.isFailing() {
-		return "", errSimulatedDBOutage
-	}
-	return f.inner.GetLeastUtilizedBackend(ctx, size, eligible)
+	return f.inner.ListBackendQuotaUsage(ctx)
 }
 
 // CreateMultipartUpload is an integration-test fixture helper; see file header for
@@ -815,11 +1029,11 @@ func (f *FailableStore) GetMultipartUpload(ctx context.Context, uploadID string)
 
 // RecordPart is an integration-test fixture helper; see file header for
 // the surrounding lifecycle the helpers participate in.
-func (f *FailableStore) RecordPart(ctx context.Context, uploadID string, partNumber int, etag string, size int64, enc *core.EncryptionMeta) error {
+func (f *FailableStore) RecordPart(ctx context.Context, p *core.RecordPartParams) error {
 	if f.isFailing() {
 		return errSimulatedDBOutage
 	}
-	return f.inner.RecordPart(ctx, uploadID, partNumber, etag, size, enc)
+	return f.inner.RecordPart(ctx, p)
 }
 
 // GetParts is an integration-test fixture helper; see file header for
@@ -941,9 +1155,9 @@ func (f *FailableStore) CountOverReplicatedObjects(ctx context.Context, factor i
 
 // RemoveExcessCopy is an integration-test fixture helper; see file header for
 // the surrounding lifecycle the helpers participate in.
-func (f *FailableStore) RemoveExcessCopy(ctx context.Context, key, backendName string, factor int) (bool, error) {
+func (f *FailableStore) RemoveExcessCopy(ctx context.Context, key, backendName string, factor int) (int64, bool, error) {
 	if f.isFailing() {
-		return false, errSimulatedDBOutage
+		return 0, false, errSimulatedDBOutage
 	}
 	return f.inner.RemoveExcessCopy(ctx, key, backendName, factor)
 }
@@ -1030,4 +1244,28 @@ func newTestS3Backend(t *testing.T, name string) *s3be.S3Backend {
 		t.Fatalf("NewS3Backend(%s): %v", name, err)
 	}
 	return backend
+}
+
+// mustBucketRegistry builds a registry from config the test controls, failing
+// the test if that config turns out to be ambiguous.
+//
+// The root credential is declared so a root identity exists: a registry without
+// one refuses every admin request a test makes.
+func mustBucketRegistry(tb testing.TB, buckets []config.BucketConfig) *auth.BucketRegistry {
+	tb.Helper()
+	v := provisioning.Merge(buckets, rootAuthConfig(), &provisioning.Snapshot{})
+	br, err := auth.NewBucketRegistry(&v)
+	if err != nil {
+		tb.Fatalf("NewBucketRegistry: %v", err)
+	}
+	return br
+}
+
+// declaredForConfig builds the live bucket set a hand-wired harness hands the
+// operations layer, applying the same config-to-declared translation registry
+// assembly performs before publishing it.
+func declaredForConfig(buckets []config.BucketConfig) *provisioning.Declared {
+	d := provisioning.NewDeclared()
+	d.Set(provisioning.Merge(buckets, config.AuthConfig{}, &provisioning.Snapshot{}).Buckets)
+	return d
 }

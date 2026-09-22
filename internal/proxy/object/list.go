@@ -16,17 +16,23 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"time"
 
 	"github.com/afreidah/s3-orchestrator/internal/observe"
 	"github.com/afreidah/s3-orchestrator/internal/observe/telemetry"
 	pobserve "github.com/afreidah/s3-orchestrator/internal/proxy/observe"
+	"github.com/afreidah/s3-orchestrator/internal/s3op"
 	"github.com/afreidah/s3-orchestrator/internal/store/core"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 )
+
+// -------------------------------------------------------------------------
+// TYPES
+// -------------------------------------------------------------------------
 
 // ListObjectsV2Result holds the processed result for the S3 ListObjectsV2 response.
 type ListObjectsV2Result struct {
@@ -40,10 +46,10 @@ type ListObjectsV2Result struct {
 // ListObjects returns one page of objects under the given prefix, folding keys
 // into virtual-directory CommonPrefixes when a delimiter is set.
 func (o *Manager) ListObjects(ctx context.Context, prefix, delimiter, startAfter string, maxKeys int) (*ListObjectsV2Result, error) {
-	const operation = "ListObjects"
+	const operation = s3op.ListObjects
 	start := time.Now()
 
-	ctx, span := telemetry.StartSpan(ctx, managerSpanPrefix+operation,
+	ctx, span := telemetry.StartSpan(ctx, managerSpanPrefix+operation.String(),
 		attribute.String("s3o.prefix", prefix),
 		attribute.String("s3o.delimiter", delimiter),
 		attribute.Int("s3o.max_keys", maxKeys),
@@ -62,6 +68,10 @@ func (o *Manager) ListObjects(ctx context.Context, prefix, delimiter, startAfter
 	span.SetAttributes(attribute.Int("s3o.key_count", result.KeyCount))
 	return result, nil
 }
+
+// -------------------------------------------------------------------------
+// INTERNALS
+// -------------------------------------------------------------------------
 
 // listPage fetches one page from the store: the delimiter-grouped query when a
 // delimiter is set (CommonPrefixes plus interleaved leaf objects), otherwise the
@@ -100,7 +110,7 @@ func (o *Manager) listPage(ctx context.Context, prefix, delimiter, startAfter st
 func listObjectsError(span trace.Span, err error) error {
 	if errors.Is(err, core.ErrDBUnavailable) {
 		observe.MarkSpanError(span, "database unavailable")
-		return &core.S3Error{StatusCode: 503, Code: "ServiceUnavailable", Message: "listing unavailable during database outage"}
+		return &core.S3Error{StatusCode: http.StatusServiceUnavailable, Code: "ServiceUnavailable", Message: "listing unavailable during database outage"}
 	}
 	observe.RecordSpanError(span, err)
 	return fmt.Errorf("failed to list objects: %w", err)

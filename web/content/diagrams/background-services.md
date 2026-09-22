@@ -1,7 +1,8 @@
 ---
-title: "Background Services"
-linkTitle: "Background Services"
-weight: 6
+description: "Interactive diagram of how the periodic workers coordinate to maintain storage health, enforce replication, and persist counters."
+title: "Background Services Flow"
+linkTitle: "Background Services Flow"
+weight: 7
 ---
 
 Coordination of periodic background workers that maintain storage health, enforce replication, and persist counters. **Hover over any component** for implementation details.
@@ -86,8 +87,28 @@ Coordination of periodic background workers that maintain storage health, enforc
   ].join('\n');
 
   mermaid.initialize({
-    startOnLoad: false, theme: 'dark',
-    flowchart: { nodeSpacing: 80, rankSpacing: 160, curve: 'basis', padding: 16, diagramPadding: 8, useMaxWidth: true }
+    startOnLoad: false,
+    theme: 'base',
+    themeVariables: {
+      darkMode: true,
+      background: '#191c23',
+      fontFamily: 'Inter, ui-sans-serif, system-ui, sans-serif',
+      fontSize: '15px',
+      primaryColor: '#26332f',
+      primaryTextColor: '#f8fafc',
+      primaryBorderColor: '#2a9d73',
+      secondaryColor: '#3a2e20',
+      secondaryTextColor: '#e8dfd0',
+      secondaryBorderColor: '#c4a35a',
+      tertiaryColor: '#20262d',
+      tertiaryTextColor: '#e8dfd0',
+      tertiaryBorderColor: '#4aaa8a',
+      lineColor: '#7f8b86',
+      edgeLabelBackground: '#191c23',
+      clusterBkg: '#1d2229',
+      clusterBorder: '#39443f'
+    },
+    flowchart: { nodeSpacing: 80, rankSpacing: 160, curve: 'linear', padding: 12, diagramPadding: 16, useMaxWidth: true, htmlLabels: true }
   });
 
   mermaid.render('bg-mermaid-svg', diagramSrc).then(function(result) {
@@ -99,27 +120,27 @@ Coordination of periodic background workers that maintain storage health, enforc
     SCHED: {
       title: 'Lifecycle Manager (Scheduler)',
       badge: 'entry', badgeText: 'scheduler',
-      body: '<p>Central service orchestrator from <code>internal/lifecycle</code>. Launches all background workers as supervised goroutines.</p><p>Each service implements <code>lifecycle.Service</code> with a <code>Run(ctx)</code> method. Most workers use <code>lockedTickerService</code> which wraps periodic execution behind PostgreSQL advisory locks (<code>pg_try_advisory_lock</code>) for leader election across instances.</p><p>Services are defined in <code>internal/di/services.go</code>. Hot-reloadable configs are stored as <code>atomic.Pointer</code> on the <code>proxy.BackendManager</code>.</p><p><b>Health tracking</b>: every <code>lockedTickerService</code> records per-tick success/failure state (last success, last failure, last error, consecutive failures). Exposed through <code>GET /admin/api/workers</code> and as Prometheus gauges so operators can alert on stalled or repeatedly failing workers without scraping logs.</p><p class="ac-metric">Per-service generic metrics: s3o_worker_ticks_total{service,result}, s3o_worker_last_success_timestamp_seconds{service}, s3o_worker_consecutive_failures{service}</p>'
+      body: '<p>Central service orchestrator from <code>internal/lifecycle</code>. Launches all background workers as supervised goroutines.</p><p>Each service implements <code>lifecycle.Service</code> with a <code>Run(ctx)</code> method. Most workers use <code>lockedTickerService</code> which wraps periodic execution behind PostgreSQL advisory locks (<code>pg_try_advisory_lock</code>) for leader election across instances.</p><p>Services are defined in <code>internal/di/services.go</code>. Hot-reloadable configs are stored as <code>atomic.Pointer</code> on the worker or manager that consumes them (<code>worker.Replicator</code>, <code>worker.Scrubber</code>, <code>expiry.Manager</code>).</p><p><b>Health tracking</b>: every <code>lockedTickerService</code> records per-tick success/failure state (last success, last failure, last error, consecutive failures). Exposed through <code>GET /admin/api/workers</code> and as Prometheus gauges so operators can alert on stalled or repeatedly failing workers without scraping logs.</p><p class="ac-metric">Per-service generic metrics: s3o_worker_ticks_total{service,result}, s3o_worker_last_success_timestamp_seconds{service}, s3o_worker_consecutive_failures{service}</p>'
     },
     REPL: {
       title: 'Replicator',
       badge: 'process', badgeText: 'every 5 min',
-      body: '<p><code>Replicator.Replicate()</code> creates additional copies of under-replicated objects to reach the configured replication factor.</p><p><b>Interval</b>: default 5 minutes (configurable via <code>replication.worker_interval</code>).<br><b>Advisory lock</b>: <code>LockReplicator = 1002</code>.<br><b>Batch size</b>: configurable, queries <code>GetUnderReplicatedObjects()</code>.<br><b>Concurrency</b>: parallel via <code>workerpool.Run()</code>.</p><p>Runs a <b>startup pass</b> immediately on boot for catch-up. Excludes backends unhealthy longer than <code>unhealthy_threshold</code>. Uses <code>streamCopy()</code> for zero-buffer transfer. Conditional <code>RecordReplica()</code> DB insert guards against concurrent overwrites/deletes.</p><p>On copy failure or stale source: orphan cleaned via <code>deleteOrEnqueue()</code> with reason <code>replication_orphan</code>.</p><p class="ac-metric">Metrics: replication_copies_created_total, replication_runs_total, replication_errors_total, replication_duration_seconds, replication_pending</p>'
+      body: '<p><code>Replicator.Replicate()</code> creates additional copies of under-replicated objects to reach the configured replication factor.</p><p><b>Interval</b>: default 5 minutes (configurable via <code>replication.worker_interval</code>).<br><b>Advisory lock</b>: <code>LockReplicator = 1002</code>.<br><b>Batch size</b>: configurable, queries <code>GetUnderReplicatedObjects()</code>.<br><b>Concurrency</b>: parallel via <code>workerpool.Run()</code>.</p><p>Runs a <b>startup pass</b> immediately on boot for catch-up. Excludes backends unhealthy longer than <code>unhealthy_threshold</code>. Uses <code>StreamCopy()</code> for zero-buffer transfer. Conditional <code>RecordReplica()</code> DB insert guards against concurrent overwrites/deletes.</p><p>On copy failure or stale source: orphan cleaned via <code>DeleteOrEnqueue()</code> with reason <code>replication_orphan</code>.</p><p>Not the only way a copy is made. With <code>write_path.parallel_copies</code> on the write places its own, leaving this worker with repair: objects a write could not place, health-triggered replacements, multipart uploads, and copies discarded because a newer write took the key mid-upload. The scan is unchanged; there is simply less for it to find.</p><p class="ac-metric">Metrics: replication_copies_created_total, replication_runs_total, replication_errors_total, replication_duration_seconds, replication_pending &bull; write-placed: replication_write_copies_committed, replication_write_copies_total, detached_uploads_depth, replication_write_fanout_skipped_total</p>'
     },
     REBAL: {
       title: 'Rebalancer',
       badge: 'process', badgeText: 'every 6 hrs',
-      body: '<p><code>Rebalancer.Rebalance()</code> moves objects between backends to optimize space distribution.</p><p><b>Interval</b>: default 6 hours (configurable via <code>rebalance.interval</code>).<br><b>Advisory lock</b>: <code>LockRebalancer = 1001</code>.<br><b>Guard</b>: skips if disabled or utilization spread &lt; <code>threshold</code>.</p><p><b>Strategies</b>:<br>&bull; <code>spread</code>: equalizes utilization ratios (most over-target sources &rarr; most under-target destinations)<br>&bull; <code>pack</code>: consolidates onto most-full backends, pulling from least-full</p><p>Each move: <code>streamCopy()</code> &rarr; <code>MoveObjectLocation()</code> (atomic CAS) &rarr; delete source. On DB failure: destination orphan cleaned via <code>deleteOrEnqueue()</code> with reason <code>rebalance_orphan</code>. Source delete failures use reason <code>rebalance_source_delete</code>.</p><p class="ac-metric">Metrics: rebalance_objects_moved, rebalance_bytes_moved, rebalance_runs_total, rebalance_duration_seconds, rebalance_skipped</p>'
+      body: '<p><code>Rebalancer.Rebalance()</code> moves objects between backends to optimize space distribution.</p><p><b>Interval</b>: default 6 hours (configurable via <code>rebalance.interval</code>).<br><b>Advisory lock</b>: <code>LockRebalancer = 1001</code>.<br><b>Guard</b>: skips if disabled or utilization spread &lt; <code>threshold</code>.</p><p><b>Strategies</b>:<br>&bull; <code>spread</code>: equalizes utilization ratios (most over-target sources &rarr; most under-target destinations)<br>&bull; <code>pack</code>: consolidates onto most-full backends, pulling from least-full</p><p>Each move: <code>StreamCopy()</code> &rarr; <code>MoveObjectLocation()</code> (atomic CAS) &rarr; delete source. On DB failure: destination orphan cleaned via <code>DeleteOrEnqueue()</code> with reason <code>rebalance_orphan</code>. Source delete failures use reason <code>rebalance_source_delete</code>.</p><p class="ac-metric">Metrics: rebalance_objects_moved, rebalance_bytes_moved, rebalance_runs_total, rebalance_duration_seconds, rebalance_skipped</p>'
     },
     OVERREP: {
       title: 'Over-Replication Cleaner',
       badge: 'process', badgeText: 'every 5 min',
-      body: '<p><code>OverReplicationCleaner.Clean()</code> removes surplus copies that exceed the target replication factor.</p><p><b>Interval</b>: default 5 minutes (configurable via <code>replication.worker_interval</code>).<br><b>Advisory lock</b>: <code>LockOverReplication = 1008</code>.<br><b>Guard</b>: only runs when <code>factor > 1</code>.</p><p>Queries <code>GetOverReplicatedObjects()</code>, groups by key, then scores each copy:<br>&bull; Draining backend: score 0 (remove first)<br>&bull; Circuit-broken backend: score 1<br>&bull; Healthy backend: 2 + (1 - utilization ratio), range [2..3]</p><p>Lowest-scoring copies removed first. Uses <code>RemoveExcessCopy()</code> with <code>FOR UPDATE</code> row lock to prevent races with concurrent replicator/rebalancer. Physical delete via <code>deleteOrEnqueue()</code> with reason <code>over_replication</code>.</p><p class="ac-metric">Metrics: over_replication_removed_total, over_replication_runs_total, over_replication_errors_total, over_replication_pending, over_replication_duration_seconds</p>'
+      body: '<p><code>OverReplicationCleaner.Clean()</code> removes surplus copies that exceed the target replication factor.</p><p><b>Interval</b>: default 5 minutes (configurable via <code>replication.worker_interval</code>).<br><b>Advisory lock</b>: <code>LockOverReplication = 1008</code>.<br><b>Guard</b>: only runs when <code>factor > 1</code>.</p><p>Queries <code>GetOverReplicatedObjects()</code>, groups by key, then scores each copy:<br>&bull; Draining backend: score 0 (remove first)<br>&bull; Circuit-broken backend: score 1<br>&bull; Healthy backend: 2 + (1 - utilization ratio), range [2..3]</p><p>Lowest-scoring copies removed first. Uses <code>RemoveExcessCopy()</code> with <code>FOR UPDATE</code> row lock to prevent races with concurrent replicator/rebalancer. Physical delete via <code>DeleteOrEnqueue()</code> with reason <code>over_replication</code>.</p><p class="ac-metric">Metrics: over_replication_removed_total, over_replication_runs_total, over_replication_errors_total, over_replication_pending, over_replication_duration_seconds</p>'
     },
     LIFECYCLE: {
       title: 'Lifecycle Expiration',
       badge: 'process', badgeText: 'every 1 hr',
-      body: '<p><code>proxy.BackendManager.ProcessLifecycleRules()</code> evaluates TTL-based lifecycle rules and deletes expired objects.</p><p><b>Interval</b>: 1 hour.<br><b>Advisory lock</b>: <code>LockLifecycle = 1005</code>.<br><b>Guard</b>: only runs when lifecycle rules are configured.<br><b>Batch size</b>: <code>lifecycleBatchSize = 100</code> per rule.</p><p>For each rule: computes <code>cutoff = now - expiration_days * 24h</code>, queries <code>ListExpiredObjects(ctx, prefix, cutoff, 100)</code>, then calls the standard <code>DeleteObject()</code> path (quota decrement, cache invalidation, cleanup queue on failure).</p><p>Audit event: <code>lifecycle.delete</code> with key, prefix, expiration_days.</p><p class="ac-metric">Metrics: lifecycle_deleted_total, lifecycle_failed_total, lifecycle_runs_total{status=success|partial|error}</p>'
+      body: '<p><code>expiry.Manager.ProcessRules()</code> evaluates TTL-based lifecycle rules and deletes expired objects.</p><p><b>Interval</b>: 1 hour.<br><b>Advisory lock</b>: <code>LockLifecycle = 1005</code>.<br><b>Guard</b>: only runs when lifecycle rules are configured.<br><b>Batch size</b>: <code>lifecycle.batch_size</code>, default 100 per rule.</p><p>For each rule: computes <code>cutoff = now - expiration_days * 24h</code>, queries <code>ListExpiredObjects()</code> with the rule prefix, tags, cutoff and batch size, then calls the standard <code>DeleteObject()</code> path (quota decrement, cache invalidation, cleanup queue on failure).</p><p>Audit event: <code>lifecycle.delete</code> with key, prefix, expiration_days.</p><p class="ac-metric">Metrics: lifecycle_deleted_total, lifecycle_failed_total, lifecycle_runs_total{status=success|partial|error}</p>'
     },
     MPCLEAN: {
       title: 'Multipart Cleanup',
@@ -129,7 +150,7 @@ Coordination of periodic background workers that maintain storage health, enforc
     FLUSH: {
       title: 'Usage Flusher',
       badge: 'filter', badgeText: 'every 30s (adaptive)',
-      body: '<p><code>UsageTracker.FlushUsage()</code> reads and resets in-memory atomic counters, then writes accumulated deltas (API requests, egress, ingress) to PostgreSQL.</p><p><b>Interval</b>: default 30 seconds (configurable via <code>usage_flush.interval</code>).<br><b>Adaptive mode</b>: when any backend exceeds <code>adaptive_threshold</code> ratio of its usage limit, interval shortens to <code>fast_interval</code> for higher enforcement accuracy.<br><b>Advisory lock</b>: <code>LockUsageFlush = 1007</code> (always acquired when Redis is configured, regardless of health, to prevent double-counting during recovery).</p><p>Counters keyed by calendar month (<code>YYYY-MM</code>) for automatic period rollover. On DB error, deltas are added back to avoid data loss. Drained backends have counters discarded. Also refreshes <code>UpdateQuotaMetrics()</code> each tick.</p><p class="ac-metric">Metric: s3o_quota_used_bytes, s3o_quota_limit_bytes (per-backend gauges)</p>'
+      body: '<p><code>UsageTracker.FlushUsage()</code> reads and resets in-memory atomic counters, then writes accumulated deltas (API requests, egress, ingress) to PostgreSQL.</p><p><b>Interval</b>: default 30 seconds (configurable via <code>usage_flush.interval</code>).<br><b>Adaptive mode</b>: when any backend exceeds <code>adaptive_threshold</code> ratio of its usage limit, interval shortens to <code>fast_interval</code> for higher enforcement accuracy.<br><b>Advisory lock</b>: <code>LockUsageFlush = 1007</code> (always acquired when Redis is configured, regardless of health, to prevent double-counting during recovery).</p><p>Counters keyed by calendar month (<code>YYYY-MM</code>) for automatic period rollover. On DB error, deltas are added back to avoid data loss. Drained backends have counters discarded. Also refreshes <code>UpdateQuotaMetrics()</code> each tick.</p><p class="ac-metric">Metric: s3o_quota_bytes_used, s3o_quota_bytes_limit (per-backend gauges)</p>'
     },
     CQWORKER: {
       title: 'Cleanup Queue Worker',
@@ -144,12 +165,12 @@ Coordination of periodic background workers that maintain storage health, enforc
     SCRUBBER: {
       title: 'Integrity Scrubber',
       badge: 'process', badgeText: 'configurable (default 6h)',
-      body: '<p><code>Scrubber.Scrub()</code> reads random objects from backends, computes their SHA-256 hash, and compares against the stored <code>content_hash</code>.</p><p><b>Interval</b>: configurable via <code>integrity.scrubber_interval</code> (default 6 hours, 0 = disabled).<br><b>Advisory lock</b>: <code>LockScrubber = 1010</code>.<br><b>Batch size</b>: configurable via <code>integrity.scrubber_batch_size</code> (default 100).<br><b>Guard</b>: only runs when <code>integrity.enabled: true</code> and <code>scrubber_interval > 0</code>.</p><p>Encrypted objects are decrypted before hashing — the hash is always against plaintext. Each backend read is tracked against usage quota (API calls + egress).</p><p>On hash mismatch: the corrupted copy is enqueued for cleanup via <code>DeleteOrEnqueue()</code> with reason <code>integrity_scrub_failed</code>.</p><p class="ac-metric">Metrics: s3o_integrity_checks_total{operation="scrub"}, s3o_integrity_errors_total{operation="scrub"}</p>'
+      body: '<p><code>Scrubber.Scrub()</code> takes the copies least recently verified, computes their SHA-256 hash, and compares against the stored <code>content_hash</code>.</p><p><b>Ordering</b>: <code>COALESCE(last_scrubbed_at, created_at)</code>, so a freshly written copy sorts behind an old unverified one and a heavy write rate cannot starve the sweep. Every attempt is stamped, including reads that fail, so an unreadable copy cannot stall the queue behind it.</p><p><b>Interval</b>: configurable via <code>integrity.scrubber_interval</code> (default 6 hours, 0 = disabled).<br><b>Advisory lock</b>: <code>LockScrubber = 1010</code>.<br><b>Batch size</b>: configurable via <code>integrity.scrubber_batch_size</code> (default 100).<br><b>Guard</b>: only runs when <code>integrity.enabled: true</code> and <code>scrubber_interval > 0</code>. It runs on a tick only, never at startup, so an interval longer than the process lifetime means it never runs at all.</p><p>The stored form is undone before hashing, in the reverse of the order it was applied: decrypt, then decompress. The hash is always against the bytes the client wrote. A copy that cannot be decoded at all is reported as unreadable rather than corrupt, so it is left alone instead of deleted. Each backend read is tracked against usage quota (API calls + egress).</p><p>On hash mismatch: the bytes are removed via <code>DeleteOrEnqueue()</code> with reason <code>integrity_scrub_failed</code>, and the <code>object_locations</code> row is dropped so the replicator sees the object as under-replicated and rebuilds it. Leaving the row behind would let the replicator keep counting a copy that no longer exists.</p><p class="ac-metric">Metrics: s3o_integrity_checks_total{operation="scrub"}, s3o_integrity_errors_total{operation="scrub"}, s3o_integrity_oldest_unverified_seconds, s3o_integrity_never_verified_copies</p>'
     },
     RECONCILE: {
       title: 'Orphan Reconciler',
       badge: 'process', badgeText: 'configurable (default 24h)',
-      body: '<p><code>Reconciler.Run()</code> scans each backend via <code>ReconcileBackend()</code>, which diffs S3 against <code>object_locations</code> using a bounded-memory sorted-merge: it walks both sides as ascending key streams (S3 paginated by <code>ListObjects</code>, DB paginated by <code>ListObjectsByBackendKeyAsc</code>) and merges them in lockstep. Memory is O(page_size) regardless of object count, so backends holding millions of keys reconcile without OOM.</p><p><b>Interval</b>: configurable (default 24 hours).<br><b>Advisory lock</b>: <code>LockReconcile = 1009</code>.<br><b>Guard</b>: only runs when <code>reconcile.enabled: true</code>.<br><b>On-demand</b>: also available via <code>POST /admin/api/reconcile[?backend=name]</code>.</p><p>The merge engine emits S3-only keys to <code>ImportObject()</code> and DB-only keys to <code>DeleteObjectLocation()</code>; rows whose keys belong to sibling virtual buckets are skipped so a per-bucket pass does not nuke other buckets stored on the same backend. After reconciling, quota metrics are refreshed.</p><p>Every pass also runs <code>ReconcileUsage()</code>, which rewrites each backend&#39;s <code>backend_quotas.bytes_used</code> to <code>SUM(object_locations.size_bytes)</code>. The counter is otherwise incrementally maintained and drifts permanently if any mutation path misses an adjustment; this is the self-heal. Runs regardless of import count (drift can exist with zero imports) and is also available on demand via <code>POST /admin/api/usage-reconcile</code>.</p><p>Audit events: <code>storage.ReconcileComplete</code> with imported count, removed count, backends scanned; <code>usage.reconcile</code> with the count of backends corrected.</p><p class="ac-metric">Metric: s3o_quota_reconcile_corrections_total</p>'
+      body: '<p><code>Reconciler.Run()</code> scans each backend via <code>ReconcileBackend()</code>, which diffs S3 against <code>object_locations</code> using a bounded-memory sorted-merge: it walks both sides as ascending key streams (S3 paginated by <code>ListObjects</code>, DB paginated by <code>ListObjectsByBackendKeyAsc</code>) and merges them in lockstep. Memory is O(page_size) regardless of object count, so backends holding millions of keys reconcile without OOM.</p><p><b>Interval</b>: configurable (default 24 hours).<br><b>Advisory lock</b>: <code>LockReconcile = 1009</code>.<br><b>Guard</b>: only runs when <code>reconcile.enabled: true</code>.<br><b>On-demand</b>: also available via <code>POST /admin/api/reconcile[?backend=name]</code>.</p><p>The merge engine emits S3-only keys to <code>ImportObject()</code> and DB-only keys to <code>DeleteObjectLocation()</code>. Every key is imported at its literal backend key, including keys outside every configured virtual bucket prefix &mdash; those are real bytes against the backend&#39;s quota, so leaving them off the ledger makes space accounting wrong. Such rows are flagged <code>managed = false</code>: quota sums them, but replication, rebalance, integrity and drain skip them. After reconciling, quota metrics are refreshed.</p><p>A key whose delete is still outstanding &mdash; waiting in <code>cleanup_queue</code> or dead-lettered to <code>cleanup_dlq</code> &mdash; is left alone rather than imported. Those bytes are on the backend only because the delete could not reach them, so adopting the key would resurrect the object: it would come back live, the replicator would spread it to reach the replication factor, and its <code>created_at</code> would restart so any lifecycle rule that had expired it would wait another full window. The check runs inside the import transaction, so a cleanup finishing concurrently cannot slip between it and the insert.</p><p>The suppression is scoped to the <code>(key, backend)</code> pair, so a copy removed cleanly on another backend is still importable. Suppressed keys are logged and counted as <code>suppressed_pending_cleanup</code>; a run reporting many of them points at a cleanup queue that is not draining rather than at a reconcile problem.</p><p>Every pass also runs <code>ReconcileUsage()</code>, which rewrites each backend&#39;s striped byte total to <code>SUM(object_locations.size_bytes)</code>. Mutations charge the counter inside the transaction that writes the rows it summarizes, so it cannot drift from them: this pass is an audit, and a correction it applies means a mutation path is storing bytes without charging them. Runs regardless of import count, and after an import (which adopts rows the counter has never seen) and is also available on demand via <code>POST /admin/api/usage-reconcile</code>.</p><p>Audit events: <code>storage.ReconcileComplete</code> with imported count, removed count, <code>suppressed_pending_cleanup</code> count, backends scanned; <code>usage.reconcile</code> with the count of backends corrected.</p><p class="ac-metric">Metric: s3o_quota_reconcile_corrections_total</p>'
     },
     CBWATCH: {
       title: 'CB Watchdog',
@@ -159,12 +180,12 @@ Coordination of periodic background workers that maintain storage health, enforc
     PG: {
       title: 'PostgreSQL',
       badge: 'storage', badgeText: 'shared state',
-      body: '<p>Central metadata store shared by all background services. Hosts object locations, quota stats, usage counters, multipart upload state, cleanup queue, and advisory locks.</p><p><b>Advisory locks</b> provide leader election: <code>pg_try_advisory_lock(lockID)</code> ensures only one instance runs each service. Lock IDs: Rebalancer=1001, Replicator=1002, CleanupQueue=1003, MultipartCleanup=1004, Lifecycle=1005, UsageFlush=1007, OverReplication=1008, Reconcile=1009, Scrubber=1010.</p><p>Key tables: <code>object_locations</code>, <code>backend_quotas</code>, <code>backend_usage</code>, <code>cleanup_queue</code>, <code>multipart_uploads</code>, <code>multipart_parts</code>.</p>'
+      body: '<p>Central metadata store shared by all background services. Hosts object locations, quota stats, usage counters, multipart upload state, cleanup queue, and advisory locks.</p><p><b>Advisory locks</b> provide leader election: <code>pg_try_advisory_lock(lockID)</code> ensures only one instance runs each service. Lock IDs: Rebalancer=1001, Replicator=1002, CleanupQueue=1003, MultipartCleanup=1004, Lifecycle=1005, UsageFlush=1007, OverReplication=1008, Reconcile=1009, Scrubber=1010.</p><p>Key tables: <code>object_locations</code>, <code>backend_quotas</code>, <code>backend_usage</code>, <code>backend_request_usage</code>, <code>cleanup_queue</code>, <code>multipart_uploads</code>, <code>multipart_parts</code>.</p>'
     },
     S3: {
       title: 'S3 Backends',
       badge: 'storage', badgeText: 'object storage',
-      body: '<p>Physical storage backends (OCI Object Storage, Cloudflare R2, etc.) accessed through the <code>ObjectBackend</code> interface, optionally wrapped with <code>CircuitBreakerBackend</code>.</p><p>Background services interact via:<br>&bull; <code>streamCopy()</code>: piped <code>GetObject</code> &rarr; <code>PutObject</code> for rebalancer and replicator<br>&bull; <code>deleteWithTimeout()</code>: bounded <code>DeleteObject</code> for cleanup worker, lifecycle, over-replication<br>&bull; <code>AbortMultipartUpload()</code>: deletes uploaded parts for stale upload cleanup</p><p>All S3 API calls are recorded against per-backend usage counters (<code>usage.Record()</code>) for quota enforcement.</p>'
+      body: '<p>Physical storage backends (OCI Object Storage, Cloudflare R2, etc.) accessed through the <code>ObjectBackend</code> interface, optionally wrapped with <code>CircuitBreakerBackend</code>.</p><p>Background services interact via:<br>&bull; <code>StreamCopy()</code>: piped <code>GetObject</code> &rarr; <code>PutObject</code> for rebalancer and replicator<br>&bull; <code>deleteWithTimeout()</code>: bounded <code>DeleteObject</code> for cleanup worker, lifecycle, over-replication<br>&bull; <code>AbortMultipartUpload()</code>: deletes uploaded parts for stale upload cleanup</p><p>All S3 API calls are recorded against per-backend usage counters (<code>usage.Record()</code>) for quota enforcement. Each call names the operation it made, so it charges the request pools that operation belongs to as well as the backend&#39;s request total; operations listed as <code>unmetered</code> are recorded but charged to no pool.</p>'
     },
     CQ: {
       title: 'Cleanup Queue Table',
@@ -185,10 +206,25 @@ Coordination of periodic background workers that maintain storage health, enforc
     if (tooltip.style.display === 'block') positionTooltip();
   });
   function positionTooltip() {
-    var pad = 12, x = mouseX + pad, y = mouseY + pad;
-    if (x + tooltip.offsetWidth > window.innerWidth - pad) x = mouseX - tooltip.offsetWidth - pad;
-    if (y + tooltip.offsetHeight > window.innerHeight - pad) y = mouseY - tooltip.offsetHeight - pad;
-    tooltip.style.left = x + 'px'; tooltip.style.top = y + 'px';
+    var pad = 12;
+    var w = tooltip.offsetWidth, h = tooltip.offsetHeight;
+    var vw = window.innerWidth, vh = window.innerHeight;
+
+    var x = mouseX + pad;
+    if (x + w > vw - pad) x = mouseX - w - pad;
+    x = Math.max(pad, Math.min(x, vw - w - pad));
+
+    // Prefer below the cursor, and flip above only when above genuinely has
+    // more room. Clamping afterwards is what keeps a tall panel on screen: an
+    // unclamped flip puts its top edge above the viewport, and a panel taller
+    // than the viewport pins to the top and scrolls instead.
+    var below = vh - mouseY - pad * 2;
+    var above = mouseY - pad * 2;
+    var y = (h <= below || below >= above) ? mouseY + pad : mouseY - h - pad;
+    y = Math.max(pad, Math.min(y, vh - h - pad));
+
+    tooltip.style.left = x + 'px';
+    tooltip.style.top = y + 'px';
   }
   function showInfo(id) {
     var info = nodeInfo[id];

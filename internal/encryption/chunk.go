@@ -30,18 +30,13 @@ import (
 	"io"
 )
 
-// HeaderSize and related constants used by this package.
+// HeaderSize and the AES-GCM sizes the envelope format is built from. Every
+// chunk carries its own nonce and tag, so ChunkOverhead is what a chunk costs
+// on top of its plaintext.
 const (
-	// HeaderSize is the fixed size of the encryption header.
-	HeaderSize = 32
-
-	// NonceSize is the AES-GCM nonce length.
-	NonceSize = 12
-
-	// TagSize is the AES-GCM authentication tag length.
-	TagSize = 16
-
-	// ChunkOverhead is the per-chunk overhead: nonce + tag.
+	HeaderSize    = 32
+	NonceSize     = 12
+	TagSize       = 16
 	ChunkOverhead = NonceSize + TagSize
 )
 
@@ -117,7 +112,7 @@ func newEncryptReader(src io.Reader, dek []byte, chunkSize int, bufs *chunkBuffe
 	// Build header into the reusable header buffer.
 	hdr := bufs.header[:HeaderSize]
 	copy(hdr[0:4], headerMagic[:])
-	hdr[4] = 0x01 // version
+	hdr[4] = 0x01                                           // version
 	binary.BigEndian.PutUint32(hdr[5:9], uint32(chunkSize)) //nolint:gosec // G115: chunkSize validated <= 1MB in config
 	copy(hdr[9:21], baseNonce)
 	for i := 21; i < HeaderSize; i++ {
@@ -151,6 +146,29 @@ func (r *encryptReader) returnBufs() {
 	release()
 }
 
+// readChunk fills buf from src and reports which of the three endings
+// io.ReadFull distinguishes it hit: a clean end of stream (0, io.EOF), a
+// partial final chunk (n>0, io.ErrUnexpectedEOF), or a real error from the
+// source. done covers the first two; the error is returned as io.EOF only for
+// the first.
+//
+// The bug class this defends against is squashing the third case to io.EOF,
+// which would let a transient backend failure land in storage as a
+// truncated-but-valid object. Both directions of the stream read through here
+// so neither can drift into doing that.
+func readChunk(src io.Reader, buf []byte, what string) (n int, done bool, err error) {
+	n, err = io.ReadFull(src, buf)
+	switch {
+	case n == 0 && errors.Is(err, io.EOF):
+		return 0, true, io.EOF
+	case errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF):
+		return n, true, nil
+	case err != nil:
+		return 0, false, fmt.Errorf("read %s: %w", what, err)
+	}
+	return n, false, nil
+}
+
 // Read implements io.Reader. Emits the header followed by encrypted chunks.
 func (r *encryptReader) Read(p []byte) (int, error) {
 	if r.bufs == nil {
@@ -176,22 +194,15 @@ func (r *encryptReader) Read(p []byte) (int, error) {
 		return 0, io.EOF
 	}
 
-	// Read one plaintext chunk into the reusable buffer. io.ReadFull
-	// returns (0, io.EOF) for a clean end of stream, (n>0, io.ErrUnexpectedEOF)
-	// for a partial final chunk, and (0, err) for any real error from the
-	// source. The bug class this code defends against is silently squashing
-	// the third case to io.EOF, which would let a transient backend failure
-	// land in storage as a truncated-but-valid object.
-	n, err := io.ReadFull(r.src, r.bufs.plain)
-	switch {
-	case n == 0 && errors.Is(err, io.EOF):
+	n, done, err := readChunk(r.src, r.bufs.plain, "plaintext")
+	if done {
 		r.srcDone = true
-		r.returnBufs()
-		return 0, io.EOF
-	case errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF):
-		r.srcDone = true
-	case err != nil:
-		return 0, fmt.Errorf("read plaintext: %w", err)
+	}
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			r.returnBufs()
+		}
+		return 0, err
 	}
 	plain := r.bufs.plain[:n]
 
@@ -289,20 +300,16 @@ func (r *decryptReader) Read(p []byte) (int, error) {
 		return 0, io.EOF
 	}
 
-	// Read one ciphertext chunk into the reusable framed buffer. See
-	// the matching comment in encryptReader.Read for the failure
-	// modes distinguished here.
 	chunkBuf := r.bufs.framed[:cap(r.bufs.framed)]
-	n, err := io.ReadFull(r.src, chunkBuf)
-	switch {
-	case n == 0 && errors.Is(err, io.EOF):
+	n, done, err := readChunk(r.src, chunkBuf, "ciphertext")
+	if done {
 		r.srcDone = true
-		r.returnBufs()
-		return 0, io.EOF
-	case errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF):
-		r.srcDone = true
-	case err != nil:
-		return 0, fmt.Errorf("read ciphertext: %w", err)
+	}
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			r.returnBufs()
+		}
+		return 0, err
 	}
 	chunk := chunkBuf[:n]
 
@@ -337,34 +344,15 @@ func (r *decryptReader) Read(p []byte) (int, error) {
 // NONCE DERIVATION
 // -------------------------------------------------------------------------
 //
-// SAFETY INVARIANT: AES-GCM requires that the same (key, nonce) pair is
-// never used twice. This derivation is safe because:
+// SAFETY INVARIANT: AES-GCM requires that a (key, nonce) pair is never used
+// twice. This derivation is safe because Encryptor.Encrypt generates a fresh
+// 32-byte DEK per object, newEncryptReader generates a fresh random base nonce
+// per call, and chunk indices are sequential within one object, so the XOR
+// produces a unique nonce per chunk. A re-uploaded plaintext gets a different
+// DEK and base nonce, and PutObject re-encrypts with a fresh DEK on every retry.
 //
-//  1. Each object gets a fresh random DEK (Encryptor.Encrypt generates a
-//     new 32-byte key per call  -  see encryption.go:93).
-//  2. Each encrypt call generates a fresh random base nonce (see
-//     newEncryptReader  -  chunk.go:77-78).
-//  3. Within a single object, chunk indices are sequential (0, 1, 2, ...),
-//     so XOR with the index produces unique nonces per chunk.
-//
-// Even if the same plaintext is uploaded twice, it gets a different DEK
-// and different base nonce. Nonce reuse can only occur if a future code
-// change reuses a DEK across objects or re-encrypts with the same DEK
-// after a partial failure. The current code never does this  -  PutObject
-// re-encrypts with a fresh DEK on each retry attempt.
-//
-// If the DEK-per-object invariant is ever relaxed (e.g., for performance),
-// this derivation must be replaced with random per-chunk nonces or a
-// NIST-compliant counter mode (AES-ECB of the chunk index).
-
-// chunkNonce derives a per-chunk nonce by XORing the chunk index into the
-// last 8 bytes of the base nonce. Each chunk gets a unique nonce without
-// requiring additional random bytes.
-func chunkNonce(base []byte, idx uint64) []byte {
-	nonce := make([]byte, NonceSize)
-	deriveNonce(nonce, base, idx)
-	return nonce
-}
+// Relaxing the DEK-per-object invariant would require replacing this with
+// random per-chunk nonces or a NIST-compliant counter mode.
 
 // deriveNonce writes a per-chunk nonce into dst by copying the base nonce
 // and XORing the chunk index into the last 8 bytes. dst must be at least
@@ -389,9 +377,18 @@ func ParseHeader(r io.Reader) (chunkSize int, baseNonce []byte, err error) {
 	if _, err := io.ReadFull(r, hdr); err != nil {
 		return 0, nil, fmt.Errorf("read header: %w", err)
 	}
+	return ParseHeaderBytes(hdr)
+}
 
-	if hdr[0] != headerMagic[0] || hdr[1] != headerMagic[1] ||
-		hdr[2] != headerMagic[2] || hdr[3] != headerMagic[3] {
+// ParseHeaderBytes validates an already-read 32-byte encryption header and
+// returns the chunk size and base nonce encoded in it. Callers that fetched
+// the header as part of a larger ranged read use this to avoid a second read.
+func ParseHeaderBytes(hdr []byte) (chunkSize int, baseNonce []byte, err error) {
+	if len(hdr) < HeaderSize {
+		return 0, nil, fmt.Errorf("short encryption header: %d bytes", len(hdr))
+	}
+
+	if !HasEnvelopeMagic(hdr) {
 		return 0, nil, fmt.Errorf("invalid encryption header magic")
 	}
 
@@ -407,4 +404,64 @@ func ParseHeader(r io.Reader) (chunkSize int, baseNonce []byte, err error) {
 	copy(nonce, hdr[9:21])
 
 	return cs, nonce, nil
+}
+
+// SameEncryptionOperation reports whether an envelope header read off a
+// backend was produced by the same encryption operation as the stored key
+// blob packed by PackKeyData.
+//
+// The base nonce is drawn fresh from crypto/rand for every encryption run
+// (see newEncryptReader), and copies of an object reproduce its ciphertext
+// byte for byte, so a matching nonce means the blob's DEK is the one that
+// encrypted these bytes. A separate write of the same key gets a different
+// nonce, which is what makes this safe to use for deciding whether a stray
+// backend object may adopt a sibling row's key.
+//
+// This establishes identity, not authenticity: it assumes the backend holds
+// what the orchestrator wrote. Bytes that lie about their header still fail
+// the AEAD tag on the first real read.
+func SameEncryptionOperation(header, packedKey []byte) bool {
+	_, headerNonce, err := ParseHeaderBytes(header)
+	if err != nil {
+		return false
+	}
+	storedNonce, _, err := UnpackKeyData(packedKey)
+	if err != nil {
+		return false
+	}
+	return bytes.Equal(headerNonce, storedNonce)
+}
+
+// HasEnvelopeMagic reports whether b begins with the envelope signature.
+// b shorter than the signature is never an envelope.
+func HasEnvelopeMagic(b []byte) bool {
+	if len(b) < len(headerMagic) {
+		return false
+	}
+	return b[0] == headerMagic[0] && b[1] == headerMagic[1] &&
+		b[2] == headerMagic[2] && b[3] == headerMagic[3]
+}
+
+// PeekEnvelope reports whether r's stream begins with the envelope signature,
+// returning a reader that replays the bytes it consumed so the caller can go
+// on reading from the start.
+//
+// This is how a caller checks that a row's encrypted flag agrees with the
+// bytes actually stored. The two disagreeing means either ciphertext would be
+// served as plaintext or plaintext decrypted as ciphertext, both of which are
+// worth failing on rather than guessing.
+//
+// A short stream is reported as not-an-envelope with the bytes replayed; a
+// read error is returned with a reader that still replays whatever arrived.
+func PeekEnvelope(r io.Reader) (bool, io.Reader, error) {
+	buf := make([]byte, len(headerMagic))
+	n, err := io.ReadFull(r, buf)
+	replayed := io.MultiReader(bytes.NewReader(buf[:n]), r)
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return false, replayed, nil
+	}
+	if err != nil {
+		return false, replayed, fmt.Errorf("peek encryption header: %w", err)
+	}
+	return HasEnvelopeMagic(buf), replayed, nil
 }

@@ -21,14 +21,30 @@ import (
 	"testing"
 	"time"
 
+	promtest "github.com/prometheus/client_golang/prometheus/testutil"
+	"go.uber.org/mock/gomock"
+
 	"github.com/afreidah/s3-orchestrator/internal/backend"
 	"github.com/afreidah/s3-orchestrator/internal/backend/backendtest"
 	"github.com/afreidah/s3-orchestrator/internal/config"
 	"github.com/afreidah/s3-orchestrator/internal/observe/telemetry"
 	"github.com/afreidah/s3-orchestrator/internal/store/core"
-	promtest "github.com/prometheus/client_golang/prometheus/testutil"
-	"go.uber.org/mock/gomock"
 )
+
+// endpointOf matches the backend.CopyEndpoint carrying a given backend client.
+// StreamCopy takes named endpoints so it can charge each leg of a copy to the
+// right backend; these tests care only about which client was used, so the
+// matcher looks past the name.
+type endpointOf struct{ be backend.ObjectBackend }
+
+// Matches reports whether x is an endpoint wrapping the expected client.
+func (m endpointOf) Matches(x any) bool {
+	ep, ok := x.(backend.CopyEndpoint)
+	return ok && ep.Backend == m.be
+}
+
+// String describes the matcher for gomock's failure output.
+func (m endpointOf) String() string { return fmt.Sprintf("copy endpoint for %v", m.be) }
 
 // -------------------------------------------------------------------------
 // planUnderReplicated (planner)
@@ -174,7 +190,7 @@ func TestReplicationOutcome_FailedCountsAllFailureKinds(t *testing.T) {
 func TestReplicator_SetConfig_RoundTrip(t *testing.T) {
 	t.Parallel()
 	ctrl := gomock.NewController(t)
-	r := NewReplicator(NewMockOps(ctrl), NewMockPlacement(ctrl), &mockMetadataStore{})
+	r := newTestReplicator(newMockOps(ctrl), NewMockPlacement(ctrl), &mockMetadataStore{})
 	if r.Config() != nil {
 		t.Fatal("expected nil config before set")
 	}
@@ -190,14 +206,14 @@ func TestReplicator_SetConfig_RoundTrip(t *testing.T) {
 func TestFindReplicaTarget_SelectsBackendWithSpace(t *testing.T) {
 	t.Parallel()
 	ctrl := gomock.NewController(t)
-	ops := NewMockOps(ctrl)
+	ops := newMockOps(ctrl)
 	pl := NewMockPlacement(ctrl)
 	ms := &mockMetadataStore{}
 
 	exclusion := map[string]bool{"b1": true}
-	pl.EXPECT().SelectReplicaTarget(gomock.Any(), int64(50), exclusion).Return("b2", nil)
+	pl.EXPECT().RankReplicaTargets(int64(50), exclusion).Return([]string{"b2"})
 
-	r := NewReplicator(ops, pl, ms)
+	r := newTestReplicator(ops, pl, ms)
 
 	target := r.FindReplicaTarget(context.Background(), "key1", 50, exclusion)
 	if target != "b2" {
@@ -210,13 +226,13 @@ func TestFindReplicaTarget_SelectsBackendWithSpace(t *testing.T) {
 func TestFindReplicaTarget_NoSpace(t *testing.T) {
 	t.Parallel()
 	ctrl := gomock.NewController(t)
-	ops := NewMockOps(ctrl)
+	ops := newMockOps(ctrl)
 	pl := NewMockPlacement(ctrl)
 	ms := &mockMetadataStore{}
 
-	pl.EXPECT().SelectReplicaTarget(gomock.Any(), int64(50), gomock.Any()).Return("", nil)
+	pl.EXPECT().RankReplicaTargets(int64(50), gomock.Any()).Return(nil)
 
-	r := NewReplicator(ops, pl, ms)
+	r := newTestReplicator(ops, pl, ms)
 
 	target := r.FindReplicaTarget(context.Background(), "key1", 50, nil)
 	if target != "" {
@@ -229,14 +245,13 @@ func TestFindReplicaTarget_NoSpace(t *testing.T) {
 func TestFindReplicaTarget_SelectionError(t *testing.T) {
 	t.Parallel()
 	ctrl := gomock.NewController(t)
-	ops := NewMockOps(ctrl)
+	ops := newMockOps(ctrl)
 	pl := NewMockPlacement(ctrl)
 	ms := &mockMetadataStore{}
 
-	pl.EXPECT().SelectReplicaTarget(gomock.Any(), int64(50), gomock.Any()).
-		Return("", fmt.Errorf("database unavailable"))
+	pl.EXPECT().RankReplicaTargets(int64(50), gomock.Any()).Return(nil)
 
-	r := NewReplicator(ops, pl, ms)
+	r := newTestReplicator(ops, pl, ms)
 
 	target := r.FindReplicaTarget(context.Background(), "key1", 50, nil)
 	if target != "" {
@@ -249,7 +264,7 @@ func TestFindReplicaTarget_SelectionError(t *testing.T) {
 func TestCopyToReplica_Success(t *testing.T) {
 	t.Parallel()
 	ctrl := gomock.NewController(t)
-	ops := NewMockOps(ctrl)
+	ops := newMockOps(ctrl)
 	pl := NewMockPlacement(ctrl)
 	ms := &mockMetadataStore{}
 
@@ -258,20 +273,20 @@ func TestCopyToReplica_Success(t *testing.T) {
 
 	ops.EXPECT().GetBackend("b2").Return(dstBe, nil)
 	ops.EXPECT().Backends().Return(map[string]backend.ObjectBackend{"b1": srcBe}).AnyTimes()
-	ops.EXPECT().StreamCopy(gomock.Any(), srcBe, dstBe, "key1").Return(nil)
+	ops.EXPECT().StreamCopy(gomock.Any(), endpointOf{srcBe}, endpointOf{dstBe}, "key1", gomock.Any()).Return(int64(0), nil)
 
-	r := NewReplicator(ops, pl, ms)
+	r := newTestReplicator(ops, pl, ms)
 	copies := []core.ObjectLocation{{BackendName: "b1", SizeBytes: 4096}}
 
-	src, size, err := r.CopyToReplica(context.Background(), "key1", copies, "b2")
+	src, err := r.CopyToReplica(context.Background(), "key1", copies, "b2")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if src != "b1" {
-		t.Errorf("source = %q, want b1", src)
+	if src.BackendName != "b1" {
+		t.Errorf("source = %q, want b1", src.BackendName)
 	}
-	if size != 4096 {
-		t.Errorf("size = %d, want 4096 (the source's SizeBytes)", size)
+	if src.SizeBytes != 4096 {
+		t.Errorf("size = %d, want 4096 (the source's SizeBytes)", src.SizeBytes)
 	}
 }
 
@@ -299,7 +314,7 @@ func newOpenBreakerBackend(t *testing.T, ctrl *gomock.Controller, name string) *
 func TestCopyToReplica_SkipsOpenBreakerSource(t *testing.T) {
 	t.Parallel()
 	ctrl := gomock.NewController(t)
-	ops := NewMockOps(ctrl)
+	ops := newMockOps(ctrl)
 	pl := NewMockPlacement(ctrl)
 	ms := &mockMetadataStore{}
 
@@ -312,18 +327,18 @@ func TestCopyToReplica_SkipsOpenBreakerSource(t *testing.T) {
 		Return(map[string]backend.ObjectBackend{"b0": deadSrc, "b1": healthySrc}).AnyTimes()
 	// Only the healthy source may be streamed; an unexpected StreamCopy against
 	// deadSrc fails the test (no expectation registered for it).
-	ops.EXPECT().StreamCopy(gomock.Any(), healthySrc, dstBe, "key1").Return(nil)
+	ops.EXPECT().StreamCopy(gomock.Any(), endpointOf{healthySrc}, endpointOf{dstBe}, "key1", gomock.Any()).Return(int64(0), nil)
 
-	r := NewReplicator(ops, pl, ms)
+	r := newTestReplicator(ops, pl, ms)
 	// Dead source listed first to prove exclusion, not just ordering, is at work.
 	copies := []core.ObjectLocation{{BackendName: "b0", SizeBytes: 10}, {BackendName: "b1", SizeBytes: 4096}}
 
-	src, size, err := r.CopyToReplica(context.Background(), "key1", copies, "b2")
+	src, err := r.CopyToReplica(context.Background(), "key1", copies, "b2")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if src != "b1" || size != 4096 {
-		t.Errorf("got (%q, %d), want (b1, 4096)", src, size)
+	if src.BackendName != "b1" || src.SizeBytes != 4096 {
+		t.Errorf("got (%q, %d), want (b1, 4096)", src.BackendName, src.SizeBytes)
 	}
 }
 
@@ -333,7 +348,7 @@ func TestCopyToReplica_SkipsOpenBreakerSource(t *testing.T) {
 func TestCopyToReplica_FallsBackWhenAllSourcesUnhealthy(t *testing.T) {
 	t.Parallel()
 	ctrl := gomock.NewController(t)
-	ops := NewMockOps(ctrl)
+	ops := newMockOps(ctrl)
 	pl := NewMockPlacement(ctrl)
 	ms := &mockMetadataStore{}
 
@@ -343,17 +358,17 @@ func TestCopyToReplica_FallsBackWhenAllSourcesUnhealthy(t *testing.T) {
 	ops.EXPECT().GetBackend("b2").Return(dstBe, nil)
 	ops.EXPECT().Backends().Return(map[string]backend.ObjectBackend{"b0": deadSrc}).AnyTimes()
 	// With no healthy source, the fallback must still attempt the dead one.
-	ops.EXPECT().StreamCopy(gomock.Any(), deadSrc, dstBe, "key1").Return(nil)
+	ops.EXPECT().StreamCopy(gomock.Any(), endpointOf{deadSrc}, endpointOf{dstBe}, "key1", gomock.Any()).Return(int64(0), nil)
 
-	r := NewReplicator(ops, pl, ms)
+	r := newTestReplicator(ops, pl, ms)
 	copies := []core.ObjectLocation{{BackendName: "b0", SizeBytes: 7}}
 
-	src, _, err := r.CopyToReplica(context.Background(), "key1", copies, "b2")
+	src, err := r.CopyToReplica(context.Background(), "key1", copies, "b2")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if src != "b0" {
-		t.Errorf("source = %q, want b0 (fallback attempt)", src)
+	if src.BackendName != "b0" {
+		t.Errorf("source = %q, want b0 (fallback attempt)", src.BackendName)
 	}
 }
 
@@ -362,7 +377,7 @@ func TestCopyToReplica_FallsBackWhenAllSourcesUnhealthy(t *testing.T) {
 func TestCopyToReplica_404CleansUpStaleMetadata(t *testing.T) {
 	t.Parallel()
 	ctrl := gomock.NewController(t)
-	ops := NewMockOps(ctrl)
+	ops := newMockOps(ctrl)
 	pl := NewMockPlacement(ctrl)
 	ms := &mockMetadataStore{}
 
@@ -371,13 +386,13 @@ func TestCopyToReplica_404CleansUpStaleMetadata(t *testing.T) {
 
 	ops.EXPECT().GetBackend("b2").Return(dstBe, nil)
 	ops.EXPECT().Backends().Return(map[string]backend.ObjectBackend{"b1": srcBe}).AnyTimes()
-	ops.EXPECT().StreamCopy(gomock.Any(), srcBe, dstBe, "key1").
-		Return(fmt.Errorf("read: %w", &httpError{code: 404, msg: "NoSuchKey"}))
+	ops.EXPECT().StreamCopy(gomock.Any(), endpointOf{srcBe}, endpointOf{dstBe}, "key1", gomock.Any()).
+		Return(int64(0), fmt.Errorf("read: %w", &httpError{code: 404, msg: "NoSuchKey"}))
 
-	r := NewReplicator(ops, pl, ms)
+	r := newTestReplicator(ops, pl, ms)
 	copies := []core.ObjectLocation{{BackendName: "b1"}}
 
-	_, _, err := r.CopyToReplica(context.Background(), "key1", copies, "b2")
+	_, err := r.CopyToReplica(context.Background(), "key1", copies, "b2")
 	if err == nil {
 		t.Fatal("expected error when source returns 404")
 	}
@@ -390,7 +405,7 @@ func TestCopyToReplica_404CleansUpStaleMetadata(t *testing.T) {
 func TestCopyToReplica_AllSourcesFail(t *testing.T) {
 	t.Parallel()
 	ctrl := gomock.NewController(t)
-	ops := NewMockOps(ctrl)
+	ops := newMockOps(ctrl)
 	pl := NewMockPlacement(ctrl)
 	ms := &mockMetadataStore{}
 
@@ -399,12 +414,12 @@ func TestCopyToReplica_AllSourcesFail(t *testing.T) {
 
 	ops.EXPECT().GetBackend("b2").Return(dstBe, nil)
 	ops.EXPECT().Backends().Return(map[string]backend.ObjectBackend{"b1": srcBe}).AnyTimes()
-	ops.EXPECT().StreamCopy(gomock.Any(), srcBe, dstBe, "key1").Return(&backend.CopyError{Phase: backend.CopyPhaseRead, Err: errors.New("timeout")})
+	ops.EXPECT().StreamCopy(gomock.Any(), endpointOf{srcBe}, endpointOf{dstBe}, "key1", gomock.Any()).Return(int64(0), &backend.CopyError{Phase: backend.CopyPhaseRead, Err: errors.New("timeout")})
 
-	r := NewReplicator(ops, pl, ms)
+	r := newTestReplicator(ops, pl, ms)
 	copies := []core.ObjectLocation{{BackendName: "b1"}}
 
-	_, _, err := r.CopyToReplica(context.Background(), "key1", copies, "b2")
+	_, err := r.CopyToReplica(context.Background(), "key1", copies, "b2")
 	if err == nil {
 		t.Fatal("expected error when all sources fail")
 	}
@@ -420,7 +435,7 @@ func TestCopyToReplica_AllSourcesFail(t *testing.T) {
 func TestCopyToReplica_WriteErrorShortCircuits(t *testing.T) {
 	t.Parallel()
 	ctrl := gomock.NewController(t)
-	ops := NewMockOps(ctrl)
+	ops := newMockOps(ctrl)
 	pl := NewMockPlacement(ctrl)
 	ms := &mockMetadataStore{}
 
@@ -437,15 +452,15 @@ func TestCopyToReplica_WriteErrorShortCircuits(t *testing.T) {
 	// First source triggers a typed write error. No expectation is set
 	// for src2's StreamCopy, so the test fails (unexpected call) if
 	// the short-circuit logic regresses and we fall through.
-	ops.EXPECT().StreamCopy(gomock.Any(), src1, dstBe, "key1").
-		Return(&backend.CopyError{Phase: backend.CopyPhaseWrite, Err: errors.New("413 EntityTooLarge")})
+	ops.EXPECT().StreamCopy(gomock.Any(), endpointOf{src1}, endpointOf{dstBe}, "key1", gomock.Any()).
+		Return(int64(0), &backend.CopyError{Phase: backend.CopyPhaseWrite, Err: errors.New("413 EntityTooLarge")})
 
-	r := NewReplicator(ops, pl, ms)
+	r := newTestReplicator(ops, pl, ms)
 	copies := []core.ObjectLocation{
 		{BackendName: "src1"},
 		{BackendName: "src2"},
 	}
-	if _, _, err := r.CopyToReplica(context.Background(), "key1", copies, "dst"); err == nil {
+	if _, err := r.CopyToReplica(context.Background(), "key1", copies, "dst"); err == nil {
 		t.Fatal("expected write-phase error to surface, got nil")
 	}
 }
@@ -457,7 +472,7 @@ func TestCopyToReplica_WriteErrorShortCircuits(t *testing.T) {
 func TestCopyToReplica_UntypedErrorRetriesNextSource(t *testing.T) {
 	t.Parallel()
 	ctrl := gomock.NewController(t)
-	ops := NewMockOps(ctrl)
+	ops := newMockOps(ctrl)
 	pl := NewMockPlacement(ctrl)
 	ms := &mockMetadataStore{}
 
@@ -475,22 +490,22 @@ func TestCopyToReplica_UntypedErrorRetriesNextSource(t *testing.T) {
 	// StreamCopy on src2 next. Sentinel success on src2 proves the
 	// fall-through happened.
 	gomock.InOrder(
-		ops.EXPECT().StreamCopy(gomock.Any(), src1, dstBe, "key1").
-			Return(errors.New("plain error string")),
-		ops.EXPECT().StreamCopy(gomock.Any(), src2, dstBe, "key1").Return(nil),
+		ops.EXPECT().StreamCopy(gomock.Any(), endpointOf{src1}, endpointOf{dstBe}, "key1", gomock.Any()).
+			Return(int64(0), errors.New("plain error string")),
+		ops.EXPECT().StreamCopy(gomock.Any(), endpointOf{src2}, endpointOf{dstBe}, "key1", gomock.Any()).Return(int64(0), nil),
 	)
 
-	r := NewReplicator(ops, pl, ms)
+	r := newTestReplicator(ops, pl, ms)
 	copies := []core.ObjectLocation{
 		{BackendName: "src1"},
 		{BackendName: "src2"},
 	}
-	source, _, err := r.CopyToReplica(context.Background(), "key1", copies, "dst")
+	source, err := r.CopyToReplica(context.Background(), "key1", copies, "dst")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if source != "src2" {
-		t.Errorf("source = %q, want src2 (fallthrough after untyped error)", source)
+	if source.BackendName != "src2" {
+		t.Errorf("source = %q, want src2 (fallthrough after untyped error)", source.BackendName)
 	}
 }
 
@@ -498,7 +513,7 @@ func TestCopyToReplica_UntypedErrorRetriesNextSource(t *testing.T) {
 func TestCleanupOrphan_DelegatesToDeleteOrEnqueue(t *testing.T) {
 	t.Parallel()
 	ctrl := gomock.NewController(t)
-	ops := NewMockOps(ctrl)
+	ops := newMockOps(ctrl)
 	pl := NewMockPlacement(ctrl)
 	ms := &mockMetadataStore{}
 
@@ -507,7 +522,7 @@ func TestCleanupOrphan_DelegatesToDeleteOrEnqueue(t *testing.T) {
 	ops.EXPECT().Backends().Return(map[string]backend.ObjectBackend{"b1": be})
 	pl.EXPECT().DeleteOrEnqueue(gomock.Any(), be, "b1", "key1", "replication_orphan", int64(100))
 
-	r := NewReplicator(ops, pl, ms)
+	r := newTestReplicator(ops, pl, ms)
 	r.CleanupOrphan(context.Background(), "b1", "key1", 100)
 }
 
@@ -516,36 +531,38 @@ func TestCleanupOrphan_DelegatesToDeleteOrEnqueue(t *testing.T) {
 func TestReplicate_FactorOne_Noop(t *testing.T) {
 	t.Parallel()
 	ctrl := gomock.NewController(t)
-	r := NewReplicator(NewMockOps(ctrl), NewMockPlacement(ctrl), &mockMetadataStore{})
+	r := newTestReplicator(newMockOps(ctrl), NewMockPlacement(ctrl), &mockMetadataStore{})
 
-	created, err := r.Replicate(context.Background(), config.ReplicationConfig{Factor: 1}, nil)
+	sum, err := r.Replicate(context.Background(), config.ReplicationConfig{Factor: 1}, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if created != 0 {
-		t.Errorf("created = %d, want 0", created)
+	if sum.CopiesCreated != 0 {
+		t.Errorf("created = %d, want 0", sum.CopiesCreated)
 	}
 }
 
 // TestReplicate_NothingUnderReplicated verifies the replicate nothing under replicated contract.
 // Asserts that unexpected error:.
+// Deliberately not parallel: asserts a process-wide gauge that other
+// replication tests overwrite, so a concurrent run reads whichever cycle
+// finished last.
 func TestReplicate_NothingUnderReplicated(t *testing.T) {
-	t.Parallel()
 	ctrl := gomock.NewController(t)
-	ops := NewMockOps(ctrl)
+	ops := newMockOps(ctrl)
 	pl := NewMockPlacement(ctrl)
 	ms := &mockMetadataStore{}
 
 	ops.EXPECT().Backends().Return(map[string]backend.ObjectBackend{}).AnyTimes()
 
-	r := NewReplicator(ops, pl, ms)
+	r := newTestReplicator(ops, pl, ms)
 	cfg := config.ReplicationConfig{Factor: 2, BatchSize: 10, Concurrency: 1, UnhealthyThreshold: time.Hour}
-	created, err := r.Replicate(context.Background(), cfg, nil)
+	sum, err := r.Replicate(context.Background(), cfg, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if created != 0 {
-		t.Errorf("created = %d, want 0", created)
+	if sum.CopiesCreated != 0 {
+		t.Errorf("created = %d, want 0", sum.CopiesCreated)
 	}
 	if p := promtest.ToFloat64(telemetry.ReplicationPending); p != 0 {
 		t.Errorf("ReplicationPending = %v, want 0", p)
@@ -557,7 +574,7 @@ func TestReplicate_NothingUnderReplicated(t *testing.T) {
 func TestReplicateObject_Success(t *testing.T) {
 	t.Parallel()
 	ctrl := gomock.NewController(t)
-	ops := NewMockOps(ctrl)
+	ops := newMockOps(ctrl)
 	pl := NewMockPlacement(ctrl)
 
 	srcBe := backendtest.NewMockObjectBackend(ctrl)
@@ -565,13 +582,13 @@ func TestReplicateObject_Success(t *testing.T) {
 
 	ms := &mockMetadataStore{recordReplicaOK: true}
 
-	pl.EXPECT().SelectReplicaTarget(gomock.Any(), int64(50), gomock.Any()).Return("b2", nil)
+	pl.EXPECT().RankReplicaTargets(int64(50), gomock.Any()).Return([]string{"b2"})
 	ops.EXPECT().Backends().Return(map[string]backend.ObjectBackend{"b1": srcBe, "b2": dstBe}).AnyTimes()
 	ops.EXPECT().GetBackend("b2").Return(dstBe, nil)
-	ops.EXPECT().StreamCopy(gomock.Any(), srcBe, dstBe, "key1").Return(nil)
+	ops.EXPECT().StreamCopy(gomock.Any(), endpointOf{srcBe}, endpointOf{dstBe}, "key1", gomock.Any()).Return(int64(0), nil)
 	ops.EXPECT().Acct().Return(newTestRecorder()).AnyTimes()
 
-	r := NewReplicator(ops, pl, ms)
+	r := newTestReplicator(ops, pl, ms)
 	copies := []core.ObjectLocation{{BackendName: "b1", SizeBytes: 50}}
 
 	outcome := r.ReplicateObject(context.Background(), "key1", copies, 1)
@@ -591,7 +608,7 @@ func TestReplicateObject_Success(t *testing.T) {
 func TestReplicateObject_WriteFailureExcludesTarget(t *testing.T) {
 	t.Parallel()
 	ctrl := gomock.NewController(t)
-	ops := NewMockOps(ctrl)
+	ops := newMockOps(ctrl)
 	pl := NewMockPlacement(ctrl)
 
 	srcBe := backendtest.NewMockObjectBackend(ctrl)
@@ -608,34 +625,34 @@ func TestReplicateObject_WriteFailureExcludesTarget(t *testing.T) {
 	// First call selects "fail", second (with "fail" excluded) selects "ok",
 	// third finds no remaining targets and returns "" to end the loop.
 	gomock.InOrder(
-		pl.EXPECT().SelectReplicaTarget(gomock.Any(), int64(50), gomock.Any()).
-			DoAndReturn(func(_ context.Context, _ int64, excl map[string]bool) (string, error) {
+		pl.EXPECT().RankReplicaTargets(int64(50), gomock.Any()).
+			DoAndReturn(func(_ int64, excl map[string]bool) []string {
 				if excl["fail"] {
 					t.Fatal("first call should not exclude 'fail'")
 				}
-				return "fail", nil
+				return []string{"fail"}
 			}),
-		pl.EXPECT().SelectReplicaTarget(gomock.Any(), int64(50), gomock.Any()).
-			DoAndReturn(func(_ context.Context, _ int64, excl map[string]bool) (string, error) {
+		pl.EXPECT().RankReplicaTargets(int64(50), gomock.Any()).
+			DoAndReturn(func(_ int64, excl map[string]bool) []string {
 				if !excl["fail"] {
 					t.Fatal("second call must exclude 'fail' after write failure")
 				}
-				return "ok", nil
+				return []string{"ok"}
 			}),
-		pl.EXPECT().SelectReplicaTarget(gomock.Any(), int64(50), gomock.Any()).
-			Return("", nil),
+		pl.EXPECT().RankReplicaTargets(int64(50), gomock.Any()).
+			Return(nil),
 	)
 
 	// "fail" backend: GetBackend succeeds, StreamCopy returns write error
 	ops.EXPECT().GetBackend("fail").Return(failBe, nil)
-	ops.EXPECT().StreamCopy(gomock.Any(), srcBe, failBe, "key1").
-		Return(&backend.CopyError{Phase: backend.CopyPhaseWrite, Err: errors.New("put object failed: 413 EntityTooLarge")})
+	ops.EXPECT().StreamCopy(gomock.Any(), endpointOf{srcBe}, endpointOf{failBe}, "key1", gomock.Any()).
+		Return(int64(0), &backend.CopyError{Phase: backend.CopyPhaseWrite, Err: errors.New("put object failed: 413 EntityTooLarge")})
 
 	// "ok" backend: succeeds
 	ops.EXPECT().GetBackend("ok").Return(okBe, nil)
-	ops.EXPECT().StreamCopy(gomock.Any(), srcBe, okBe, "key1").Return(nil)
+	ops.EXPECT().StreamCopy(gomock.Any(), endpointOf{srcBe}, endpointOf{okBe}, "key1", gomock.Any()).Return(int64(0), nil)
 
-	r := NewReplicator(ops, pl, ms)
+	r := newTestReplicator(ops, pl, ms)
 	copies := []core.ObjectLocation{{BackendName: "src", SizeBytes: 50}}
 
 	// Request 2 replicas: first attempt hits "fail" and should fall through
@@ -657,7 +674,7 @@ func TestReplicateObject_WriteFailureExcludesTarget(t *testing.T) {
 func TestReplicateObject_RecordReplicaErrorExcludesTarget(t *testing.T) {
 	t.Parallel()
 	ctrl := gomock.NewController(t)
-	ops := NewMockOps(ctrl)
+	ops := newMockOps(ctrl)
 	pl := NewMockPlacement(ctrl)
 
 	srcBe := backendtest.NewMockObjectBackend(ctrl)
@@ -671,23 +688,23 @@ func TestReplicateObject_RecordReplicaErrorExcludesTarget(t *testing.T) {
 	}).AnyTimes()
 
 	gomock.InOrder(
-		pl.EXPECT().SelectReplicaTarget(gomock.Any(), int64(50), gomock.Any()).Return("fail", nil),
+		pl.EXPECT().RankReplicaTargets(int64(50), gomock.Any()).Return([]string{"fail"}),
 		// After RecordReplica error, "fail" is excluded; no targets left.
-		pl.EXPECT().SelectReplicaTarget(gomock.Any(), int64(50), gomock.Any()).
-			DoAndReturn(func(_ context.Context, _ int64, excl map[string]bool) (string, error) {
+		pl.EXPECT().RankReplicaTargets(int64(50), gomock.Any()).
+			DoAndReturn(func(_ int64, excl map[string]bool) []string {
 				if !excl["fail"] {
 					t.Fatal("must exclude 'fail' after RecordReplica error")
 				}
-				return "", nil
+				return nil
 			}),
 	)
 
 	ops.EXPECT().GetBackend("fail").Return(failBe, nil)
-	ops.EXPECT().StreamCopy(gomock.Any(), srcBe, failBe, "key1").Return(nil)
+	ops.EXPECT().StreamCopy(gomock.Any(), endpointOf{srcBe}, endpointOf{failBe}, "key1", gomock.Any()).Return(int64(0), nil)
 	// CleanupOrphan path
 	pl.EXPECT().DeleteOrEnqueue(gomock.Any(), failBe, "fail", "key1", "replication_orphan", int64(50))
 
-	r := NewReplicator(ops, pl, ms)
+	r := newTestReplicator(ops, pl, ms)
 	copies := []core.ObjectLocation{{BackendName: "src", SizeBytes: 50}}
 	outcome := r.ReplicateObject(context.Background(), "key1", copies, 1)
 	if outcome.Created != 0 {
@@ -703,7 +720,7 @@ func TestReplicateObject_RecordReplicaErrorExcludesTarget(t *testing.T) {
 func TestReplicateObject_NotInsertedExcludesTarget(t *testing.T) {
 	t.Parallel()
 	ctrl := gomock.NewController(t)
-	ops := NewMockOps(ctrl)
+	ops := newMockOps(ctrl)
 	pl := NewMockPlacement(ctrl)
 
 	srcBe := backendtest.NewMockObjectBackend(ctrl)
@@ -718,23 +735,23 @@ func TestReplicateObject_NotInsertedExcludesTarget(t *testing.T) {
 	}).AnyTimes()
 
 	gomock.InOrder(
-		pl.EXPECT().SelectReplicaTarget(gomock.Any(), int64(50), gomock.Any()).Return("stale", nil),
+		pl.EXPECT().RankReplicaTargets(int64(50), gomock.Any()).Return([]string{"stale"}),
 		// After !inserted, "stale" is excluded; no targets left.
-		pl.EXPECT().SelectReplicaTarget(gomock.Any(), int64(50), gomock.Any()).
-			DoAndReturn(func(_ context.Context, _ int64, excl map[string]bool) (string, error) {
+		pl.EXPECT().RankReplicaTargets(int64(50), gomock.Any()).
+			DoAndReturn(func(_ int64, excl map[string]bool) []string {
 				if !excl["stale"] {
 					t.Fatal("must exclude 'stale' after !inserted")
 				}
-				return "", nil
+				return nil
 			}),
 	)
 
 	ops.EXPECT().GetBackend("stale").Return(staleBe, nil)
-	ops.EXPECT().StreamCopy(gomock.Any(), srcBe, staleBe, "key1").Return(nil)
+	ops.EXPECT().StreamCopy(gomock.Any(), endpointOf{srcBe}, endpointOf{staleBe}, "key1", gomock.Any()).Return(int64(0), nil)
 	// CleanupOrphan path
 	pl.EXPECT().DeleteOrEnqueue(gomock.Any(), staleBe, "stale", "key1", "replication_orphan", int64(50))
 
-	r := NewReplicator(ops, pl, ms)
+	r := newTestReplicator(ops, pl, ms)
 	copies := []core.ObjectLocation{{BackendName: "src", SizeBytes: 50}}
 	outcome := r.ReplicateObject(context.Background(), "key1", copies, 1)
 	if outcome.Created != 0 {

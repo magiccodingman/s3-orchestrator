@@ -1,4 +1,8 @@
-This document covers the JSON APIs provided by the orchestrator for programmatic access. For the S3-compatible API, see the [S3 API Coverage](../README.md#s3-api-coverage) section of the README.
+---
+description: "Reference for the UI JSON API serving the built-in dashboard: authentication, the endpoints it exposes, and how it differs from the admin API."
+---
+
+This document covers the UI JSON API the built-in dashboard is served by. For the operational control plane, see the [Admin API](../admin-api/). For the S3-compatible API, see the [S3 API Coverage](../README.md#s3-api-coverage) section of the README.
 
 ## Authentication
 
@@ -8,29 +12,24 @@ UI API endpoints use session cookie authentication. Obtain a session by posting 
 
 ```bash
 curl -c cookies.txt -X POST \
-  -d "admin_key=YOUR_KEY&admin_secret=YOUR_SECRET" \
+  -d "access_key=AKIA...&secret_key=YOUR_SECRET" \
   http://localhost:9000/ui/login
 
 # Use the session cookie for subsequent requests
 curl -b cookies.txt http://localhost:9000/ui/api/dashboard
 ```
 
-Sessions are HMAC-SHA256 signed cookies with a 24-hour TTL.
+The keypair is any credential the deployment holds - the `auth.root` one, or any the store has issued - and the session carries the user it proved. Sessions are HMAC-SHA256 signed cookies with a 24-hour TTL.
 
 ### Admin API
 
-Admin API endpoints use token authentication via the `X-Admin-Token` header:
-
-```bash
-curl -H "X-Admin-Token: YOUR_ADMIN_TOKEN" \
-  http://localhost:9000/admin/api/status
-```
-
-The token is the `ui.admin_token` value from the configuration file. If `admin_token` is not set, it falls back to `ui.admin_key`. The CLI subcommand (`s3-orchestrator admin`) handles this automatically.
+Admin endpoints take a signed request rather than a session; see [Admin API](../admin-api/#authentication).
 
 All JSON request bodies on admin and UI endpoints are limited to 1 MB.
 
-**Object data caching:** When the optional in-memory cache is enabled, GET responses for eligible objects may be served from cache rather than from a backend. This is fully transparent to S3 API clients — cached responses have the same headers, status codes, and body content as uncached responses. No client-side configuration or awareness is needed.
+Two S3 operations carry an XML request body, and both are capped above the largest request the S3 API permits: multi-object delete at 4 MB and CompleteMultipartUpload at 2 MB. Exceeding the cap returns `413 MaxMessageLengthExceeded` rather than a parse error, and a body containing anything after its first XML document is rejected as `400 MalformedXML` rather than having the remainder silently ignored.
+
+**Object data caching:** When the optional in-memory cache is enabled, GET responses for eligible objects may be served from cache rather than from a backend. This is fully transparent to S3 API clients -- cached responses have the same headers, status codes, and body content as uncached responses. No client-side configuration or awareness is needed.
 
 ## UI API Endpoints
 
@@ -100,7 +99,7 @@ Returns buffered log entries from the in-memory ring buffer (last 5,000 entries)
 | Parameter | Required | Description |
 |-----------|----------|-------------|
 | `level` | No | Minimum severity: `DEBUG`, `INFO`, `WARN`, `ERROR` (default: all levels) |
-| `since` | No | RFC3339 timestamp — only return entries after this time |
+| `since` | No | RFC3339 timestamp -- only return entries after this time |
 | `component` | No | Filter by `component` attribute value |
 | `limit` | No | Maximum entries to return (default: all). When applied, returns the most recent N matching entries. |
 
@@ -224,6 +223,7 @@ Returns the status of the most recent rebalance operation.
 ```json
 {"status": "running"}
 {"status": "done", "ok": true, "moved": 5}
+{"status": "skipped", "reason": "backend utilization is within the configured threshold"}
 {"status": "error", "error": "rebalance failed"}
 {"status": "idle"}
 ```
@@ -255,6 +255,7 @@ Returns the status of the most recent cleanup operation.
 ```json
 {"status": "running"}
 {"status": "done", "ok": true, "removed": 3}
+{"status": "skipped", "reason": "replication not configured or factor <= 1"}
 {"status": "error", "error": "cleanup failed"}
 {"status": "idle"}
 ```
@@ -279,451 +280,14 @@ Both `backend` (a configured backend name) and `bucket` (a configured virtual bu
 
 ## Admin API Endpoints
 
-All admin API endpoints are mounted under `/admin/api/`. They require the `X-Admin-Token` header.
+The admin API has moved to its own page: **[Admin API](../admin-api/)**.
 
-### GET /admin/api/status
+Its endpoint reference is generated from the server's route table, so it cannot
+drift from the code. That page also covers the parts a schema does not carry:
+token authentication, which permissions the object endpoints require and when
+they answer `403`, the newline-delimited streaming mode, and the two-phase
+confirmation a destructive backend purge requires.
 
-Returns backend health, quota usage, object counts, and monthly usage stats.
-
-**Response:**
-
-```json
-{
-  "db_healthy": true,
-  "backends": [
-    {
-      "name": "oci",
-      "bytes_used": 5242880,
-      "bytes_limit": 10737418240,
-      "orphan_bytes": 0,
-      "object_count": 42,
-      "api_requests": 1234,
-      "egress_bytes": 5242880,
-      "ingress_bytes": 10485760
-    }
-  ],
-  "usage_period": "2026-03"
-}
-```
-
-### GET /admin/api/workers
-
-Returns a snapshot of every registered background service's last-tick
-health. Use this during incidents to distinguish "worker is running
-but every tick fails" from "worker has not run". Returns `503` when
-the deployment runs in proxy-only mode and no worker pool is wired.
-
-**Response:**
-
-```json
-{
-  "workers": [
-    {
-      "name": "cleanup_queue",
-      "last_success": "2026-05-12T18:42:01Z",
-      "consecutive_failures": 0
-    },
-    {
-      "name": "replicator",
-      "last_success": "2026-05-12T18:30:14Z",
-      "last_failure": "2026-05-12T18:45:14Z",
-      "last_error": "connection refused",
-      "consecutive_failures": 3
-    }
-  ]
-}
-```
-
-Fields:
-
-- `name` — registration name, matches the snake_case slug on the scoped
-  logger (e.g. `cleanup_queue`, `replicator`, `over_replication_cleanup`).
-- `last_success` — RFC 3339 timestamp of the most recent successful
-  tick. Omitted before the first success.
-- `last_failure` — most recent failed tick. Omitted before the first
-  failure. Stays set after recovery so operators can see how long ago
-  the service was last failing.
-- `last_error` — error string from the most recent failure. Cleared on
-  the next success.
-- `consecutive_failures` — count of back-to-back failed ticks since
-  the last success. Resets to 0 on success.
-
-The same data is exposed via Prometheus as
-`s3o_worker_last_success_timestamp_seconds`,
-`s3o_worker_consecutive_failures`, and `s3o_worker_ticks_total` so
-alerting can run without scraping this endpoint.
-
-### GET /admin/api/logs
-
-Returns recent structured log entries from the instance's in-memory
-ring buffer - the same source the web dashboard's logs pane reads.
-Backs the TUI's Logs section, which authenticates with the admin token
-rather than a UI session. Returns `503` when the log buffer is not
-wired.
-
-**Query parameters:**
-
-- `level` - minimum severity to return (`DEBUG`, `INFO`, `WARN`,
-  `ERROR`); unset returns all levels.
-- `limit` - maximum entries to return, newest kept (default 200, max
-  1000).
-
-**Response:**
-
-```json
-{
-  "entries": [
-    {
-      "time": "2026-07-18T13:05:09Z",
-      "level": "INFO",
-      "message": "copied object",
-      "component": "replicator",
-      "attrs": {"key": "unified/a.gz", "from": "r2", "to": "e2"}
-    }
-  ]
-}
-```
-
-Entries are returned oldest-first among the newest `limit`. `component`
-is the emitting component (lifted from the entry's attributes for a
-dedicated column); `attrs` carries the remaining structured fields so a
-client can render a full human-readable line rather than a bare message.
-Both are omitted when absent.
-
-### GET /admin/api/object-locations
-
-Returns all copies of an object across backends. Backs the `s3-orchestrator tui` inspector pane.
-
-**Query parameters:**
-
-| Parameter | Required | Description |
-|-----------|----------|-------------|
-| `key` | Yes | Full object key including bucket prefix (e.g., `my-bucket/path/to/file.txt`) |
-
-**Response:**
-
-```json
-{
-  "key": "my-bucket/path/to/file.txt",
-  "locations": [
-    {"backend": "oci", "size_bytes": 51200, "created_at": "2026-01-15T10:30:00Z", "encrypted": true, "key_id": "config-0", "plaintext_size": 51100, "content_hash": "9f3a...c1"},
-    {"backend": "r2", "size_bytes": 51200, "created_at": "2026-01-15T10:35:00Z", "encrypted": true, "key_id": "config-0", "plaintext_size": 51100, "content_hash": "9f3a...c1"}
-  ]
-}
-```
-
-Each `locations[]` entry describes one backend copy:
-
-- `backend` — the backend the copy lives on.
-- `size_bytes` — stored object size (ciphertext size when the copy is encrypted).
-- `created_at` — when the copy was recorded.
-- `encrypted` — whether the copy is envelope-encrypted.
-- `key_id` — id of the master key that wrapped the copy's data-encryption key (empty when not encrypted).
-- `plaintext_size` — original object size before encryption.
-- `content_hash` — SHA-256 of the plaintext, once a hash has been computed.
-
-The response carries encryption *metadata* only. The wrapped data-encryption key and any raw key material are never serialized; only `encrypted` and `key_id` are exposed.
-
-### GET /admin/api/objects
-
-Returns one delimiter-grouped page of the object namespace, mirroring S3
-ListObjectsV2 delimiter semantics. Backs the `s3-orchestrator tui` browser.
-
-**Query parameters:**
-
-| Parameter | Required | Description |
-|-----------|----------|-------------|
-| `prefix` | No | Prefix to list under (empty lists the root) |
-| `delimiter` | No | Grouping delimiter; defaults to `/` |
-| `continuation` | No | Continuation token from a previous truncated page |
-
-**Response:**
-
-```json
-{
-  "common_prefixes": ["my-bucket/photos/", "my-bucket/docs/"],
-  "objects": [
-    {"key": "my-bucket/readme.txt", "size": 42}
-  ],
-  "truncated": false,
-  "next": ""
-}
-```
-
-### GET /admin/api/cleanup-queue
-
-Returns the cleanup queue depth and pending items (up to 50).
-
-**Response:**
-
-```json
-{
-  "depth": 3,
-  "items": [
-    {"ID": 1, "BackendName": "oci", "ObjectKey": "my-bucket/old-file.txt", "Reason": "delete_failed", "Attempts": 2, "SizeBytes": 51200}
-  ]
-}
-```
-
-### POST /admin/api/usage-flush
-
-Forces an immediate flush of usage counters to the database. Flushes from Redis when active, otherwise from local in-memory counters.
-
-**Request:** No body required.
-
-**Response:**
-
-```json
-{"status": "flushed"}
-```
-
-### POST /admin/api/usage-reconcile
-
-Recomputes each backend's `bytes_used` from the authoritative object ledger (`SUM(object_locations.size_bytes)`), correcting drift in the incrementally maintained quota counter. The periodic reconcile pass runs this automatically; this endpoint forces it on demand.
-
-**Request:** No body required.
-
-**Response:** `adjustments` maps each corrected backend to the byte delta applied (negative when the counter was reduced); backends already in agreement are omitted.
-
-```json
-{"status": "reconciled", "adjustments": {"e2": -162801340}}
-```
-
-### POST /admin/api/replicate
-
-Triggers one replication cycle. Returns immediately if replication is not configured or factor is 1.
-
-**Request:** No body required.
-
-**Response:**
-
-```json
-{"status": "ok", "copies_created": 5}
-```
-
-Or if replication is not configured:
-
-```json
-{"status": "skipped", "copies_created": 0, "reason": "replication not configured or factor <= 1"}
-```
-
-### GET /admin/api/over-replication
-
-Returns the current replication factor and count of over-replicated objects.
-
-**Response:**
-
-```json
-{"factor": 2, "pending": 15}
-```
-
-### POST /admin/api/over-replication
-
-Triggers an immediate over-replication cleanup pass.
-
-**Query parameters:**
-
-| Parameter | Required | Description |
-|-----------|----------|-------------|
-| `batch_size` | No | Override the configured batch size for this run |
-
-**Request:** No body required.
-
-**Response:**
-
-```json
-{"status": "ok", "copies_removed": 5}
-```
-
-Or if replication is not configured:
-
-```json
-{"status": "skipped", "copies_removed": 0, "reason": "replication not configured or factor <= 1"}
-```
-
-### GET /admin/api/log-level
-
-Returns the current runtime log level.
-
-**Response:**
-
-```json
-{"level": "info"}
-```
-
-### PUT /admin/api/log-level
-
-Changes the runtime log level without restart or SIGHUP.
-
-**Request body:**
-
-```json
-{"level": "debug"}
-```
-
-Valid levels: `debug`, `info`, `warn`, `error`.
-
-**Response:**
-
-```json
-{"level": "debug"}
-```
-
-### POST /admin/api/backends/{name}/drain
-
-Starts draining a backend. All objects are migrated to other backends in the background. The backend is immediately excluded from new writes.
-
-**Response (202 Accepted):**
-
-```json
-{"status": "drain started", "backend": "oci"}
-```
-
-**Error responses:**
-
-```json
-{"error": "backend \"oci\" not found"}
-{"error": "backend \"oci\" is already draining"}
-```
-
-### GET /admin/api/backends/{name}/drain
-
-Returns the current state of a drain operation.
-
-**Response (active drain):**
-
-```json
-{
-  "active": true,
-  "objects_remaining": 150,
-  "bytes_remaining": 52428800,
-  "objects_moved": 42
-}
-```
-
-**Response (no drain active):**
-
-```json
-{
-  "active": false,
-  "objects_remaining": 0,
-  "bytes_remaining": 0,
-  "objects_moved": 0
-}
-```
-
-**Response (completed with error):**
-
-```json
-{
-  "active": false,
-  "objects_remaining": 0,
-  "bytes_remaining": 0,
-  "objects_moved": 100,
-  "error": "context canceled"
-}
-```
-
-### DELETE /admin/api/backends/{name}/drain
-
-Cancels an active drain. Objects already moved are not rolled back.
-
-**Response:**
-
-```json
-{"status": "drain cancelled", "backend": "oci"}
-```
-
-**Error response:**
-
-```json
-{"error": "backend \"oci\" is not draining"}
-```
-
-### DELETE /admin/api/backends/{name}
-
-Removes all database records for a backend. This is destructive.
-
-**Query parameters:**
-
-| Parameter | Required | Description |
-|-----------|----------|-------------|
-| `purge` | No | Set to `true` to also delete objects from the backend's S3 storage |
-
-**Response:**
-
-```json
-{"status": "backend removed", "backend": "oci"}
-```
-
-**Error responses:**
-
-```json
-{"error": "backend \"oci\" is currently draining, cancel the drain first"}
-{"error": "failed to delete backend data: ..."}
-```
-
-### POST /admin/api/encrypt-existing
-
-Encrypts all unencrypted objects in-place. Requires encryption to be enabled in the config. Each object is downloaded, encrypted, and re-uploaded to the same backend, counting as 2 API calls plus egress and ingress against the backend's usage quota.
-
-**Response:**
-
-```json
-{"status": "complete", "encrypted": 1423, "failed": 0, "total": 1423}
-```
-
-### POST /admin/api/decrypt-existing
-
-Decrypts all encrypted objects back to plaintext. Requires encryption to be enabled in the config (the key provider is needed to unwrap DEKs). Each object is downloaded, decrypted, and re-uploaded as plaintext, counting as 2 API calls plus egress and ingress against the backend's usage quota.
-
-**Response:**
-
-```json
-{"status": "complete", "decrypted": 1423, "failed": 0, "total": 1423}
-```
-
-### POST /admin/api/rotate-encryption-key
-
-Re-wraps all DEKs encrypted with a specific key ID using the current master key. This is a metadata-only operation — no object data is re-uploaded.
-
-**Request body:**
-
-```json
-{"old_key_id": "config-0"}
-```
-
-**Response:**
-
-```json
-{"status": "complete", "rotated": 1423, "failed": 0, "total": 1423}
-```
-
-### POST /admin/api/scrub
-
-Triggers an on-demand integrity scrub cycle. Verifies stored content hashes against actual object data on backends.
-
-**Request body (optional):**
-
-```json
-{"batch_size": 500}
-```
-
-**Response:**
-
-```json
-{"status": "complete", "checked": 500, "mismatches": 0, "errors": 2}
-```
-
-### POST /admin/api/hash-existing
-
-Computes and stores content hashes for all objects that don't have one yet.
-
-**Response:**
-
-```json
-{"status": "complete", "hashed": 423, "failed": 0, "total": 423}
-```
 
 ## Error Responses
 

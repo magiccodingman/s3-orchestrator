@@ -9,9 +9,6 @@
 // background goroutine; remove is synchronous.
 // -------------------------------------------------------------------------------
 
-// Package drain owns the backend drain/remove lifecycle. It tracks the
-// draining state map, runs the migration goroutine, and exposes IsDraining
-// for the proxy core's eligibility filters.
 package drain
 
 import (
@@ -23,26 +20,30 @@ import (
 	"sync/atomic"
 
 	"github.com/afreidah/s3-orchestrator/internal/backend"
+	"github.com/afreidah/s3-orchestrator/internal/counter"
 	"github.com/afreidah/s3-orchestrator/internal/observe/audit"
+	"github.com/afreidah/s3-orchestrator/internal/observe/event"
 	"github.com/afreidah/s3-orchestrator/internal/observe/logfmt"
 	"github.com/afreidah/s3-orchestrator/internal/observe/telemetry"
 	"github.com/afreidah/s3-orchestrator/internal/progress"
 	"github.com/afreidah/s3-orchestrator/internal/proxy/accounting"
 	"github.com/afreidah/s3-orchestrator/internal/proxy/writepath"
+	"github.com/afreidah/s3-orchestrator/internal/s3op"
 	"github.com/afreidah/s3-orchestrator/internal/store/core"
 	"github.com/afreidah/s3-orchestrator/internal/util/must"
 )
 
-// DrainRuntime is the backend-runtime slice the Manager needs: fleet
+// Runtime is the backend-runtime slice the Manager needs: fleet
 // enumeration, per-backend copy/delete primitives, and usage accounting.
 // Defined here at the consumer so *infra.BackendRuntime satisfies it
 // structurally without the drain package importing infra.
-type DrainRuntime interface {
+type Runtime interface {
 	Backends() map[string]backend.ObjectBackend
 	GetBackend(name string) (backend.ObjectBackend, error)
 	BackendOrder() []string
-	StreamCopy(ctx context.Context, src, dst backend.ObjectBackend, key string) error
+	StreamCopy(ctx context.Context, src, dst backend.CopyEndpoint, key string, sizeEstimate int64) (int64, error)
 	DeleteWithTimeout(ctx context.Context, be backend.ObjectBackend, key string) error
+	Quota() *counter.QuotaTracker
 	Acct() *accounting.Recorder
 }
 
@@ -95,7 +96,7 @@ type Progress struct {
 // Manager handles draining and removing backends.
 type Manager struct {
 	log              *slog.Logger
-	infra            DrainRuntime
+	infra            Runtime
 	mover            Mover
 	objects          core.ObjectStore
 	quota            core.QuotaStore
@@ -109,7 +110,7 @@ type Manager struct {
 
 // New creates a Manager.
 func New(
-	infra DrainRuntime,
+	infra Runtime,
 	mover Mover,
 	objects core.ObjectStore,
 	quota core.QuotaStore,
@@ -353,6 +354,11 @@ func (d *Manager) abortDrainWithError(name string, state *drainState, err error)
 	state.setErr(err)
 	d.draining.Delete(name)
 	state.decrementActiveGauge()
+	event.Publish(event.BackendDrainFailed, name, map[string]any{
+		"backend":       name,
+		"objects_moved": state.moved.Load(),
+		"error":         err.Error(),
+	})
 }
 
 // finalizeDrain runs after a successful migration. Flushes pending cleanup
@@ -378,6 +384,10 @@ func (d *Manager) finalizeDrain(ctx context.Context, name string, state *drainSt
 		slog.String("backend", name),
 		slog.Int64("objects_moved", state.moved.Load()),
 	)
+	event.Publish(event.BackendDrainCompleted, name, map[string]any{
+		"backend":       name,
+		"objects_moved": state.moved.Load(),
+	})
 	d.log.InfoContext(ctx, "backend drain complete", "backend", name, "objects_moved", state.moved.Load())
 }
 
@@ -412,7 +422,8 @@ func findOtherBackend(locations []core.ObjectLocation, srcName string) string {
 // exists on another backend, so the source-side row and bytes can be
 // dropped without a data transfer.
 func (d *Manager) removeReplicaSource(ctx context.Context, srcBackend backend.ObjectBackend, srcName string, obj *core.ObjectLocation, replicaBackend string) bool {
-	if err := d.objects.DeleteObjectLocation(ctx, obj.ObjectKey, srcName); err != nil {
+	_, err := d.objects.DeleteObjectLocation(ctx, obj.ObjectKey, srcName)
+	if err != nil {
 		d.log.WarnContext(ctx, "failed to delete source location",
 			slog.String("key", obj.ObjectKey), slog.String("backend", srcName), "error", err)
 		return false
@@ -480,10 +491,10 @@ func (d *Manager) pickDrainDestination(ctx context.Context, srcName string, obj 
 		}
 		filtered = append(filtered, name)
 	}
-	destName, err := d.quota.GetLeastUtilizedBackend(ctx, obj.SizeBytes, filtered)
-	if err != nil {
+	destName, ok := d.leastUtilizedWithRoom(filtered, obj.SizeBytes)
+	if !ok {
 		d.log.WarnContext(ctx, "no destination backend available",
-			slog.String("key", obj.ObjectKey), slog.Int64("size_bytes", obj.SizeBytes), "error", err)
+			slog.String("key", obj.ObjectKey), slog.Int64("size_bytes", obj.SizeBytes))
 		return "", nil, false
 	}
 	destBackend, err := d.infra.GetBackend(destName)
@@ -492,6 +503,19 @@ func (d *Manager) pickDrainDestination(ctx context.Context, srcName string, obj 
 		return "", nil, false
 	}
 	return destName, destBackend, true
+}
+
+// leastUtilizedWithRoom picks the emptiest candidate that can still take size
+// bytes, reading the same in-memory view the write path is admitted against so
+// a drain and a client write cannot disagree about where there is room.
+func (d *Manager) leastUtilizedWithRoom(candidates []string, size int64) (string, bool) {
+	quota := d.infra.Quota()
+	for _, name := range quota.RankByUtilization(candidates) {
+		if quota.Available(name) >= size {
+			return name, true
+		}
+	}
+	return "", false
 }
 
 // -------------------------------------------------------------------------
@@ -526,6 +550,10 @@ func (d *Manager) RemoveBackend(ctx context.Context, name string, purge bool, ob
 		slog.String("backend", name),
 		slog.Bool("purge", purge),
 	)
+	event.Publish(event.BackendRemoved, name, map[string]any{
+		"backend": name,
+		"purge":   purge,
+	})
 	d.log.InfoContext(ctx, "backend removed", "backend", name, "purge", purge)
 
 	return nil
@@ -573,9 +601,10 @@ func (d *Manager) purgeOneObject(ctx context.Context, be backend.ObjectBackend, 
 		d.log.WarnContext(ctx, "failed to delete object from backend during purge",
 			slog.String("backend", name), slog.String("key", key), "error", err)
 	}
-	d.infra.Acct().APICall(name)
+	d.infra.Acct().APICall(s3op.DeleteObject, name)
 
-	if err := d.objects.DeleteObjectLocation(ctx, key, name); err != nil {
+	_, err := d.objects.DeleteObjectLocation(ctx, key, name)
+	if err != nil {
 		d.log.WarnContext(ctx, "failed to delete DB record during purge",
 			slog.String("backend", name), slog.String("key", key), "error", err)
 		return progress.StatusFailed

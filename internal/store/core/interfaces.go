@@ -18,63 +18,80 @@ import (
 	"github.com/afreidah/s3-orchestrator/internal/config"
 )
 
-// MetadataStore is the union of every method the metadata-persistence
-// layer exposes. Both *postgres.Store and *sqlite.Store satisfy it, and
-// every consumer (proxy / transport / cli / worker) takes it as the one
-// dependency declaration. The narrow per-role interfaces below are kept
-// only as embedding sources for this composite; consumer code does not
-// reference them directly. CB protection lives in each driver's DBTX
-// chokepoint, so this single typed surface carries the breaker semantics
-// transparently.
-type MetadataStore interface {
-	ObjectStore
-	QuotaStore
-	MultipartStore
-	ReplicationStore
-	CleanupStore
-	PendingStore
-	IntegrityStore
-	ExpiredObjectsLister
-	BackendLifecycleStore
-	UsageFlusher
-	AdvisoryLocker
-	DashboardStore
-	LifecycleAdmin
-	EncryptionAdmin
-	NotificationOutbox
-}
+// The roles below are the whole persistence contract. Each consumer declares
+// its own dependency in terms of the ones it calls, and both *postgres.Store
+// and *sqlite.Store satisfy every role, asserted through AssertEngine.
+//
+// There is deliberately no interface unioning them. The union is not a fact
+// about the domain - it is a fact about there being one store type per engine
+// - so it exists only as the unexported engineRoles constraint in engine.go,
+// which no consumer can hold, and unexported in internal/di, which is the only
+// place that holds an opened engine before splitting it into these roles.
+//
+// CB protection lives in each driver's DBTX chokepoint, so every role carries
+// the breaker semantics transparently.
 
 // -------------------------------------------------------------------------
 // REQUEST-TIME ROLE INTERFACES
 // -------------------------------------------------------------------------
 
 // ObjectStore defines object location CRUD and listing operations.
+//
+// RecordObjectIdentity fills in the identity columns a read had to ask a
+// backend for, on every copy of the key so the answer stops depending on which
+// one replies. Columns already set are left alone: what a write computed over
+// the client's own bytes outranks what a backend reports about the bytes as
+// stored.
 type ObjectStore interface {
 	GetAllObjectLocations(ctx context.Context, key string) ([]ObjectLocation, error)
 	GetObjectBackendsForKeys(ctx context.Context, keys []string) (map[string][]string, error)
-	RecordObject(ctx context.Context, key, backend string, size int64, enc *EncryptionMeta) ([]DeletedCopy, error)
-	RecordObjectAndClearPending(ctx context.Context, key, backend string, size int64, enc *EncryptionMeta, intentID string) ([]DeletedCopy, error)
-	DeleteObject(ctx context.Context, key string) ([]DeletedCopy, error)
-	DeleteObjectsBatch(ctx context.Context, keys []string) (map[string][]DeletedCopy, error)
+	RecordObject(ctx context.Context, req *RecordObjectRequest) ([]DeletedCopy, QuotaDeltas, error)
+	DeleteObject(ctx context.Context, key string) ([]DeletedCopy, QuotaDeltas, error)
+	DeleteObjectsBatch(ctx context.Context, keys []string) (map[string][]DeletedCopy, QuotaDeltas, error)
 	ListObjects(ctx context.Context, prefix, startAfter string, maxKeys int) (*ListObjectsResult, error)
+	CountObjectsByPrefix(ctx context.Context, prefix string) (int64, error)
 	ListObjectsDelimited(ctx context.Context, prefix, delimiter, startAfter string, maxKeys int) (*ListDelimitedResult, error)
 	ListObjectsByBackend(ctx context.Context, backendName string, limit int) ([]ObjectLocation, error)
 	ListObjectsByBackendKeyAsc(ctx context.Context, backendName, afterKey string, limit int) ([]ObjectLocation, error)
 	MoveObjectLocation(ctx context.Context, key, fromBackend, toBackend string) (int64, error)
-	ImportObject(ctx context.Context, key, backend string, size int64) (bool, error)
-	DeleteObjectLocation(ctx context.Context, key, backendName string) error
+	ImportObject(ctx context.Context, req *ImportObjectRequest) (ImportOutcome, error)
+	DeleteObjectLocation(ctx context.Context, key, backendName string) (int64, error)
+	RecordObjectIdentity(ctx context.Context, key string, id *ObjectIdentity) error
 }
 
-// QuotaStore defines quota routing queries.
-type QuotaStore interface {
-	GetBackendWithSpace(ctx context.Context, size int64, backendOrder []string) (string, error)
-	GetLeastUtilizedBackend(ctx context.Context, size int64, eligible []string) (string, error)
-	GetQuotaStats(ctx context.Context) (map[string]QuotaStat, error)
+// TagStore defines object tag read and write operations. Writes are
+// transactional and promoted from TxOps, so both engines share one
+// implementation; only the reads are per-engine.
+//
+// GetObjectTags returns the set ordered by key, so the Tagging XML response is
+// byte-identical run to run. CountObjectTags returns its size for the read
+// path's tagging-count header, which needs how many rather than which. Neither
+// errors on an untagged object: an untagged object has an empty TagSet, not a
+// missing one.
+type TagStore interface {
+	GetObjectTags(ctx context.Context, key string) ([]Tag, error)
+	CountObjectTags(ctx context.Context, key string) (int, error)
+	ReplaceObjectTags(ctx context.Context, key string, tags []Tag) error
+	DeleteObjectTags(ctx context.Context, key string) error
+}
 
-	// ReconcileUsage recomputes bytes_used from SUM(object_locations.size_bytes)
-	// per backend, correcting drift in the incrementally maintained counter.
-	// Returns the per-backend delta applied (truth - previous); only drifted
-	// backends are present.
+// QuotaStore defines the byte-counter reads and writes. Placement is not among
+// them: which backend a write lands on is decided from the in-memory tracker,
+// which knows about the writes this instance has admitted since the last flush
+// and the row does not.
+//
+// ReconcileUsage recomputes the byte counter from
+// SUM(object_locations.size_bytes) per backend. It returns the delta applied
+// per backend (truth - previous), so backends already in agreement are absent
+// rather than reported as corrected by zero.
+//
+// The counter now moves inside the transaction that writes the rows it
+// summarizes, so this is an audit rather than the repair the counter depends
+// on. It still earns its keep against rows written before that was true, and
+// against a stripe left behind by a restore.
+type QuotaStore interface {
+	GetQuotaStats(ctx context.Context) (map[string]QuotaStat, error)
+	ListBackendQuotaUsage(ctx context.Context) ([]BackendQuotaUsage, error)
 	ReconcileUsage(ctx context.Context) (map[string]int64, error)
 }
 
@@ -82,7 +99,7 @@ type QuotaStore interface {
 type MultipartStore interface {
 	CreateMultipartUpload(ctx context.Context, params *CreateMultipartUploadParams) error
 	GetMultipartUpload(ctx context.Context, uploadID string) (*MultipartUpload, error)
-	RecordPart(ctx context.Context, uploadID string, partNumber int, etag string, size int64, enc *EncryptionMeta) error
+	RecordPart(ctx context.Context, p *RecordPartParams) error
 	GetParts(ctx context.Context, uploadID string) ([]MultipartPart, error)
 	DeleteMultipartUpload(ctx context.Context, uploadID string) error
 	ListMultipartUploads(ctx context.Context, prefix string, maxUploads int) ([]MultipartUpload, error)
@@ -102,6 +119,7 @@ type CreateMultipartUploadParams struct {
 	Metadata      map[string]string
 	EncryptionKey []byte // empty for unencrypted uploads
 	KeyID         string // empty for unencrypted uploads
+	Tags          []Tag  // applied to the object CompleteMultipartUpload produces
 }
 
 // ReplicationStore defines replication management operations.
@@ -111,66 +129,46 @@ type ReplicationStore interface {
 	RecordReplica(ctx context.Context, key, targetBackend, sourceBackend string) (size int64, inserted bool, err error)
 	GetOverReplicatedObjects(ctx context.Context, factor, limit int) ([]ObjectLocation, error)
 	CountOverReplicatedObjects(ctx context.Context, factor int) (int64, error)
-	RemoveExcessCopy(ctx context.Context, key, backendName string, factor int) (removed bool, err error)
+	RemoveExcessCopy(ctx context.Context, key, backendName string, factor int) (size int64, removed bool, err error)
 }
 
 // CleanupStore defines cleanup queue and orphan byte tracking operations.
+//
+// Claiming and reading are separate on purpose. GetPendingCleanups is a
+// read-only snapshot for admin and dashboard display; the worker takes rows
+// with ClaimPendingCleanups, which reserves a batch for one instance. Postgres
+// claims with FOR UPDATE SKIP LOCKED so concurrent instances get disjoint sets,
+// SQLite serializes writers intrinsically, and a row is eligible when its claim
+// is absent or older than graceCutoff - the claim a worker left behind when it
+// died mid-process. Rows reclaimed that way come back with Reclaimed set.
+//
+// Completion and retry both settle the claim. CompleteCleanupItem deletes the
+// row and decrements orphan_bytes together, and is idempotent against a
+// re-claim: a row a previous worker already deleted does not decrement twice.
+// RetryCleanupItem advances next_retry, records the error and clears the claim,
+// so the row is immediately eligible again.
+//
+// The DLQ is where a cleanup goes after exhausting its attempts.
+// MoveCleanupToDLQ leaves orphan_bytes alone, because the object is still on
+// the backend and the operator has not decided what to do about it yet; it
+// reports false when no row existed, a benign race with a concurrent finaliser.
+// RequeueCleanupDLQ sends rows back to the queue with fresh attempts once the
+// backend recovers, and orphan_bytes then drains naturally as those retries
+// complete. Both DLQ listings take an empty backend to mean every backend.
 type CleanupStore interface {
 	EnqueueCleanup(ctx context.Context, backendName, objectKey, reason string, sizeBytes int64) error
-
-	// GetPendingCleanups returns a read-only snapshot of pending rows for
-	// admin / dashboard display. It does not stamp claim columns; the
-	// cleanup worker uses ClaimPendingCleanups instead.
 	GetPendingCleanups(ctx context.Context, limit int) ([]CleanupItem, error)
-
-	// ClaimPendingCleanups atomically reserves a batch of cleanup rows
-	// for the calling instance. Postgres uses FOR UPDATE SKIP LOCKED so
-	// concurrent claim transactions across instances return disjoint row
-	// sets; SQLite serialises writes intrinsically. A row is eligible
-	// when claimed_at IS NULL or older than graceCutoff (a stale claim
-	// from a worker that died mid-process). Returned rows have Reclaimed
-	// set true when their previous claim was reclaimed by this call.
 	ClaimPendingCleanups(ctx context.Context, limit int, instanceID string, graceCutoff time.Time) ([]CleanupItem, error)
-
-	// CompleteCleanupItem atomically deletes a successfully-processed row
-	// and decrements the backing backend's orphan_bytes by the row's
-	// size_bytes. Idempotent against re-claim retries: if the row was
-	// already deleted by a previous worker, orphan_bytes is not
-	// double-decremented.
 	CompleteCleanupItem(ctx context.Context, id int64) error
-
-	// RetryCleanupItem advances next_retry, records the error, and
-	// clears the claim so the row is immediately re-eligible for the
-	// next worker tick.
 	RetryCleanupItem(ctx context.Context, id int64, backoff time.Duration, lastError string) error
 	CleanupQueueDepth(ctx context.Context) (int64, error)
 	IncrementOrphanBytes(ctx context.Context, backendName string, amount int64) error
 	DecrementOrphanBytes(ctx context.Context, backendName string, amount int64) error
 	SweepStaleCleanupQueueRows(ctx context.Context, key, backend string) (int64, error)
 
-	// MoveCleanupToDLQ atomically graduates an exhausted cleanup_queue
-	// row to cleanup_dlq. orphan_bytes is intentionally left untouched
-	// because the underlying backend object is still on disk; the DLQ
-	// entry exists so an operator can investigate, retry, or write off
-	// each unrecoverable orphan deliberately. Returns true if a row was
-	// moved, false if no row existed (benign concurrent-finaliser race).
 	MoveCleanupToDLQ(ctx context.Context, id int64, lastError string) (bool, error)
-
-	// CleanupDLQDepth returns the number of rows currently in
-	// cleanup_dlq. Updates the cleanup_dlq_depth gauge so dashboards can
-	// surface the count of unrecoverable orphans needing attention.
-	CleanupDLQDepth(ctx context.Context) (int64, error)
-
-	// ListCleanupDLQ returns dead-lettered cleanup rows for operator
-	// inspection, newest graduation first. An empty backend lists every
-	// backend; a non-empty one scopes the listing. limit bounds the page.
-	ListCleanupDLQ(ctx context.Context, backend string, limit int) ([]CleanupDLQItem, error)
-
-	// RequeueCleanupDLQ atomically moves dead-lettered rows back into
-	// cleanup_queue (fresh attempts) so the cleanup worker retries them
-	// against a recovered backend; orphan_bytes then decrements naturally
-	// as those retries complete. An empty backend requeues every backend.
-	// Returns the number of rows requeued.
+	CleanupDLQDepth(ctx context.Context) (int64, error)                                      // also refreshes the cleanup_dlq_depth gauge
+	ListCleanupDLQ(ctx context.Context, backend string, limit int) ([]CleanupDLQItem, error) // newest graduation first
 	RequeueCleanupDLQ(ctx context.Context, backend string) (int64, error)
 }
 
@@ -180,24 +178,48 @@ type CleanupStore interface {
 // a failed commit so a DB outage between PUT and RecordObject cannot
 // silently destroy the prior copy of an overwritten key.
 type PendingStore interface {
-	InsertPending(ctx context.Context, p *PendingObject) error
+	InsertPendingIfFits(ctx context.Context, p *PendingObject) (bool, error)
 	DeletePending(ctx context.Context, intentID string) error
 	GetStalePending(ctx context.Context, olderThan time.Time, limit int) ([]PendingObject, error)
-	PromotePending(ctx context.Context, p *PendingObject) (PendingPromoteResult, []DeletedCopy, error)
+	PromotePending(ctx context.Context, p *PendingObject) (PendingPromoteResult, []DeletedCopy, QuotaDeltas, error)
+	CommitCompanionCopy(ctx context.Context, p *PendingObject) (CompanionCommitResult, []DeletedCopy, QuotaDeltas, error)
 	PendingDepth(ctx context.Context) (int64, error)
 	DeletePendingByBackend(ctx context.Context, backendName string) error
 }
 
 // IntegrityStore defines content hash verification operations.
+//
+// The scrub listing filters by backend in the query rather than in the caller.
+// A copy the scrubber cannot afford to read must never occupy a batch slot, or
+// it is either stamped as examined without being read or left at the head of
+// the queue forever.
 type IntegrityStore interface {
-	GetRandomHashedObjects(ctx context.Context, limit int) ([]ObjectLocation, error)
-	GetObjectsWithoutHash(ctx context.Context, limit, offset int) ([]ObjectLocation, error)
+	GetLeastRecentlyScrubbedObjects(ctx context.Context, limit int, backends []string) ([]ObjectLocation, error)
+	CountScrubCandidatesOnBackends(ctx context.Context, backends []string) (int64, error)
+	GetObjectsWithoutHash(ctx context.Context, limit, offset int, backend string) ([]ObjectLocation, error)
 	UpdateContentHash(ctx context.Context, key, backendName, hash string) error
+	MarkObjectScrubbed(ctx context.Context, key, backendName string) error
+	IntegrityCoverage(ctx context.Context, reachable []string) (CoverageStat, error)
+}
+
+// ExpiredObjectsQuery selects the objects one lifecycle rule expires. Prefix
+// and Tags are both optional filters and every one set must match, so a query
+// carrying each selects their intersection; a query with neither matches the
+// whole namespace, which config validation refuses to express.
+//
+// A struct rather than positional parameters because the filter grows: size
+// and absolute-date conditions belong here too, and adding one should not
+// re-break every implementation and caller.
+type ExpiredObjectsQuery struct {
+	Prefix string
+	Tags   map[string]string
+	Cutoff time.Time
+	Limit  int
 }
 
 // ExpiredObjectsLister defines object lifecycle expiration operations.
 type ExpiredObjectsLister interface {
-	ListExpiredObjects(ctx context.Context, prefix string, cutoff time.Time, limit int) ([]ObjectLocation, error)
+	ListExpiredObjects(ctx context.Context, q ExpiredObjectsQuery) ([]ObjectLocation, error)
 }
 
 // BackendLifecycleStore defines backend-level admin operations.
@@ -206,9 +228,10 @@ type BackendLifecycleStore interface {
 	DeleteBackendData(ctx context.Context, backendName string) error
 }
 
-// UsageFlusher defines the store method used by UsageTracker.FlushUsage.
+// UsageFlusher defines the store methods used by UsageTracker.FlushUsage.
 type UsageFlusher interface {
 	FlushUsageDeltas(ctx context.Context, backendName, period string, apiRequests, egressBytes, ingressBytes int64) error
+	FlushPoolDeltas(ctx context.Context, backendName, period string, deltas PoolUsage) error
 }
 
 // AdvisoryLocker defines the leader-election helper used by background
@@ -227,7 +250,11 @@ type DashboardStore interface {
 	GetUnverifiedObjectCounts(ctx context.Context) (map[string]int64, error)
 	GetActiveMultipartCounts(ctx context.Context) (map[string]int64, error)
 	GetUsageForPeriod(ctx context.Context, period string) (map[string]UsageStat, error)
+	GetPoolUsageForPeriod(ctx context.Context, period string) (map[string]PoolUsage, error)
 	ListDirectoryChildren(ctx context.Context, prefix, startAfter string, maxKeys int) (*DirectoryListResult, error)
+	IntegrityCoverage(ctx context.Context, reachable []string) (CoverageStat, error)
+	CountUnencryptedLocations(ctx context.Context) (int64, error)
+	CompressionStats(ctx context.Context) (map[string]CompressionStat, error)
 }
 
 // -------------------------------------------------------------------------
@@ -251,10 +278,65 @@ type LifecycleAdmin interface {
 type EncryptionAdmin interface {
 	ListEncryptedLocations(ctx context.Context, keyID string, limit, offset int) ([]EncryptedLocation, error)
 	UpdateEncryptionKey(ctx context.Context, objectKey, backendName string, newEncryptionKey []byte, newKeyID string) error
-	ListUnencryptedLocations(ctx context.Context, limit, offset int) ([]UnencryptedLocation, error)
-	MarkObjectEncrypted(ctx context.Context, objectKey, backendName string, encryptionKey []byte, keyID string, plaintextSize, ciphertextSize int64) error
-	ListAllEncryptedLocations(ctx context.Context, limit, offset int) ([]DecryptableLocation, error)
-	MarkObjectDecrypted(ctx context.Context, objectKey, backendName string, plaintextSize int64) error
+	ListUnencryptedLocations(ctx context.Context, limit int, after Cursor, backend string) ([]UnencryptedLocation, error)
+	CountUnencryptedLocations(ctx context.Context) (int64, error)
+	MarkObjectEncrypted(ctx context.Context, u *EncryptedUpdate) error
+	ListAllEncryptedLocations(ctx context.Context, limit int, after Cursor, backend string) ([]DecryptableLocation, error)
+	MarkObjectDecrypted(ctx context.Context, u *DecryptedUpdate) error
+}
+
+// CompressionAdmin defines the admin-only bulk compression operations used by
+// the admin HTTP handler, the web UI and adminctl. Like EncryptionAdmin these
+// are off the request hot path, so they bypass the circuit breaker.
+//
+// The two listings are complements: one selects copies with no encoding, the
+// other copies that have one.
+//
+// Both page by cursor rather than offset, and that is load-bearing. A pass
+// rewrites the rows it is walking, so each one it processes leaves the
+// predicate its listing selects on; an offset advanced against a set that just
+// shrank underneath it steps straight over the rows that moved up, and the run
+// reports success having never looked at them. The cursor is the last row seen,
+// so a row leaving the set moves nothing.
+// The uncompressed listing takes the thresholds that decide candidacy, because
+// both of its exclusions are answers that outlive the pass: a copy under the
+// size floor is never a candidate, and one already measured as unable to reach
+// the ratio stays declined until a setting changes. Selecting on them is what
+// keeps a second pass from paying to rediscover what the first one learned.
+type CompressionAdmin interface {
+	ListUncompressedLocations(ctx context.Context, limit int, after Cursor, t CompressionThresholds, backend string) ([]RewritableLocation, error)
+	ListCompressedLocations(ctx context.Context, limit int, after Cursor, backend string) ([]RewritableLocation, error)
+	MarkObjectCompressed(ctx context.Context, u *CompressedUpdate, previousSize int64) error
+	RecordCompressionProbe(ctx context.Context, probe *CompressionProbe) error
+}
+
+// ProvisioningStore defines the store half of the bucket registry: the buckets,
+// users and grants that exist as rows rather than as config entries.
+//
+// The listings are what registry assembly reads, at startup and on every reload,
+// to merge with what the config file declares. The rest is how a bucket, a user,
+// one of its keypairs or one of its grants comes into being and stops being,
+// each addressable on its own so revoking a credential leaves its siblings and
+// dropping one grant leaves the others.
+//
+// Deleting a user that still holds credentials or grants is refused by the
+// schema, so a caller removes those first.
+type ProvisioningStore interface {
+	ListBuckets(ctx context.Context) ([]Bucket, error)
+	ListUsers(ctx context.Context) ([]User, error)
+	ListCredentials(ctx context.Context) ([]Credential, error)
+	ListGrants(ctx context.Context) ([]Grant, error)
+	CreateBucket(ctx context.Context, b *Bucket) error
+	CreateUser(ctx context.Context, u *User) error
+	CreateCredential(ctx context.Context, c *Credential) error
+	CreateGrant(ctx context.Context, g *Grant) error
+	UpdateBucket(ctx context.Context, b *Bucket) error
+	RenameUser(ctx context.Context, id, name string) error
+	SetGrant(ctx context.Context, g *Grant) error
+	DeleteBucket(ctx context.Context, name string) error
+	DeleteUser(ctx context.Context, id string) error
+	DeleteCredential(ctx context.Context, accessKeyID string) error
+	DeleteGrant(ctx context.Context, userID string, r Resource) error
 }
 
 // NotificationOutbox defines the durable notification outbox operations

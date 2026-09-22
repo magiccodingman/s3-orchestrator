@@ -16,11 +16,13 @@
 //	go run . -op mixed -rate 300 -duration 2m -seed 500
 //	go run . -op put -rate 200 -duration 30s -sizes 1024,1048576,104857600
 //	go run . -op get -rate 200 -duration 30s -sizes 1024,1048576 -output-json results.json
+//
 // -------------------------------------------------------------------------------
 package main
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/rand"
 	"encoding/json"
@@ -46,23 +48,48 @@ import (
 // Used for all methods - this is a load tester, not a security tool.
 const unsignedPayload = "UNSIGNED-PAYLOAD"
 
+// defaultMaxErrorRate is the share of failed requests a run may absorb before
+// it is reported as a failure. Non-zero by default so a scenario added without
+// an explicit budget is gated rather than silently unchecked.
+const defaultMaxErrorRate = 0.01
+
+// needsSeeding reports whether an operation reads objects, and so requires a
+// working set to exist on the endpoint before the run starts.
+func needsSeeding(op string) bool {
+	return op == "get" || op == "mixed" || op == "listobjects" || op == "tagging"
+}
+
+// taggingBody is the Tagging document the ?tagging PUT sends. Fixed rather
+// than generated per request: the point of the scenario is the cost of the
+// write path, not of building two tags.
+const taggingBody = `<Tagging><TagSet>` +
+	`<Tag><Key>loadtest</Key><Value>1</Value></Tag>` +
+	`<Tag><Key>retain</Key><Value>30d</Value></Tag>` +
+	`</TagSet></Tagging>`
+
+// inlineTaggingHeader is the x-amz-tagging value a tagged PUT carries. Query
+// string encoded, which is the header's format rather than the XML above.
+const inlineTaggingHeader = "loadtest=1&retain=30d"
+
 // scenarioConfig captures the immutable inputs to a single scenario run.
 // Extracted so the sweep loop can re-run with only the body size varying.
 type scenarioConfig struct {
-	endpoint     string
-	bucket       string
-	region       string
-	op           string
-	rate         int
-	duration     time.Duration
-	workers      uint64
-	seedCount    int
-	cold         bool
-	listPrefix   string
-	listMaxKeys  int
-	signer       *v4.Signer
-	creds        aws.Credentials
-	runID        string
+	endpoint      string
+	bucket        string
+	region        string
+	op            string
+	rate          int
+	duration      time.Duration
+	workers       uint64
+	seedCount     int
+	cold          bool
+	listPrefix    string
+	listMaxKeys   int
+	compressible  float64
+	overwriteKeys uint64
+	signer        *v4.Signer
+	creds         aws.Credentials
+	runID         string
 }
 
 // runResult is the per-size summary for a single scenario run, structured
@@ -86,18 +113,18 @@ type runResult struct {
 // the static scenario inputs, hardware fingerprint, and one runResult
 // per object size (single-size runs produce a one-element matrix).
 type sweepResults struct {
-	Scenario        string       `json:"scenario"`
-	Endpoint        string       `json:"endpoint"`
-	Bucket          string       `json:"bucket"`
-	Rate            int          `json:"rate"`
-	Duration        string       `json:"duration"`
-	Workers         uint64       `json:"workers"`
-	SeedCount       int          `json:"seed_count,omitempty"`
-	Mode            string       `json:"mode"` // "single", "size-sweep", "ramp"
-	SaturationRPS   int          `json:"saturation_rps,omitempty"` // ramp mode: rate at which error_rate first exceeded threshold
-	Hardware        hardwareInfo `json:"hardware"`
-	StartedAt       time.Time    `json:"started_at"`
-	Results         []runResult  `json:"results"`
+	Scenario      string       `json:"scenario"`
+	Endpoint      string       `json:"endpoint"`
+	Bucket        string       `json:"bucket"`
+	Rate          int          `json:"rate"`
+	Duration      string       `json:"duration"`
+	Workers       uint64       `json:"workers"`
+	SeedCount     int          `json:"seed_count,omitempty"`
+	Mode          string       `json:"mode"`                     // "single", "size-sweep", "ramp"
+	SaturationRPS int          `json:"saturation_rps,omitempty"` // ramp mode: rate at which error_rate first exceeded threshold
+	Hardware      hardwareInfo `json:"hardware"`
+	StartedAt     time.Time    `json:"started_at"`
+	Results       []runResult  `json:"results"`
 }
 
 // hardwareInfo records the host the loadtest ran on so a results file
@@ -128,34 +155,71 @@ func validateRampFlags(rampTo, rate, rampStep int, multiSize bool) error {
 	return nil
 }
 
+// scenarioFlags is the subset of the command line whose validity depends on
+// which operation was asked for, bundled so the checks live together rather
+// than as another arm of main's flag handling.
+type scenarioFlags struct {
+	op               string
+	overwriteKeys    uint64
+	cacheFlushBefore bool
+	adminCreds       adminCredentials
+	cold             bool
+}
+
+// validateScenarioFlags rejects combinations an operation cannot honour, so a
+// run fails at the flag rather than partway through a scenario.
+func validateScenarioFlags(f *scenarioFlags) error {
+	if f.op == "overwrite" && f.overwriteKeys == 0 {
+		return errors.New("-overwrite-keys must be positive: a rewrite scenario needs a key set to rewrite")
+	}
+	if f.cacheFlushBefore && !f.adminCreds.complete() {
+		return errors.New("-cache-flush-before requires an admin keypair " +
+			"(-admin-access-key and -admin-secret-key, or $S3O_ACCESS_KEY_ID and $S3O_SECRET_ACCESS_KEY)")
+	}
+	if f.cold && f.op != "get" {
+		return errors.New("-cold only applies to -op get")
+	}
+	return nil
+}
+
+// -------------------------------------------------------------------------
+// ENTRY POINT
+// -------------------------------------------------------------------------
+
 // main is the program entry point.
 func main() {
 	var (
-		endpoint          = flag.String("endpoint", "http://localhost:9000", "S3 orchestrator endpoint")
-		accessKey         = flag.String("access-key", "photoskey", "Access key ID")
-		secretKey         = flag.String("secret-key", "photossecret", "Secret access key")
-		bucket            = flag.String("bucket", "photos", "Target bucket")
-		region            = flag.String("region", "us-east-1", "AWS region for SigV4")
-		rateFlag          = flag.Int("rate", 100, "Requests per second (initial rate when -ramp-to is set)")
-		dur               = flag.Duration("duration", 30*time.Second, "Test duration per scenario step")
-		size              = flag.Int("size", 1024, "Object size in bytes (ignored if -sizes is set)")
-		sizesFlag         = flag.String("sizes", "", "Comma-separated object sizes for sweep mode (e.g. 1024,1048576,104857600); overrides -size")
-		op                = flag.String("op", "put", "Operation: put, get, mixed, listobjects")
-		workers           = flag.Uint64("workers", 10, "Concurrent workers")
-		seedN             = flag.Int("seed", 100, "Objects to pre-seed for get/mixed/listobjects (per size in sweep mode)")
-		listPrefix        = flag.String("list-prefix", "loadtest/", "Prefix for listobjects scenario")
-		listMaxKeys       = flag.Int("list-max-keys", 1000, "max-keys query parameter for listobjects scenario")
-		outputJSON        = flag.String("output-json", "", "Write structured results to this file")
-		rampTo            = flag.Int("ramp-to", 0, "Saturation-find: ramp from -rate up to this rate; stop when error rate exceeds -ramp-error-threshold (0 disables ramp mode)")
-		rampStep          = flag.Int("ramp-step", 100, "Rate increment per ramp step")
-		rampErrThreshold  = flag.Float64("ramp-error-threshold", 0.05, "Error rate threshold (0..1) for ramp termination")
-		cacheFlushBefore  = flag.Bool("cache-flush-before", false, "POST /admin/api/cache/flush before each scenario step (requires -admin-token)")
-		adminToken        = flag.String("admin-token", "", "Admin token for cache-flush calls (also read from S3O_ADMIN_TOKEN env var)")
-		cold              = flag.Bool("cold", false, "Cold-cache read mode for -op get: read each seeded object exactly once so every GET is a first touch; the run lasts one pass over the working set, not -duration")
+		endpoint         = flag.String("endpoint", "http://localhost:9000", "S3 orchestrator endpoint")
+		accessKey        = flag.String("access-key", "photoskey", "Access key ID")
+		secretKey        = flag.String("secret-key", "photossecret", "Secret access key")
+		bucket           = flag.String("bucket", "photos", "Target bucket")
+		region           = flag.String("region", "us-east-1", "AWS region for SigV4")
+		rateFlag         = flag.Int("rate", 100, "Requests per second (initial rate when -ramp-to is set)")
+		dur              = flag.Duration("duration", 30*time.Second, "Test duration per scenario step")
+		size             = flag.Int("size", 1024, "Object size in bytes (ignored if -sizes is set)")
+		sizesFlag        = flag.String("sizes", "", "Comma-separated object sizes for sweep mode (e.g. 1024,1048576,104857600); overrides -size")
+		op               = flag.String("op", "put", "Operation: put, get, mixed, listobjects, tagging, puttagged")
+		workers          = flag.Uint64("workers", 10, "Concurrent workers")
+		seedN            = flag.Int("seed", 100, "Objects to pre-seed for get/mixed/listobjects (per size in sweep mode)")
+		listPrefix       = flag.String("list-prefix", "loadtest/", "Prefix for listobjects scenario")
+		listMaxKeys      = flag.Int("list-max-keys", 1000, "max-keys query parameter for listobjects scenario")
+		outputJSON       = flag.String("output-json", "", "Write structured results to this file")
+		rampTo           = flag.Int("ramp-to", 0, "Saturation-find: ramp from -rate up to this rate; stop when error rate exceeds -ramp-error-threshold (0 disables ramp mode)")
+		rampStep         = flag.Int("ramp-step", 100, "Rate increment per ramp step")
+		rampErrThreshold = flag.Float64("ramp-error-threshold", 0.05, "Error rate threshold (0..1) for ramp termination")
+		maxErrorRate     = flag.Float64("max-error-rate", defaultMaxErrorRate, "Fail the run when any result exceeds this error rate (0..1); 0 disables")
+		cacheFlushBefore = flag.Bool("cache-flush-before", false, "POST /admin/api/cache/flush before each scenario step (requires an admin keypair)")
+		adminAccessKey   = flag.String("admin-access-key", "", "Access key ID the cache-flush calls sign with (also read from S3O_ACCESS_KEY_ID)")
+		adminSecretKey   = flag.String("admin-secret-key", "", "Secret access key the cache-flush calls sign with (also read from S3O_SECRET_ACCESS_KEY)")
+		cold             = flag.Bool("cold", false, "Cold-cache read mode for -op get: read each seeded object exactly once so every GET is a first touch; the run lasts one pass over the working set, not -duration")
+		compressible     = flag.Float64("compressible", 0, "Fraction of each body that is repetitive (0..1). 0 is incompressible random bytes; 0.8 encodes to roughly a fifth. Applies to every scenario that writes")
+		overwriteKeys    = flag.Uint64("overwrite-keys", 1000, "Size of the key set -op overwrite rewrites, so a key is written every -overwrite-keys requests")
 	)
 	flag.Parse()
-	if *adminToken == "" {
-		*adminToken = os.Getenv("S3O_ADMIN_TOKEN")
+	adminCreds := adminCredentials{
+		accessKey: cmp.Or(*adminAccessKey, os.Getenv("S3O_ACCESS_KEY_ID")),
+		secretKey: cmp.Or(*adminSecretKey, os.Getenv("S3O_SECRET_ACCESS_KEY")),
+		region:    *region,
 	}
 
 	sizes, err := parseSizes(*sizesFlag, *size)
@@ -168,36 +232,40 @@ func main() {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
-	if *cacheFlushBefore && *adminToken == "" {
-		fmt.Fprintln(os.Stderr, "error: -cache-flush-before requires -admin-token (or S3O_ADMIN_TOKEN env var)")
-		os.Exit(1)
-	}
-	if *cold && *op != "get" {
-		fmt.Fprintln(os.Stderr, "error: -cold only applies to -op get")
+	if err := validateScenarioFlags(&scenarioFlags{
+		op:               *op,
+		overwriteKeys:    *overwriteKeys,
+		cacheFlushBefore: *cacheFlushBefore,
+		adminCreds:       adminCreds,
+		cold:             *cold,
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 
-	signer := v4.NewSigner()
+	signer := v4.NewSigner(disableURIPathEscaping)
 	creds := aws.Credentials{
 		AccessKeyID:     *accessKey,
 		SecretAccessKey: *secretKey,
 	}
 
 	cfg := scenarioConfig{
-		endpoint:    *endpoint,
-		bucket:      *bucket,
-		region:      *region,
-		op:          *op,
-		rate:        *rateFlag,
-		duration:    *dur,
-		workers:     *workers,
-		seedCount:   *seedN,
-		cold:        *cold,
-		listPrefix:  *listPrefix,
-		listMaxKeys: *listMaxKeys,
-		signer:      signer,
-		creds:       creds,
-		runID:       time.Now().UTC().Format("20060102T150405Z"),
+		endpoint:      *endpoint,
+		bucket:        *bucket,
+		region:        *region,
+		op:            *op,
+		rate:          *rateFlag,
+		duration:      *dur,
+		workers:       *workers,
+		seedCount:     *seedN,
+		cold:          *cold,
+		listPrefix:    *listPrefix,
+		listMaxKeys:   *listMaxKeys,
+		compressible:  *compressible,
+		overwriteKeys: *overwriteKeys,
+		signer:        signer,
+		creds:         creds,
+		runID:         time.Now().UTC().Format("20060102T150405Z"),
 	}
 
 	results := sweepResults{
@@ -210,7 +278,7 @@ func main() {
 		Hardware:  newHardwareInfo(),
 		StartedAt: time.Now().UTC(),
 	}
-	if *op == "get" || *op == "mixed" || *op == "listobjects" {
+	if needsSeeding(*op) {
 		results.SeedCount = *seedN
 	}
 	switch {
@@ -223,9 +291,9 @@ func main() {
 	}
 
 	if *rampTo > 0 {
-		runRamp(&cfg, sizes[0], *rampTo, *rampStep, *rampErrThreshold, *cacheFlushBefore, *endpoint, *adminToken, &results)
+		runRamp(&cfg, sizes[0], *rampTo, *rampStep, *rampErrThreshold, *cacheFlushBefore, *endpoint, adminCreds, &results)
 	} else {
-		runSizes(&cfg, sizes, *cacheFlushBefore, *endpoint, *adminToken, &results)
+		runSizes(&cfg, sizes, *cacheFlushBefore, *endpoint, adminCreds, &results)
 	}
 
 	printMarkdownSummary(os.Stdout, &results)
@@ -237,18 +305,50 @@ func main() {
 		}
 		fmt.Printf("\nResults written to %s\n", *outputJSON)
 	}
+
+	// Checked last so the summary and JSON are always produced: a run that
+	// blows its budget is exactly the one whose numbers you want to keep.
+	if err := enforceErrorBudget(&results, *maxErrorRate, *rampTo > 0); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+// -------------------------------------------------------------------------
+// SWEEP ORCHESTRATION
+// -------------------------------------------------------------------------
+
+// enforceErrorBudget reports the first result whose error rate exceeded the
+// budget, so a scenario that ran to completion while failing a large share of
+// its requests is a failure rather than a successful measurement of one.
+//
+// Ramp runs are exempt: they drive the system into saturation deliberately,
+// and crossing an error threshold is their terminal condition rather than a
+// fault.
+func enforceErrorBudget(results *sweepResults, maxRate float64, ramp bool) error {
+	if ramp || maxRate <= 0 {
+		return nil
+	}
+	for i := range results.Results {
+		r := &results.Results[i]
+		if r.ErrorRate > maxRate {
+			return fmt.Errorf("error budget exceeded: size=%d requested_rps=%d observed %.2f%% errors (budget %.2f%%)",
+				r.SizeBytes, r.RequestedRPS, r.ErrorRate*100, maxRate*100)
+		}
+	}
+	return nil
 }
 
 // runSizes executes the scenario once per size in sizes, optionally
 // flushing the orchestrator cache before each step. Appends each
 // result to results.Results.
-func runSizes(cfg *scenarioConfig, sizes []int, flushBefore bool, endpoint, adminToken string, results *sweepResults) {
+func runSizes(cfg *scenarioConfig, sizes []int, flushBefore bool, endpoint string, adminCreds adminCredentials, results *sweepResults) {
 	for _, sz := range sizes {
 		if len(sizes) > 1 {
 			fmt.Printf("\n=== size=%d bytes ===\n", sz)
 		}
 		if flushBefore {
-			if err := flushAdminCache(endpoint, adminToken); err != nil {
+			if err := flushAdminCache(endpoint, adminCreds); err != nil {
 				fmt.Fprintf(os.Stderr, "error: cache flush failed: %v (cold-cache results would be silently warm; check the admin token)\n", err)
 				os.Exit(1)
 			}
@@ -268,13 +368,13 @@ func runSizes(cfg *scenarioConfig, sizes []int, flushBefore bool, endpoint, admi
 // step's rate as the saturation point. Each step optionally
 // pre-flushes the cache so saturation reflects the cache-cold
 // path rather than steady-state warm hits.
-func runRamp(cfg *scenarioConfig, size, rampTo, step int, errThreshold float64, flushBefore bool, endpoint, adminToken string, results *sweepResults) {
+func runRamp(cfg *scenarioConfig, size, rampTo, step int, errThreshold float64, flushBefore bool, endpoint string, adminCreds adminCredentials, results *sweepResults) {
 	startRate := cfg.rate
 	for rate := startRate; rate <= rampTo; rate += step {
 		fmt.Printf("\n=== rate=%d req/s ===\n", rate)
 		cfg.rate = rate
 		if flushBefore {
-			if err := flushAdminCache(endpoint, adminToken); err != nil {
+			if err := flushAdminCache(endpoint, adminCreds); err != nil {
 				fmt.Fprintf(os.Stderr, "error: cache flush failed: %v (cold-cache results would be silently warm; check the admin token)\n", err)
 				os.Exit(1)
 			}
@@ -298,13 +398,18 @@ func runRamp(cfg *scenarioConfig, size, rampTo, step int, errThreshold float64, 
 // each ramp/sweep step starts from a known cold cache state. 503 is
 // treated as success since it just means the orchestrator has caching
 // disabled, not that the call failed.
-func flushAdminCache(endpoint, adminToken string) error {
+//
+// The admin API authenticates the same signed credential the data plane does,
+// so this signs with the keypair the run is already using.
+func flushAdminCache(endpoint string, creds adminCredentials) error {
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost,
 		endpoint+"/admin/api/cache/flush", nil)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("X-Admin-Token", adminToken)
+	if err := signAdminRequest(req, creds); err != nil {
+		return err
+	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return err
@@ -314,6 +419,36 @@ func flushAdminCache(endpoint, adminToken string) error {
 		return fmt.Errorf("flush returned %d", resp.StatusCode)
 	}
 	return nil
+}
+
+// adminCredentials is the keypair an admin call signs with.
+type adminCredentials struct {
+	accessKey string
+	secretKey string
+	region    string
+}
+
+// complete reports whether both halves are present, which is what it takes to
+// sign.
+func (c adminCredentials) complete() bool {
+	return c.accessKey != "" && c.secretKey != ""
+}
+
+// signAdminRequest signs an admin request with SigV4. The payload is declared
+// unsigned because these calls carry no body.
+func signAdminRequest(req *http.Request, creds adminCredentials) error {
+	req.Header.Set("X-Amz-Content-Sha256", unsignedPayload)
+	return v4.NewSigner(disableURIPathEscaping).SignHTTP(req.Context(),
+		aws.Credentials{AccessKeyID: creds.accessKey, SecretAccessKey: creds.secretKey},
+		req, unsignedPayload, "s3", creds.region, time.Now().UTC())
+}
+
+// disableURIPathEscaping signs the path exactly as it goes on the wire. The
+// SDK's default escapes an already-encoded path a second time, which the
+// orchestrator refuses: it canonicalises in the S3 do-not-double-encode mode,
+// so a key needing percent-encoding would sign as something it never sent.
+func disableURIPathEscaping(o *v4.SignerOptions) {
+	o.DisableURIPathEscaping = true
 }
 
 // parseSizes resolves the effective per-run object sizes. -sizes wins
@@ -348,6 +483,10 @@ func parseSizes(csv string, single int) ([]int, error) {
 	return out, nil
 }
 
+// -------------------------------------------------------------------------
+// SCENARIO EXECUTION
+// -------------------------------------------------------------------------
+
 // newHardwareInfo captures the host fingerprint at run start so the
 // results document remains interpretable when read months later.
 func newHardwareInfo() hardwareInfo {
@@ -359,21 +498,48 @@ func newHardwareInfo() hardwareInfo {
 	}
 }
 
+// newBody builds one scenario's payload at the requested compressibility.
+//
+// Random bytes are the honest default for measuring the write path, but they
+// are also the one input an encoder can never shrink, so a run made entirely of
+// them measures compression as the cost of declining and never as the work of
+// encoding. compressible is the fraction of the body filled with a repeating
+// dictionary instead: at 0.8 an encoder has four repetitive bytes for every
+// random one and stores roughly a fifth of what it was given.
+//
+// The repetitive part is a fixed phrase rather than a run of one byte, so the
+// encoder does real matching rather than collapsing a single run.
+func newBody(size int, compressible float64) ([]byte, error) {
+	body := make([]byte, size)
+	if _, err := rand.Read(body); err != nil {
+		return nil, fmt.Errorf("generate body: %w", err)
+	}
+	if compressible <= 0 {
+		return body, nil
+	}
+	repeated := int(float64(size) * min(compressible, 1))
+	phrase := []byte("the quick brown fox jumps over the lazy dog, and does so repeatedly. ")
+	for i := 0; i < repeated; i += len(phrase) {
+		copy(body[i:min(i+len(phrase), repeated)], phrase)
+	}
+	return body, nil
+}
+
 // runScenario executes one full scenario at a single object size: seeds
 // (if needed), attacks, collects vegeta metrics, and returns a runResult.
 // The metrics live entirely on the stack so concurrent runs would be
 // safe, though main runs them sequentially. cfg is passed by pointer to
 // avoid copying the embedded signer/creds on each call.
 func runScenario(cfg *scenarioConfig, size int) (runResult, error) {
-	body := make([]byte, size)
-	if _, err := rand.Read(body); err != nil {
-		return runResult{}, fmt.Errorf("generate body: %w", err)
+	body, err := newBody(size, cfg.compressible)
+	if err != nil {
+		return runResult{}, err
 	}
 
 	var keys []string
-	if cfg.op == "get" || cfg.op == "mixed" || cfg.op == "listobjects" {
+	if needsSeeding(cfg.op) {
 		fmt.Printf("Seeding %d objects (%d B each)...\n", cfg.seedCount, size)
-		keys = seedObjects(cfg.endpoint, cfg.bucket, cfg.region, cfg.signer, cfg.creds, body, cfg.seedCount)
+		keys = seedObjects(cfg.endpoint, cfg.bucket, cfg.region, cfg.signer, &cfg.creds, body, cfg.seedCount)
 		fmt.Printf("Seeded %d objects\n", len(keys))
 		if len(keys) == 0 {
 			return runResult{}, fmt.Errorf("no objects seeded")
@@ -406,6 +572,10 @@ func runScenario(cfg *scenarioConfig, size int) (runResult, error) {
 
 	return summarise(size, cfg.rate, &metrics), nil
 }
+
+// -------------------------------------------------------------------------
+// REPORTING
+// -------------------------------------------------------------------------
 
 // summarise converts a vegeta.Metrics block into the persisted runResult
 // shape. ms-precision percentiles are easier to skim in Markdown than
@@ -467,9 +637,13 @@ func writeJSON(path string, r *sweepResults) error {
 	return os.WriteFile(path, data, 0o600)
 }
 
+// -------------------------------------------------------------------------
+// SEEDING AND TARGETING
+// -------------------------------------------------------------------------
+
 // seedObjects uploads n objects and returns the keys that succeeded.
 // Retries on 429 with backoff to avoid overwhelming the rate limiter.
-func seedObjects(endpoint, bucket, region string, signer *v4.Signer, creds aws.Credentials, body []byte, n int) []string {
+func seedObjects(endpoint, bucket, region string, signer *v4.Signer, creds *aws.Credentials, body []byte, n int) []string {
 	client := &http.Client{Timeout: 30 * time.Second}
 	keys := make([]string, 0, n)
 
@@ -482,7 +656,7 @@ func seedObjects(endpoint, bucket, region string, signer *v4.Signer, creds aws.C
 		key := fmt.Sprintf("loadtest/seed-%06d", i)
 		reqURL := fmt.Sprintf("%s/%s/%s", endpoint, bucket, key)
 
-		req, err := http.NewRequest(http.MethodPut, reqURL, bytes.NewReader(body))
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodPut, reqURL, bytes.NewReader(body))
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "  seed %d: %v\n", i, err)
 			continue
@@ -490,7 +664,7 @@ func seedObjects(endpoint, bucket, region string, signer *v4.Signer, creds aws.C
 		req.Header.Set("Content-Type", "application/octet-stream")
 		req.Header.Set("X-Amz-Content-Sha256", unsignedPayload)
 
-		if err := signer.SignHTTP(context.Background(), creds, req, unsignedPayload, "s3", region, time.Now()); err != nil {
+		if err := signer.SignHTTP(context.Background(), *creds, req, unsignedPayload, "s3", region, time.Now()); err != nil {
 			fmt.Fprintf(os.Stderr, "  seed %d sign: %v\n", i, err)
 			continue
 		}
@@ -533,6 +707,16 @@ func newTargeter(cfg *scenarioConfig, body []byte, keys []string) vegeta.Targete
 			tgt.Method = http.MethodPut
 			tgt.URL = fmt.Sprintf("%s/%s/loadtest/%s/obj-%06d", cfg.endpoint, cfg.bucket, cfg.runID, n)
 			tgt.Body = body
+		case "overwrite":
+			// Rewrites a bounded key set, so every request after the first pass
+			// replaces an object that already exists. A run of unique keys never
+			// touches overwrite displacement, the intent supersession that goes
+			// with it, or the copies a write is still placing when the next
+			// write for that key arrives.
+			tgt.Method = http.MethodPut
+			tgt.URL = fmt.Sprintf("%s/%s/loadtest/%s/obj-%06d",
+				cfg.endpoint, cfg.bucket, cfg.runID, n%cfg.overwriteKeys)
+			tgt.Body = body
 		case "get":
 			tgt.Method = http.MethodGet
 			tgt.URL = fmt.Sprintf("%s/%s/%s", cfg.endpoint, cfg.bucket, keys[n%uint64(len(keys))])
@@ -553,17 +737,51 @@ func newTargeter(cfg *scenarioConfig, body []byte, keys []string) vegeta.Targete
 				cfg.endpoint, cfg.bucket,
 				url.QueryEscape(cfg.listPrefix), cfg.listMaxKeys)
 			tgt.Body = nil
+		case "tagging":
+			// Rotates the three subresource verbs over the seeded set so one
+			// run exercises the write, the read and the clear rather than
+			// measuring whichever happens to be cheapest.
+			key := keys[n%uint64(len(keys))]
+			tgt.URL = fmt.Sprintf("%s/%s/%s?tagging", cfg.endpoint, cfg.bucket, key)
+			switch n % 3 {
+			case 0:
+				tgt.Method = http.MethodPut
+				tgt.Body = []byte(taggingBody)
+			case 1:
+				tgt.Method = http.MethodGet
+				tgt.Body = nil
+			default:
+				tgt.Method = http.MethodDelete
+				tgt.Body = nil
+			}
+		case "puttagged":
+			// A plain PUT plus the inline header, so the run is directly
+			// comparable against `put` at the same rate and size: the delta is
+			// what tagging on the write path costs.
+			tgt.Method = http.MethodPut
+			tgt.URL = fmt.Sprintf("%s/%s/loadtest/%s/obj-%06d", cfg.endpoint, cfg.bucket, cfg.runID, n)
+			tgt.Body = body
 		default:
 			return fmt.Errorf("unknown operation: %s", cfg.op)
 		}
 
 		// Build a temporary http.Request to sign, then copy headers to the target.
-		req, err := http.NewRequest(tgt.Method, tgt.URL, nil)
+		req, err := http.NewRequestWithContext(context.Background(), tgt.Method, tgt.URL, nil)
 		if err != nil {
 			return err
 		}
 		req.Header.Set("Content-Type", "application/octet-stream")
 		req.Header.Set("X-Amz-Content-Sha256", unsignedPayload)
+
+		// Set before signing, not after: the orchestrator verifies the
+		// signature over the headers the client sent, and x-amz-tagging is one
+		// SigV4 covers.
+		switch cfg.op {
+		case "tagging":
+			req.Header.Set("Content-Type", "application/xml")
+		case "puttagged":
+			req.Header.Set("x-amz-tagging", inlineTaggingHeader)
+		}
 
 		if err := cfg.signer.SignHTTP(context.Background(), cfg.creds, req, unsignedPayload, "s3", cfg.region, time.Now()); err != nil {
 			return err

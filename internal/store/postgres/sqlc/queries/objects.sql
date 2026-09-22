@@ -14,7 +14,8 @@
 SELECT pg_advisory_xact_lock(hashtext($1));
 
 -- name: GetExistingCopiesForUpdate :many
-SELECT backend_name, size_bytes, created_at
+SELECT backend_name, size_bytes, created_at, encrypted,
+       (encryption_key IS NOT NULL AND length(encryption_key) > 0) AS has_dek
 FROM object_locations
 WHERE object_key = $1
 FOR UPDATE;
@@ -24,13 +25,17 @@ DELETE FROM object_locations
 WHERE object_key = $1;
 
 -- name: InsertObjectLocation :exec
-INSERT INTO object_locations (object_key, backend_name, size_bytes, encrypted, encryption_key, key_id, plaintext_size, content_hash, created_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW());
+INSERT INTO object_locations (object_key, backend_name, size_bytes, encrypted, encryption_key, key_id, plaintext_size, content_hash, compression_algorithm, compression_level, compression_format_version, logical_size, etag, content_type, user_metadata, created_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, NOW());
 
+-- ListObjectsByBackend backs the rebalance, placement and drain candidate
+-- scans, so it returns managed rows only. Objects outside every configured
+-- bucket prefix are tracked for accounting but are not the orchestrator's to
+-- move.
 -- name: ListObjectsByBackend :many
 SELECT object_key, backend_name, size_bytes, created_at
 FROM object_locations
-WHERE backend_name = $1
+WHERE backend_name = $1 AND managed
 ORDER BY size_bytes ASC
 LIMIT $2;
 
@@ -58,7 +63,18 @@ SELECT EXISTS(
 ) AS exists;
 
 -- name: LockObjectOnBackend :one
-SELECT size_bytes, encrypted, encryption_key, key_id, plaintext_size, content_hash
+-- Every column describing the stored bytes, because the caller moving this row
+-- to another backend rebuilds the destination from what this returns. A column
+-- missing here is one the moved copy silently stops claiming, which for the
+-- compression columns means a still-encoded object recorded as verbatim.
+--
+-- The probe columns come along because a verbatim move does not change the
+-- bytes, so what the encoder measured about them still holds. Dropping them
+-- would have the next pass download and encode the copy again to learn what
+-- this row already knows.
+SELECT size_bytes, encrypted, encryption_key, key_id, plaintext_size, content_hash,
+       compression_algorithm, compression_level, compression_format_version, logical_size,
+       compression_probe_size, compression_probe_level, etag, content_type, user_metadata
 FROM object_locations
 WHERE object_key = $1 AND backend_name = $2
 FOR UPDATE;
@@ -68,22 +84,37 @@ DELETE FROM object_locations
 WHERE object_key = $1 AND backend_name = $2;
 
 -- name: ListObjectsByPrefix :many
-SELECT DISTINCT ON (object_key) object_key, backend_name, size_bytes, created_at
+-- COLLATE "C" is required: S3 ListObjectsV2 returns keys in UTF-8 byte order,
+-- and object_key is plain TEXT so it would otherwise sort under the database's
+-- LC_COLLATE. The cursor predicate carries the same collation as the ORDER BY -
+-- splitting them would page a byte-ordered scan with a locale-ordered cursor and
+-- skip or repeat keys. DISTINCT ON must carry it too, or Postgres rejects the
+-- query for not matching the leading ORDER BY expression.
+SELECT DISTINCT ON (object_key COLLATE "C") object_key, backend_name, size_bytes, etag, created_at
 FROM object_locations
 WHERE object_key LIKE @prefix::text || '%' ESCAPE '\'
-  AND object_key > @start_after
-ORDER BY object_key, created_at ASC
+  AND object_key COLLATE "C" > @start_after
+ORDER BY object_key COLLATE "C", created_at ASC
 LIMIT @max_keys;
 
+-- name: CountObjectsByPrefix :one
+-- Distinct keys, not copies: an object replicated three times is one object to
+-- an operator asking whether a bucket is empty. The prefix is escaped the same
+-- way ListObjectsByPrefix escapes it, so a bucket whose name contains a LIKE
+-- metacharacter counts its own keys rather than a wider set.
+SELECT count(DISTINCT object_key)
+FROM object_locations
+WHERE object_key LIKE @prefix::text || '%' ESCAPE '\';
+
 -- name: GetAllObjectLocations :many
-SELECT object_key, backend_name, size_bytes, encrypted, encryption_key, key_id, plaintext_size, content_hash, created_at
+SELECT object_key, backend_name, size_bytes, encrypted, encryption_key, key_id, plaintext_size, content_hash, compression_algorithm, compression_level, compression_format_version, logical_size, etag, content_type, user_metadata, created_at, last_scrubbed_at
 FROM object_locations
 WHERE object_key = $1
 ORDER BY created_at ASC;
 
 -- name: InsertObjectLocationIfNotExists :one
-INSERT INTO object_locations (object_key, backend_name, size_bytes, encrypted, encryption_key, key_id, plaintext_size, content_hash, created_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+INSERT INTO object_locations (object_key, backend_name, size_bytes, encrypted, encryption_key, key_id, plaintext_size, content_hash, compression_algorithm, compression_level, compression_format_version, logical_size, etag, content_type, user_metadata, managed, created_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
 ON CONFLICT (object_key, backend_name) DO NOTHING
 RETURNING true AS inserted;
 
@@ -114,11 +145,33 @@ GROUP BY name, is_dir
 ORDER BY is_dir DESC, name ASC;
 
 -- name: ListExpiredObjects :many
-SELECT DISTINCT ON (object_key) object_key, backend_name, size_bytes, created_at
-FROM object_locations
-WHERE object_key LIKE @prefix::text || '%' ESCAPE '\'
-  AND created_at < @cutoff
-ORDER BY object_key, created_at ASC
+-- Collated for the same reason as ListObjectsByPrefix. The expiry worker does
+-- not depend on the order, but a batch that differs by engine is one more thing
+-- an operator has to hold in their head when a run is reproduced elsewhere.
+--
+-- The tag filter is a correlated subquery rather than a join: a join against
+-- object_tags multiplies the row per matching tag, and this query's DISTINCT ON
+-- and its matching ORDER BY are what reduce an object's replicas to one row.
+-- Counting in a subquery leaves both untouched.
+--
+-- Requiring the count to equal tag_count is what makes several tags an AND.
+-- The primary key allows one row per (object_key, tag_key), so a count equal to
+-- the number of pairs asked for means every one of them matched.
+SELECT DISTINCT ON (ol.object_key COLLATE "C") ol.object_key, ol.backend_name, ol.size_bytes, ol.created_at
+FROM object_locations ol
+WHERE ol.object_key LIKE @prefix::text || '%' ESCAPE '\'
+  AND ol.created_at < @cutoff
+  AND (
+    @tag_count::int = 0
+    OR (
+      SELECT COUNT(*)
+      FROM object_tags t
+      JOIN jsonb_each_text(@tags::jsonb) AS f(k, v)
+        ON t.tag_key = f.k AND t.tag_value = f.v
+      WHERE t.object_key = ol.object_key
+    ) = @tag_count::int
+  )
+ORDER BY ol.object_key COLLATE "C", ol.created_at ASC
 LIMIT @max_keys;
 
 -- name: BackendObjectStats :one
@@ -141,60 +194,276 @@ UPDATE object_locations
 SET encryption_key = $3, key_id = $4
 WHERE object_key = $1 AND backend_name = $2;
 
+-- name: CountUnencryptedLocations :one
+-- Copies still stored as plaintext. Uses the same predicate as
+-- ListUnencryptedLocations, so the figure is exactly what encrypt-existing
+-- would process rather than a differently-scoped count that happens to be near
+-- it.
+SELECT count(*) FROM object_locations WHERE encrypted = FALSE;
+
+-- name: CompressionStats :many
+-- What compression is worth, per backend. Only encoded copies are counted:
+-- including the verbatim ones would report a ratio no encoder produced. The
+-- saving is logical - stored, left to the caller so it cannot disagree with the
+-- two figures it comes from.
+SELECT backend_name,
+       count(*) AS objects,
+       COALESCE(SUM(logical_size), 0)::bigint AS logical_bytes,
+       COALESCE(SUM(size_bytes), 0)::bigint AS stored_bytes
+FROM object_locations
+WHERE compression_algorithm IS NOT NULL
+GROUP BY backend_name;
+
 -- name: ListUnencryptedLocations :many
-SELECT object_key, backend_name, size_bytes
+-- Paged by cursor rather than offset. Encrypting a copy takes it out of this
+-- predicate, so the set shrinks as encrypt-existing walks it and an offset
+-- would step over the rows that moved up.
+--
+-- An empty backend_filter selects every backend, which is what a pass over the
+-- whole fleet asks for. Filtering here rather than after the page is read is
+-- what keeps the row_limit spent on candidates the pass will act on.
+SELECT object_key, backend_name, size_bytes, etag
 FROM object_locations
 WHERE encrypted = FALSE
+  AND (sqlc.arg(backend_filter)::text = '' OR backend_name = sqlc.arg(backend_filter)::text)
+  AND (object_key, backend_name) > (sqlc.arg(after_key)::text, sqlc.arg(after_backend)::text)
 ORDER BY object_key, backend_name
-LIMIT $1 OFFSET $2;
+LIMIT sqlc.arg(row_limit);
 
--- name: MarkObjectEncrypted :exec
+-- name: MarkObjectEncrypted :execrows
+--
+-- Committed only while the row still reports the etag the transform read. A
+-- client writing the key mid-pass changes it, and the bytes this would describe
+-- are then no longer the bytes stored - so no row matches and the caller skips
+-- the copy. IS NOT DISTINCT FROM rather than =, so a row that carried no etag
+-- and gained one from a client write fails the check instead of matching NULL.
 UPDATE object_locations
 SET encrypted = TRUE,
     encryption_key = $3,
     key_id = $4,
     plaintext_size = $5,
     size_bytes = $6
-WHERE object_key = $1 AND backend_name = $2;
+WHERE object_key = $1 AND backend_name = $2
+  AND etag IS NOT DISTINCT FROM sqlc.narg(expected_etag)::text;
 
 -- name: ListAllEncryptedLocations :many
-SELECT object_key, backend_name, size_bytes, encryption_key, key_id, plaintext_size
+-- Cursor-paged for the same reason as ListUnencryptedLocations: decrypting a
+-- copy removes it from this set mid-walk.
+SELECT object_key, backend_name, size_bytes, encryption_key, key_id, plaintext_size, etag
 FROM object_locations
 WHERE encrypted = TRUE
+  AND (sqlc.arg(backend_filter)::text = '' OR backend_name = sqlc.arg(backend_filter)::text)
+  AND (object_key, backend_name) > (sqlc.arg(after_key)::text, sqlc.arg(after_backend)::text)
 ORDER BY object_key, backend_name
-LIMIT $1 OFFSET $2;
+LIMIT sqlc.arg(row_limit);
 
--- name: MarkObjectDecrypted :exec
+-- name: ListUncompressedLocations :many
+-- Copies whose stored bytes carry no encoding, which is what compress-existing
+-- rewrites. The encryption columns come along because compression sits inside
+-- encryption: an encrypted copy is decrypted, encoded, and re-encrypted under
+-- the key it already had.
+--
+-- Paged by cursor, not offset: an encoded copy leaves this predicate, so the
+-- set shrinks under the pass walking it.
+--
+-- Copies already measured as not worth encoding are excluded here rather than
+-- downloaded and encoded again to reach the same verdict, which on an
+-- incompressible fleet is the pass's largest wasted expense. The stored
+-- measurement is judged against the current settings, so it excludes a copy
+-- only while it would still be declined: lowering min_ratio returns those
+-- copies to the pass without reading any of them. A probe taken at a different
+-- level says nothing about this one and is ignored, since the levels are names
+-- from an ordered set rather than numbers.
+--
+-- The divisor is NULLIF'd because a zero-length copy cannot shrink: the
+-- comparison goes NULL and the row is excluded, matching WorthStoring, which
+-- declines a logical size of zero outright.
+--
+-- The size floor is applied here for the same reason, one the row can answer:
+-- a copy below it is never a candidate, so listing it only to decline it costs
+-- a page slot on every pass forever.
+SELECT object_key, backend_name, size_bytes, encrypted, encryption_key, key_id,
+       plaintext_size, compression_algorithm, compression_level,
+       compression_format_version, logical_size, etag
+FROM object_locations
+WHERE compression_algorithm IS NULL
+  AND (sqlc.arg(backend_filter)::text = '' OR backend_name = sqlc.arg(backend_filter)::text)
+  AND (CASE WHEN encrypted THEN plaintext_size ELSE size_bytes END) >= sqlc.arg(min_size)::bigint
+  AND (compression_probe_size IS NULL
+       OR compression_probe_level IS DISTINCT FROM sqlc.arg(probe_level)::text
+       OR compression_probe_size::float8
+          / NULLIF(CASE WHEN encrypted THEN plaintext_size ELSE size_bytes END, 0)::float8
+          <= sqlc.arg(min_ratio)::float8)
+  AND (object_key, backend_name) > (sqlc.arg(after_key)::text, sqlc.arg(after_backend)::text)
+ORDER BY object_key, backend_name
+LIMIT sqlc.arg(row_limit);
+
+-- name: ListCompressedLocations :many
+-- The complement of ListUncompressedLocations, which is what
+-- decompress-existing rewrites. Cursor-paged for the same reason, and the case
+-- that makes it matter most: every object this pass succeeds on leaves the
+-- predicate, so an offset walk would skip whole pages and stop early.
+SELECT object_key, backend_name, size_bytes, encrypted, encryption_key, key_id,
+       plaintext_size, compression_algorithm, compression_level,
+       compression_format_version, logical_size, etag
+FROM object_locations
+WHERE compression_algorithm IS NOT NULL
+  AND (sqlc.arg(backend_filter)::text = '' OR backend_name = sqlc.arg(backend_filter)::text)
+  AND (object_key, backend_name) > (sqlc.arg(after_key)::text, sqlc.arg(after_backend)::text)
+ORDER BY object_key, backend_name
+LIMIT sqlc.arg(row_limit);
+
+-- name: MarkObjectCompressed :execrows
+-- Records how a rewritten copy is now stored. A NULL algorithm is the
+-- decompress direction, which also clears the columns that only describe an
+-- encoding. The envelope columns are rewritten too: re-encrypting an object
+-- mints a new base nonce and wrapped key, so leaving the old ones would
+-- describe bytes nothing can decrypt.
+--
+-- Committed only while the row still reports the etag the transform read. A
+-- client writing the key mid-pass changes it, and the bytes this would describe
+-- are then no longer the bytes stored - so no row matches and the caller skips
+-- the copy. IS NOT DISTINCT FROM rather than =, so a row that carried no etag
+-- and gained one from a client write fails the check instead of matching NULL.
+UPDATE object_locations
+SET compression_algorithm = $3,
+    compression_level = $4,
+    compression_format_version = $5,
+    logical_size = $6,
+    size_bytes = $7,
+    plaintext_size = $8,
+    encryption_key = $9,
+    key_id = $10
+WHERE object_key = $1 AND backend_name = $2
+  AND etag IS NOT DISTINCT FROM sqlc.narg(expected_etag)::text;
+
+-- name: RecordCompressionProbe :exec
+-- Records what the encoder produced for a copy it declined to store compressed,
+-- so the next pass reaches the same verdict from the row instead of downloading
+-- and encoding the object again.
+--
+-- Only the min_ratio decline writes here. A min_size decline is answered from
+-- the row at no cost, a copy declined by usage limits never reached the encoder,
+-- and a failure measured nothing.
+UPDATE object_locations
+SET compression_probe_size = $3,
+    compression_probe_level = $4
+WHERE object_key = $1 AND backend_name = $2;
+
+-- name: MarkObjectDecrypted :execrows
+--
+-- Committed only while the row still reports the etag the transform read. A
+-- client writing the key mid-pass changes it, and the bytes this would describe
+-- are then no longer the bytes stored - so no row matches and the caller skips
+-- the copy. IS NOT DISTINCT FROM rather than =, so a row that carried no etag
+-- and gained one from a client write fails the check instead of matching NULL.
 UPDATE object_locations
 SET encrypted = FALSE,
     encryption_key = NULL,
     key_id = NULL,
     size_bytes = $3,
     plaintext_size = NULL
+WHERE object_key = $1 AND backend_name = $2
+  AND etag IS NOT DISTINCT FROM sqlc.narg(expected_etag)::text;
+
+-- name: GetLeastRecentlyScrubbedObjects :many
+-- Return the copies least recently touched, by verification or by writing.
+--
+-- Falling back to created_at is what keeps the sweep alive on a busy fleet: a
+-- copy written moments ago sorts to the back rather than jumping the queue, so
+-- a write rate above the scrub rate cannot starve older data. It also puts the
+-- effort where rot actually accumulates, since churn is deleted long before it
+-- degrades while the copies that persist for months are the ones at risk.
+--
+-- backend_names restricts the batch to copies the scrubber can afford to read.
+-- Filtering here rather than after selection is what keeps a sweep useful when
+-- a backend is over its usage limit: a copy the scrubber would decline never
+-- occupies a slot, so it is neither stamped as examined nor left at the head of
+-- the queue to be re-selected every cycle.
+SELECT object_key, backend_name, size_bytes, encrypted, encryption_key, key_id, plaintext_size, content_hash, compression_algorithm, compression_level, compression_format_version, logical_size, created_at, last_scrubbed_at
+FROM object_locations
+WHERE content_hash IS NOT NULL AND managed
+  AND backend_name = ANY(@backend_names::text[])
+ORDER BY COALESCE(last_scrubbed_at, created_at) ASC, object_key ASC
+LIMIT @row_limit;
+
+-- name: CountScrubCandidatesOnBackends :one
+-- Copies eligible for scrubbing that live on the named backends. Used to report
+-- how much of the queue a cycle declined to read, which a sampled count of the
+-- batch cannot show.
+SELECT count(*)
+FROM object_locations
+WHERE content_hash IS NOT NULL AND managed
+  AND backend_name = ANY(@backend_names::text[]);
+
+-- name: MarkObjectScrubbed :exec
+-- Stamp a copy the scrubber just examined. Applied to every attempted copy,
+-- not only the ones that verified: a copy that cannot be read would otherwise
+-- stay at the head of the queue and starve the rest of the sweep.
+UPDATE object_locations
+SET last_scrubbed_at = NOW()
 WHERE object_key = $1 AND backend_name = $2;
 
--- name: GetRandomHashedObjects :many
--- Return random object locations that have a content hash, for scrubber
--- verification. Uses TABLESAMPLE to avoid a full table sort, then filters
--- and limits. The sample percentage is generous (10%) to ensure enough rows
--- pass the WHERE filter; the LIMIT caps the final result.
-SELECT object_key, backend_name, size_bytes, encrypted, encryption_key, key_id, plaintext_size, content_hash, created_at
-FROM object_locations TABLESAMPLE BERNOULLI (10)
-WHERE content_hash IS NOT NULL
-LIMIT $1;
+-- name: IntegrityCoverage :one
+-- How far behind verification is, split by whether the sweep can reach the copy
+-- at all. Reachable is the same backend set the scrub queue draws from.
+--
+-- The age and the never-verified count cover reachable copies only. A copy the
+-- sweep is not allowed to read can never be stamped, so counting it pins
+-- MIN(COALESCE(last_scrubbed_at, created_at)) to a fixed timestamp and the age
+-- then tracks wall clock rather than the backlog: it climbs by a day every day
+-- no matter how much the sweep verifies, and no amount of scrubbing lowers it.
+--
+-- Deferred counts the rest rather than discarding them, so a fleet holding most
+-- of its copies on a backend over its usage limit cannot report as healthy.
+--
+-- The age falls back to created_at exactly as the queue ordering does, so a
+-- never-verified copy is measured from when it was written. Taking MIN over
+-- last_scrubbed_at alone skips those rows entirely, which reports a fleet that
+-- has never been scrubbed as an age of zero.
+SELECT
+    COALESCE(EXTRACT(EPOCH FROM (NOW() - MIN(COALESCE(last_scrubbed_at, created_at))
+        FILTER (WHERE backend_name = ANY(@reachable_backends::text[])))), 0)::bigint AS age_seconds,
+    COUNT(*) FILTER (WHERE last_scrubbed_at IS NULL
+        AND backend_name = ANY(@reachable_backends::text[]))::bigint AS never_verified,
+    COUNT(*) FILTER (WHERE NOT (backend_name = ANY(@reachable_backends::text[])))::bigint AS deferred
+FROM object_locations
+WHERE content_hash IS NOT NULL AND managed;
 
 -- name: GetObjectsWithoutHash :many
--- Return object locations that have no content hash, for backfill.
-SELECT object_key, backend_name, size_bytes, encrypted, encryption_key, key_id, plaintext_size, content_hash, created_at
+-- Return object locations that have no content hash, for backfill. Hashing
+-- reads the whole body, so unmanaged rows are left alone rather than spending
+-- egress on data the orchestrator does not manage.
+SELECT object_key, backend_name, size_bytes, encrypted, encryption_key, key_id, plaintext_size, content_hash, compression_algorithm, compression_level, compression_format_version, logical_size, created_at
 FROM object_locations
-WHERE content_hash IS NULL
+WHERE content_hash IS NULL AND managed
+  AND (sqlc.arg(backend_filter)::text = '' OR backend_name = sqlc.arg(backend_filter)::text)
 ORDER BY created_at ASC
-LIMIT $1 OFFSET $2;
+LIMIT sqlc.arg(row_limit) OFFSET sqlc.arg(row_offset);
 
 -- name: UpdateContentHash :exec
+-- Record the hash the backfill pass computed and stamp the copy as verified in
+-- the same statement. The pass read the whole body to produce the digest, so the
+-- copy is verified by construction at that moment. Leaving last_scrubbed_at NULL
+-- would report it as never verified and sort it to the head of the scrub queue
+-- on its original created_at, so the next sweep would re-read the same bytes.
 UPDATE object_locations
-SET content_hash = $3
+SET content_hash = $3, last_scrubbed_at = NOW()
 WHERE object_key = $1 AND backend_name = $2;
+
+-- RecordObjectIdentity fills in what a read had to ask a backend for, so the
+-- next one does not. Every copy of the key is written, not just the one that
+-- answered: a per-copy value is what lets a failover change the ETag under a
+-- conditional request, which is the divergence this column exists to end.
+--
+-- Only NULL columns are filled. A recorded identity is what the write computed
+-- over the client's own bytes, and a backend's answer must never overwrite it.
+-- name: RecordObjectIdentity :exec
+UPDATE object_locations
+SET etag          = COALESCE(etag, sqlc.narg('etag')),
+    content_type  = COALESCE(content_type, sqlc.narg('content_type')),
+    user_metadata = COALESCE(user_metadata, sqlc.narg('user_metadata'))
+WHERE object_key = $1;
 
 -- name: GetCopiesForKeysForUpdate :many
 -- Returns (object_key, backend_name, size_bytes) for every row matching
@@ -280,10 +549,11 @@ SELECT
         ELSE w.k END)::text AS skip_bound,
     COALESCE(leaf.backend_name, '')::text AS backend_name,
     COALESCE(leaf.size_bytes, 0)::bigint AS size_bytes,
+    COALESCE(leaf.etag, '')::text AS etag,
     COALESCE(leaf.created_at, to_timestamp(0)) AS created_at
 FROM walk w
 LEFT JOIN LATERAL (
-    SELECT backend_name, size_bytes, created_at
+    SELECT backend_name, size_bytes, etag, created_at
       FROM object_locations o2
      WHERE o2.object_key = w.k
        AND position(@delim::text IN substr(w.k, length(@prefix::text) + 1)) = 0

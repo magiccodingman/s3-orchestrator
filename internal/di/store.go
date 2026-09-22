@@ -23,25 +23,65 @@ import (
 	"github.com/afreidah/s3-orchestrator/internal/config"
 	"github.com/afreidah/s3-orchestrator/internal/instanceid"
 	"github.com/afreidah/s3-orchestrator/internal/observe/logfmt"
-	"github.com/afreidah/s3-orchestrator/internal/proxy/metrics"
 	"github.com/afreidah/s3-orchestrator/internal/store"
 	"github.com/afreidah/s3-orchestrator/internal/store/core"
 	"github.com/afreidah/s3-orchestrator/internal/store/postgres"
 	sqlitestore "github.com/afreidah/s3-orchestrator/internal/store/sqlite"
 )
 
-// ProvideMetadataStore opens the configured driver, runs migrations,
-// syncs quota limits, and returns the wide core.MetadataStore every
-// consumer depends on. CB protection lives inside each driver's DBTX/DB
-// chokepoint, so this provider does no wrapping of its own.
-func ProvideMetadataStore(i do.Injector) (core.MetadataStore, error) {
-	cfg, err := do.Invoke[*config.Config](i)
-	if err != nil {
-		return nil, err
-	}
-	cb, err := do.Invoke[*breaker.CircuitBreaker](i)
-	if err != nil {
-		return nil, err
+// -------------------------------------------------------------------------
+// TYPES
+// -------------------------------------------------------------------------
+
+// metadataStore is the union of every store role, and exists only so the
+// composition root can carry one opened engine from openStore to the
+// do.MustAs role aliases in injector.go.
+//
+// Unexported on purpose. The union is not a domain fact: nothing in the
+// persistence domain requires one object to implement all seventeen roles,
+// and a design that split persistence across several objects would satisfy
+// every role interface without violating anything. What it actually encodes
+// is that this package holds one opened value before splitting it, which is
+// wiring. Keeping it unnameable outside di is what stops it being taken as a
+// dependency, since consumers cannot depend on a type they cannot write down.
+//
+// Each engine also carries per-role compile-time assertions, so a driver that
+// drops a method names the role rather than the union.
+type metadataStore interface {
+	core.ObjectStore
+	core.QuotaStore
+	core.MultipartStore
+	core.ReplicationStore
+	core.CleanupStore
+	core.PendingStore
+	core.IntegrityStore
+	core.ExpiredObjectsLister
+	core.BackendLifecycleStore
+	core.UsageFlusher
+	core.AdvisoryLocker
+	core.DashboardStore
+	core.LifecycleAdmin
+	core.EncryptionAdmin
+	core.CompressionAdmin
+	core.NotificationOutbox
+	core.TagStore
+	core.ProvisioningStore
+}
+
+// -------------------------------------------------------------------------
+// INTERNALS
+// -------------------------------------------------------------------------
+
+// provideMetadataStore opens the configured driver, runs migrations, syncs
+// quota limits, and returns the opened engine for the role aliases to split.
+// CB protection lives inside each driver's DBTX/DB chokepoint, so this
+// provider does no wrapping of its own.
+func provideMetadataStore(i do.Injector) (metadataStore, error) {
+	r := newResolver(i)
+	cfg := r.Resolve[*config.Config]()
+	cb := r.Resolve[*breaker.CircuitBreaker]()
+	if r.err != nil {
+		return nil, r.err
 	}
 	ctx := context.Background()
 
@@ -66,24 +106,6 @@ func ProvideMetadataStore(i do.Injector) (core.MetadataStore, error) {
 	return cs, nil
 }
 
-// ProvideLifecycleAdmin aliases the wide MetadataStore as its LifecycleAdmin
-// role for boot/shutdown migrations, schema checks, and Close.
-func ProvideLifecycleAdmin(i do.Injector) (core.LifecycleAdmin, error) {
-	return do.Invoke[core.MetadataStore](i)
-}
-
-// ProvideEncryptionAdmin aliases the wide MetadataStore as its EncryptionAdmin
-// role for the admin HTTP handler's key rotation and encrypt/decrypt batch ops.
-func ProvideEncryptionAdmin(i do.Injector) (core.EncryptionAdmin, error) {
-	return do.Invoke[core.MetadataStore](i)
-}
-
-// ProvideNotificationOutbox aliases the wide MetadataStore as its
-// NotificationOutbox role for the notifier worker.
-func ProvideNotificationOutbox(i do.Injector) (core.NotificationOutbox, error) {
-	return do.Invoke[core.MetadataStore](i)
-}
-
 // ProvideDatabaseBreaker constructs the shared *breaker.CircuitBreaker every
 // driver-level SQL statement forwards calls through.
 func ProvideDatabaseBreaker(i do.Injector) (*breaker.CircuitBreaker, error) {
@@ -98,7 +120,7 @@ func ProvideDatabaseBreaker(i do.Injector) (*breaker.CircuitBreaker, error) {
 // shared *breaker.CircuitBreaker is threaded through so every SQL
 // statement (pool-bound or tx-bound) gets PreCheck/PostCheck protection
 // at the driver chokepoint.
-func openStore(ctx context.Context, dbCfg *config.DatabaseConfig, cb *breaker.CircuitBreaker) (core.MetadataStore, error) {
+func openStore(ctx context.Context, dbCfg *config.DatabaseConfig, cb *breaker.CircuitBreaker) (metadataStore, error) {
 	switch dbCfg.Driver {
 	case "postgres":
 		return postgres.NewStore(ctx, dbCfg, cb)
@@ -114,10 +136,4 @@ func openStore(ctx context.Context, dbCfg *config.DatabaseConfig, cb *breaker.Ci
 // at first invoke and reused everywhere the value is needed.
 func ProvideInstanceID(_ do.Injector) (instanceid.ID, error) {
 	return instanceid.New()
-}
-
-// ProvideMetricsDeps aliases the wide MetadataStore as the metrics.Deps
-// subset metrics.Collector uses to refresh Prometheus gauges.
-func ProvideMetricsDeps(i do.Injector) (metrics.Deps, error) {
-	return do.Invoke[core.MetadataStore](i)
 }

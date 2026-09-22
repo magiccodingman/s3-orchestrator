@@ -6,9 +6,9 @@
 // Hand-rolled fakes for the narrow consumer interfaces (BackendOps,
 // ReplicatorOps, OverReplicationOps, ScrubberOps, Reconciler) so the
 // success branches of handlers that otherwise required a full
-// BackendManager + worker fleet stay exercised. Pairs with the existing
+// backend runtime + worker fleet stay exercised. Pairs with the existing
 // handler_manager_test.go which covers the empty/skip paths via a real
-// manager.
+// stack.
 // -------------------------------------------------------------------------------
 
 package admin
@@ -20,139 +20,36 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
+	"time"
 
-	"github.com/afreidah/s3-orchestrator/internal/backend"
+	"go.uber.org/mock/gomock"
+
 	"github.com/afreidah/s3-orchestrator/internal/config"
 	"github.com/afreidah/s3-orchestrator/internal/observe/logfmt"
-	"github.com/afreidah/s3-orchestrator/internal/progress"
+	"github.com/afreidah/s3-orchestrator/internal/ops/opstest"
 	"github.com/afreidah/s3-orchestrator/internal/proxy/dashboard"
 	"github.com/afreidah/s3-orchestrator/internal/store/core"
+	"github.com/afreidah/s3-orchestrator/internal/transport/admin/adminapi"
+	"github.com/afreidah/s3-orchestrator/internal/transport/admin/adminstream"
+	"github.com/afreidah/s3-orchestrator/internal/transport/auth"
 	"github.com/afreidah/s3-orchestrator/internal/worker"
 )
 
-// -------------------------------------------------------------------------
-// FAKES
-// -------------------------------------------------------------------------
-
-type fakeBackendOps struct {
-	dashData     *dashboard.Data
-	dashErr      error
-	flushErr     error
-	intCfg       *config.IntegrityConfig
-	reconcileMap map[string]int64
-	reconcileErr error
-}
-
-func (f *fakeBackendOps) GetDashboardData(_ context.Context) (*dashboard.Data, error) {
-	return f.dashData, f.dashErr
-}
-func (f *fakeBackendOps) FlushUsage(_ context.Context) error { return f.flushErr }
-func (f *fakeBackendOps) ReconcileUsage(_ context.Context) (map[string]int64, error) {
-	return f.reconcileMap, f.reconcileErr
-}
-func (f *fakeBackendOps) RecordUsage(_ string, _, _, _ int64) {}
-func (f *fakeBackendOps) IntegrityConfig() *config.IntegrityConfig { return f.intCfg }
-
-// fakeRuntimeOps is the RuntimeOps double: the runtime surface the handler
-// reaches directly. GetBackend errors by default (rewrite tests cover the
-// not-found branch); UpdateQuotaMetrics is a no-op success.
-type fakeRuntimeOps struct{}
-
-func (fakeRuntimeOps) GetBackend(_ string) (backend.ObjectBackend, error) {
-	return nil, errors.New("no backend")
-}
-func (fakeRuntimeOps) UpdateQuotaMetrics(_ context.Context) error { return nil }
-
-type fakeReplicator struct {
-	cfg     *config.ReplicationConfig
-	created int
-	err     error
-}
-
-func (f *fakeReplicator) Config() *config.ReplicationConfig { return f.cfg }
-func (f *fakeReplicator) Replicate(_ context.Context, _ config.ReplicationConfig, observer progress.Observer) (int, error) {
-	for range f.created {
-		progress.Track(observer, "fake-key", func() string { return progress.StatusOK })
-	}
-	return f.created, f.err
-}
-
-type fakeOverRep struct {
-	cfg      *config.ReplicationConfig
-	count    int64
-	countErr error
-	cleaned  int
-	cleanErr error
-}
-
-func (f *fakeOverRep) Config() *config.ReplicationConfig { return f.cfg }
-func (f *fakeOverRep) CountPending(_ context.Context, _ int) (int64, error) {
-	return f.count, f.countErr
-}
-func (f *fakeOverRep) Clean(_ context.Context, _ config.ReplicationConfig, observer progress.Observer) (int, error) {
-	for range f.cleaned {
-		progress.Track(observer, "fake-key", func() string { return progress.StatusOK })
-	}
-	return f.cleaned, f.cleanErr
-}
-
-type fakeScrubber struct {
-	scrubChecked, scrubFailed int
-	backfillProcessed         int
-	backfillMore              bool // when true, always report another batch (nextOffset != 0)
-	backfillCalls             int
-}
-
-func (f *fakeScrubber) Scrub(_ context.Context, _ int, observer progress.Observer) worker.WorkSummary {
-	for range f.scrubChecked {
-		progress.Track(observer, "fake-key", func() string { return progress.StatusOK })
-	}
-	return worker.WorkSummary{Attempted: f.scrubChecked, Succeeded: f.scrubChecked - f.scrubFailed, Failed: f.scrubFailed}
-}
-func (f *fakeScrubber) Backfill(_ context.Context, batchSize, offset int, observer progress.Observer) (worker.WorkSummary, int) {
-	f.backfillCalls++
-	for range f.backfillProcessed {
-		progress.Track(observer, "fake-key", func() string { return progress.StatusOK })
-	}
-	sum := worker.WorkSummary{Attempted: f.backfillProcessed, Succeeded: f.backfillProcessed}
-	if f.backfillMore {
-		return sum, offset + batchSize
-	}
-	// One batch processed, then signal done with nextOffset=0.
-	return sum, 0
-}
-
-type fakeReconciler struct {
-	result *worker.ReconcileResult
-	err    error
-}
-
-func (f *fakeReconciler) Reconcile(_ context.Context, _ string) (*worker.ReconcileResult, error) {
-	return f.result, f.err
-}
-
-func (f *fakeReconciler) ReconcileStreaming(_ context.Context, _ string, observer progress.Observer) (*worker.ReconcileResult, error) {
-	if f.err != nil {
-		return nil, f.err
-	}
-	progress.Track(observer, "fake-backend", func() string { return progress.StatusOK })
-	return f.result, f.err
-}
-
-// newCoverageHandler builds a Handler wired entirely from the lightweight
-// fakes above so each test can dial in the precise branch it wants to
-// exercise without standing up a BackendManager.
-func newCoverageHandler() *Handler {
+// newCoverageHandler builds a Handler wired entirely from the generated ops
+// mocks, so each test can dial in the precise branch it wants to exercise
+// without standing up a backend runtime.
+func newCoverageHandler(t *testing.T) *Handler {
+	t.Helper()
 	var lv slog.LevelVar
 	lv.Set(slog.LevelInfo)
 	return &Handler{
-		log:        slog.Default().With(logfmt.Component("admin")),
-		runtimeOps: fakeRuntimeOps{},
-		token:      "test-token",
-		logLevel:   &lv,
-		dbHealthy:  func() bool { return true },
+		log:       slog.Default().With(logfmt.Component("admin")),
+		registry:  func() *auth.BucketRegistry { return rootRegistry(t) },
+		logLevel:  &lv,
+		dbHealthy: func() bool { return true },
 	}
 }
 
@@ -165,16 +62,14 @@ func newCoverageHandler() *Handler {
 // ObjectCounts, and UsageStats lookups all succeeding for the same key.
 func TestHandleStatus_PopulatedDashboard(t *testing.T) {
 	t.Parallel()
-	h := newCoverageHandler()
-	h.backendOps = &fakeBackendOps{
-		dashData: &dashboard.Data{
-			BackendOrder: []string{"b1"},
-			QuotaStats:   map[string]core.QuotaStat{"b1": {BytesUsed: 100, BytesLimit: 1000}},
-			ObjectCounts: map[string]int64{"b1": 5},
-			UsageStats:   map[string]core.UsageStat{"b1": {APIRequests: 3, IngressBytes: 50, EgressBytes: 25}},
-			UsagePeriod:  "2026-05",
-		},
-	}
+	h := newCoverageHandler(t)
+	h.dashboardOps = newDashboardOps(t, &dashboard.Data{
+		BackendOrder: []string{"b1"},
+		QuotaStats:   map[string]core.QuotaStat{"b1": {BytesUsed: 100, BytesLimit: 1000}},
+		ObjectCounts: map[string]int64{"b1": 5},
+		UsageStats:   map[string]core.UsageStat{"b1": {APIRequests: 3, IngressBytes: 50, EgressBytes: 25}},
+		UsagePeriod:  "2026-05",
+	}, nil)
 
 	w := httptest.NewRecorder()
 	h.handleStatus(w, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/admin/api/status", nil))
@@ -204,8 +99,8 @@ func TestHandleStatus_PopulatedDashboard(t *testing.T) {
 // path that the existing skip-only test never reaches.
 func TestHandleOverReplicationStatus_Configured(t *testing.T) {
 	t.Parallel()
-	h := newCoverageHandler()
-	h.overRep = &fakeOverRep{cfg: &config.ReplicationConfig{Factor: 2}, count: 7}
+	h := newCoverageHandler(t)
+	replicationWith(t, h, replicatorStub{}, overRepStub{cfg: &config.ReplicationConfig{Factor: 2}, count: 7})
 
 	w := httptest.NewRecorder()
 	h.handleOverReplicationStatus(w, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/admin/api/over-replication", nil))
@@ -213,18 +108,47 @@ func TestHandleOverReplicationStatus_Configured(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
 	}
-	var resp map[string]any
+	var resp adminapi.OverReplicationStatusResponse
 	_ = json.NewDecoder(w.Body).Decode(&resp)
-	if resp["pending"].(float64) != 7 {
-		t.Errorf("pending = %v, want 7", resp["pending"])
+	if resp.Pending != 7 || resp.Factor != 2 {
+		t.Errorf("got factor=%d pending=%d, want 2/7", resp.Factor, resp.Pending)
+	}
+	// Status reports "ok" on the configured branch so the field means the same
+	// thing here as on the endpoints that act.
+	if resp.Status != "ok" || resp.Reason != "" {
+		t.Errorf("got status=%q reason=%q, want ok with no reason", resp.Status, resp.Reason)
+	}
+}
+
+// TestHandleOverReplicationStatus_Unconfigured pins the skipped branch: zeroed
+// counts carrying the same status vocabulary as the replicate and clean
+// endpoints rather than a sentence in the status field.
+func TestHandleOverReplicationStatus_Unconfigured(t *testing.T) {
+	t.Parallel()
+	h := newCoverageHandler(t)
+	replicationWith(t, h, replicatorStub{}, overRepStub{cfg: &config.ReplicationConfig{Factor: 1}})
+
+	w := httptest.NewRecorder()
+	h.handleOverReplicationStatus(w, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/admin/api/over-replication", nil))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	var resp adminapi.OverReplicationStatusResponse
+	_ = json.NewDecoder(w.Body).Decode(&resp)
+	if resp.Status != "skipped" || resp.Reason == "" {
+		t.Errorf("got status=%q reason=%q, want skipped with a reason", resp.Status, resp.Reason)
+	}
+	if resp.Factor != 0 || resp.Pending != 0 {
+		t.Errorf("got factor=%d pending=%d, want both zero", resp.Factor, resp.Pending)
 	}
 }
 
 // TestHandleOverReplicationStatus_CountError exercises the error branch.
 func TestHandleOverReplicationStatus_CountError(t *testing.T) {
 	t.Parallel()
-	h := newCoverageHandler()
-	h.overRep = &fakeOverRep{cfg: &config.ReplicationConfig{Factor: 2}, countErr: errors.New("db down")}
+	h := newCoverageHandler(t)
+	replicationWith(t, h, replicatorStub{}, overRepStub{cfg: &config.ReplicationConfig{Factor: 2}, countErr: errors.New("db down")})
 
 	w := httptest.NewRecorder()
 	h.handleOverReplicationStatus(w, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/admin/api/over-replication", nil))
@@ -238,9 +162,9 @@ func TestHandleOverReplicationStatus_CountError(t *testing.T) {
 // including the batch_size query parameter parser.
 func TestHandleOverReplicationClean_Configured(t *testing.T) {
 	t.Parallel()
-	h := newCoverageHandler()
-	h.backendOps = &fakeBackendOps{}
-	h.overRep = &fakeOverRep{cfg: &config.ReplicationConfig{Factor: 2, BatchSize: 5}, cleaned: 3}
+	h := newCoverageHandler(t)
+	h.backendOps = newBackendOps(t, backendOpsStub{})
+	replicationWith(t, h, replicatorStub{}, overRepStub{cfg: &config.ReplicationConfig{Factor: 2, BatchSize: 5}, cleaned: 3})
 
 	w := httptest.NewRecorder()
 	h.handleOverReplicationClean(w, httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/admin/api/over-replication?batch_size=100", nil))
@@ -263,8 +187,8 @@ func TestHandleOverReplicationClean_Configured(t *testing.T) {
 // returns the per-backend bytes_used corrections from the store.
 func TestHandleReconcileUsage_Success(t *testing.T) {
 	t.Parallel()
-	h := newCoverageHandler()
-	h.backendOps = &fakeBackendOps{reconcileMap: map[string]int64{"e2": -163}}
+	h := newCoverageHandler(t)
+	h.backendOps = newBackendOps(t, backendOpsStub{reconcileMap: map[string]int64{"e2": -163}})
 
 	w := httptest.NewRecorder()
 	h.handleReconcileUsage(w, httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/admin/api/usage-reconcile", nil))
@@ -272,10 +196,7 @@ func TestHandleReconcileUsage_Success(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
 	}
-	var resp struct {
-		Status      string           `json:"status"`
-		Adjustments map[string]int64 `json:"adjustments"`
-	}
+	var resp adminapi.UsageReconcileResponse
 	_ = json.NewDecoder(w.Body).Decode(&resp)
 	if resp.Status != "reconciled" {
 		t.Errorf("status = %q, want reconciled", resp.Status)
@@ -289,8 +210,8 @@ func TestHandleReconcileUsage_Success(t *testing.T) {
 // surfaces as a 500.
 func TestHandleReconcileUsage_Error(t *testing.T) {
 	t.Parallel()
-	h := newCoverageHandler()
-	h.backendOps = &fakeBackendOps{reconcileErr: errors.New("db down")}
+	h := newCoverageHandler(t)
+	h.backendOps = newBackendOps(t, backendOpsStub{reconcileErr: errors.New("db down")})
 
 	w := httptest.NewRecorder()
 	h.handleReconcileUsage(w, httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/admin/api/usage-reconcile", nil))
@@ -309,9 +230,9 @@ func TestHandleReconcileUsage_Error(t *testing.T) {
 // hook stay covered.
 func TestHandleReplicate_Configured(t *testing.T) {
 	t.Parallel()
-	h := newCoverageHandler()
-	h.backendOps = &fakeBackendOps{}
-	h.replicator = &fakeReplicator{cfg: &config.ReplicationConfig{Factor: 2}, created: 4}
+	h := newCoverageHandler(t)
+	h.backendOps = newBackendOps(t, backendOpsStub{})
+	replicationWith(t, h, replicatorStub{cfg: &config.ReplicationConfig{Factor: 2}, created: 4}, overRepStub{})
 
 	w := httptest.NewRecorder()
 	h.handleReplicate(w, httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/admin/api/replicate", nil))
@@ -324,6 +245,63 @@ func TestHandleReplicate_Configured(t *testing.T) {
 	if resp["copies_created"].(float64) != 4 {
 		t.Errorf("copies_created = %v, want 4", resp["copies_created"])
 	}
+	// A clean pass carries no failed key at all, so a client reading the field
+	// as "objects left under-replicated" is not handed a zero it must ignore.
+	if _, present := resp["failed"]; present {
+		t.Errorf("failed present on a clean pass: %v", resp["failed"])
+	}
+}
+
+// TestHandleReplicate_ReportsObjectsItCouldNotCopy asserts a pass that left
+// objects under-replicated says so. Without the field, an operator polling the
+// endpoint sees only the copies that landed and reads a half-done pass as done.
+func TestHandleReplicate_ReportsObjectsItCouldNotCopy(t *testing.T) {
+	t.Parallel()
+	h := newCoverageHandler(t)
+	h.backendOps = newBackendOps(t, backendOpsStub{})
+	replicationWith(t, h, replicatorStub{cfg: &config.ReplicationConfig{Factor: 2}, created: 1, failed: 3}, overRepStub{})
+
+	w := httptest.NewRecorder()
+	h.handleReplicate(w, httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/admin/api/replicate", nil))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	var resp adminapi.ReplicateResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.CopiesCreated != 1 || resp.Failed != 3 {
+		t.Errorf("got copies_created=%d failed=%d, want 1/3", resp.CopiesCreated, resp.Failed)
+	}
+	if resp.Status != statusOK {
+		t.Errorf("status = %q, want %q - a partial pass still ran", resp.Status, statusOK)
+	}
+}
+
+// TestHandleOverReplicationClean_ReportsObjectsItCouldNotClean asserts the
+// surplus a cleanup pass could not remove reaches the client.
+func TestHandleOverReplicationClean_ReportsObjectsItCouldNotClean(t *testing.T) {
+	t.Parallel()
+	h := newCoverageHandler(t)
+	h.backendOps = newBackendOps(t, backendOpsStub{})
+	replicationWith(t, h, replicatorStub{}, overRepStub{
+		cfg: &config.ReplicationConfig{Factor: 2}, cleaned: 2, failed: 1,
+	})
+
+	w := httptest.NewRecorder()
+	h.handleOverReplicationClean(w, httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/admin/api/over-replication", nil))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	var resp adminapi.OverReplicationCleanResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.CopiesRemoved != 2 || resp.Failed != 1 {
+		t.Errorf("got copies_removed=%d failed=%d, want 2/1", resp.CopiesRemoved, resp.Failed)
+	}
 }
 
 // -------------------------------------------------------------------------
@@ -334,9 +312,10 @@ func TestHandleReplicate_Configured(t *testing.T) {
 // the success-branch handler and the typed Scrub method stay covered.
 func TestHandleScrub_IntegrityEnabled(t *testing.T) {
 	t.Parallel()
-	h := newCoverageHandler()
-	h.backendOps = &fakeBackendOps{intCfg: &config.IntegrityConfig{Enabled: true, ScrubberBatchSize: 50}}
-	h.scrubber = &fakeScrubber{scrubChecked: 12, scrubFailed: 1}
+	h := newCoverageHandler(t)
+	integrityWith(t, h,
+		backendOpsStub{integrity: &config.IntegrityConfig{Enabled: true, ScrubberBatchSize: 50}},
+		&scrubberStub{scrubChecked: 12, scrubFailed: 1})
 
 	w := httptest.NewRecorder()
 	h.handleScrub(w, httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/admin/api/scrub?batch_size=10", nil))
@@ -344,10 +323,13 @@ func TestHandleScrub_IntegrityEnabled(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
 	}
-	var resp map[string]any
+	var resp adminapi.ScrubResponse
 	_ = json.NewDecoder(w.Body).Decode(&resp)
-	if resp["checked"].(float64) != 12 || resp["failed"].(float64) != 1 {
-		t.Errorf("counts wrong: %v", resp)
+	if resp.Checked != 12 || resp.Failed != 1 {
+		t.Errorf("got checked=%d failed=%d, want 12/1", resp.Checked, resp.Failed)
+	}
+	if resp.Status != "ok" || resp.Reason != "" {
+		t.Errorf("got status=%q reason=%q, want ok with no reason", resp.Status, resp.Reason)
 	}
 }
 
@@ -356,9 +338,10 @@ func TestHandleScrub_IntegrityEnabled(t *testing.T) {
 // paginated loop on the first batch.
 func TestHandleBackfillChecksums_IntegrityEnabled(t *testing.T) {
 	t.Parallel()
-	h := newCoverageHandler()
-	h.backendOps = &fakeBackendOps{intCfg: &config.IntegrityConfig{Enabled: true, ScrubberBatchSize: 50}}
-	h.scrubber = &fakeScrubber{backfillProcessed: 8}
+	h := newCoverageHandler(t)
+	integrityWith(t, h,
+		backendOpsStub{integrity: &config.IntegrityConfig{Enabled: true, ScrubberBatchSize: 50}},
+		&scrubberStub{backfillProcessed: 8})
 
 	w := httptest.NewRecorder()
 	h.handleBackfillChecksums(w, httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/admin/api/backfill-checksums", nil))
@@ -382,10 +365,11 @@ func TestHandleBackfillChecksums_IntegrityEnabled(t *testing.T) {
 // delay_ms exercises the inter-batch pacing path.
 func TestHandleBackfillChecksums_BoundedByMax(t *testing.T) {
 	t.Parallel()
-	h := newCoverageHandler()
-	h.backendOps = &fakeBackendOps{intCfg: &config.IntegrityConfig{Enabled: true, ScrubberBatchSize: 50}}
-	sc := &fakeScrubber{backfillProcessed: 10, backfillMore: true}
-	h.scrubber = sc
+	h := newCoverageHandler(t)
+	scrubs := &scrubberStub{backfillProcessed: 10, backfillMore: true}
+	integrityWith(t, h,
+		backendOpsStub{integrity: &config.IntegrityConfig{Enabled: true, ScrubberBatchSize: 50}},
+		scrubs)
 
 	w := httptest.NewRecorder()
 	h.handleBackfillChecksums(w, httptest.NewRequestWithContext(
@@ -403,8 +387,8 @@ func TestHandleBackfillChecksums_BoundedByMax(t *testing.T) {
 	if resp["done"] != false {
 		t.Errorf("done = %v, want false (backlog not drained)", resp["done"])
 	}
-	if sc.backfillCalls != 3 {
-		t.Errorf("backfillCalls = %d, want 3", sc.backfillCalls)
+	if scrubs.backfillCalls != 3 {
+		t.Errorf("backfillCalls = %d, want 3", scrubs.backfillCalls)
 	}
 }
 
@@ -416,8 +400,8 @@ func TestHandleBackfillChecksums_BoundedByMax(t *testing.T) {
 // configured reconciler returning non-zero counts.
 func TestHandleReconcile_Success(t *testing.T) {
 	t.Parallel()
-	h := newCoverageHandler()
-	h.reconciler = &fakeReconciler{result: &worker.ReconcileResult{Imported: 4, Removed: 1, BackendsScanned: 2}}
+	h := newCoverageHandler(t)
+	h.reconciler = newReconciler(t, &worker.ReconcileResult{Imported: 4, Removed: 1, BackendsScanned: 2}, nil)
 
 	w := httptest.NewRecorder()
 	h.handleReconcile(w, httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/admin/api/reconcile?backend=b1", nil))
@@ -436,34 +420,14 @@ func TestHandleReconcile_Success(t *testing.T) {
 // returns a non-nil error.
 func TestHandleReconcile_Error(t *testing.T) {
 	t.Parallel()
-	h := newCoverageHandler()
-	h.reconciler = &fakeReconciler{err: errors.New("scan failed")}
+	h := newCoverageHandler(t)
+	h.reconciler = newReconciler(t, nil, errors.New("scan failed"))
 
 	w := httptest.NewRecorder()
 	h.handleReconcile(w, httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/admin/api/reconcile", nil))
 
 	if w.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want 500; body=%s", w.Code, w.Body.String())
-	}
-}
-
-// -------------------------------------------------------------------------
-// BULK REWRITE ROW ADAPTERS
-// -------------------------------------------------------------------------
-
-// TestBulkRewriteAdapters exercises the encryptRow / decryptRow
-// adapter methods so the trivial getters are not reported as 0%.
-func TestBulkRewriteAdapters(t *testing.T) {
-	t.Parallel()
-
-	er := &encryptRow{UnencryptedLocation: core.UnencryptedLocation{ObjectKey: "k", BackendName: "b", SizeBytes: 42}}
-	if er.rewriteKey() != "k" || er.rewriteBackend() != "b" || er.rewriteSize() != 42 {
-		t.Errorf("encryptRow accessors wrong: %+v", er)
-	}
-
-	dr := &decryptRow{DecryptableLocation: core.DecryptableLocation{ObjectKey: "x", BackendName: "y", SizeBytes: 7}}
-	if dr.rewriteKey() != "x" || dr.rewriteBackend() != "y" || dr.rewriteSize() != 7 {
-		t.Errorf("decryptRow accessors wrong: %+v", dr)
 	}
 }
 
@@ -477,8 +441,8 @@ func TestBulkRewriteAdapters(t *testing.T) {
 // returned branches; this fills the middle case.
 func TestHandleReloadStatus_ProviderReturnsNil(t *testing.T) {
 	t.Parallel()
-	h := newCoverageHandler()
-	h.SetReloadStatusProvider(func() any { return nil })
+	h := newCoverageHandler(t)
+	h.SetReloadStatusProvider(func() *adminapi.ReloadStatusResponse { return nil })
 
 	w := httptest.NewRecorder()
 	h.handleReloadStatus(w, httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/admin/api/reload-status", nil))
@@ -515,24 +479,31 @@ func TestHandleCacheInvalidateKey_EmptyKey(t *testing.T) {
 // KEY ROTATION
 // -------------------------------------------------------------------------
 
-// singleRowEncAdmin is an EncryptionAdmin stub that returns a single
-// EncryptedLocation on the first ListEncryptedLocations call and an
-// empty slice afterwards. Lets the rotation loop exercise rotateBatch
-// + rotateOneLocation through the rotateOne unpack failure branch
-// (the EncryptionKey is intentionally malformed).
-type singleRowEncAdmin struct {
-	emptyEncAdmin
-	sent bool
+// singleRowEncryptionStore returns one encrypted location on the first listing
+// and nothing afterwards, so the rotation loop runs end to end. The malformed
+// key trips the unpack branch, which is enough to drive the loop body.
+func singleRowEncryptionStore(t *testing.T) *opstest.MockEncryptionStore {
+	t.Helper()
+	m := opstest.NewMockEncryptionStore(gomock.NewController(t))
+	first := m.EXPECT().ListEncryptedLocations(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+		Return([]core.EncryptedLocation{
+			{ObjectKey: "k1", BackendName: "b1", EncryptionKey: []byte{0x01}, KeyID: "old"},
+		}, nil).
+		Times(1)
+	m.EXPECT().ListEncryptedLocations(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+		Return(nil, nil).After(first).AnyTimes()
+	return m
 }
 
-func (r *singleRowEncAdmin) ListEncryptedLocations(_ context.Context, _ string, _, _ int) ([]core.EncryptedLocation, error) {
-	if r.sent {
-		return nil, nil
-	}
-	r.sent = true
-	return []core.EncryptedLocation{
-		{ObjectKey: "k1", BackendName: "b1", EncryptionKey: []byte{0x01}, KeyID: "old"},
-	}, nil
+// emptyEncryptionStore reports nothing to rewrite in either direction, so a
+// pass runs to completion with zero counts.
+func emptyEncryptionStore(t *testing.T) *opstest.MockEncryptionStore {
+	t.Helper()
+	m := opstest.NewMockEncryptionStore(gomock.NewController(t))
+	m.EXPECT().ListEncryptedLocations(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
+	m.EXPECT().ListAllEncryptedLocations(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
+	m.EXPECT().ListUnencryptedLocations(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
+	return m
 }
 
 // TestHandleDecryptExisting_HappyEmpty wires an encryptor + a stub
@@ -560,6 +531,139 @@ func TestHandleDecryptExisting_HappyEmpty(t *testing.T) {
 	}
 }
 
+// TestReplicationEndpoints_WorkerFailureIs500 asserts a cycle that failed
+// mid-run is reported as a fault, not as a cycle that moved nothing.
+func TestReplicationEndpoints_WorkerFailureIs500(t *testing.T) {
+	t.Parallel()
+
+	t.Run("replicate", func(t *testing.T) {
+		t.Parallel()
+		h := newCoverageHandler(t)
+		replicationWith(t, h,
+			replicatorStub{cfg: &config.ReplicationConfig{Factor: 2}, err: errors.New("boom")},
+			overRepStub{})
+
+		w := httptest.NewRecorder()
+		h.handleReplicate(w, httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/admin/api/replicate", nil))
+
+		if w.Code != http.StatusInternalServerError {
+			t.Errorf("status = %d, want 500; body=%s", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("clean excess", func(t *testing.T) {
+		t.Parallel()
+		h := newCoverageHandler(t)
+		replicationWith(t, h, replicatorStub{},
+			overRepStub{cfg: &config.ReplicationConfig{Factor: 2}, cleanErr: errors.New("boom")})
+
+		w := httptest.NewRecorder()
+		h.handleOverReplicationClean(w, httptest.NewRequestWithContext(t.Context(), http.MethodPost, pathOverReplication, nil))
+
+		if w.Code != http.StatusInternalServerError {
+			t.Errorf("status = %d, want 500; body=%s", w.Code, w.Body.String())
+		}
+	})
+}
+
+// TestReplicationStreams_ReportFailure asserts a failed cycle terminates the
+// NDJSON stream with the error rather than a partial run the caller cannot
+// classify.
+func TestReplicationStreams_ReportFailure(t *testing.T) {
+	t.Parallel()
+
+	t.Run("replicate", func(t *testing.T) {
+		t.Parallel()
+		h := newCoverageHandler(t)
+		replicationWith(t, h,
+			replicatorStub{cfg: &config.ReplicationConfig{Factor: 2}, err: errors.New("boom")},
+			overRepStub{})
+
+		w := httptest.NewRecorder()
+		h.handleReplicate(w, streamReq("/admin/api/replicate"))
+
+		events := decodeEvents(t, w.Body.Bytes())
+		last := events[len(events)-1]
+		if last.Kind != adminstream.KindResult || last.Outcome != adminstream.OutcomeFailed {
+			t.Errorf("last event = %+v, want result/failed", last)
+		}
+	})
+
+	t.Run("over-replication", func(t *testing.T) {
+		t.Parallel()
+		h := newCoverageHandler(t)
+		replicationWith(t, h, replicatorStub{},
+			overRepStub{cfg: &config.ReplicationConfig{Factor: 2}, cleanErr: errors.New("boom")})
+
+		w := httptest.NewRecorder()
+		h.handleOverReplicationClean(w, streamReq(pathOverReplication))
+
+		events := decodeEvents(t, w.Body.Bytes())
+		last := events[len(events)-1]
+		if last.Kind != adminstream.KindResult || last.Outcome != adminstream.OutcomeFailed {
+			t.Errorf("last event = %+v, want result/failed", last)
+		}
+	})
+}
+
+// failingEncryptionStore reports a listing failure in both directions, so the
+// bulk endpoints can be driven through their server-fault arm.
+func failingEncryptionStore(t *testing.T, err error) *opstest.MockEncryptionStore {
+	t.Helper()
+	m := opstest.NewMockEncryptionStore(gomock.NewController(t))
+	m.EXPECT().ListEncryptedLocations(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, err).AnyTimes()
+	m.EXPECT().ListAllEncryptedLocations(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, err).AnyTimes()
+	m.EXPECT().ListUnencryptedLocations(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, err).AnyTimes()
+	return m
+}
+
+// TestHandleRotateEncryptionKey_ListFailureIs500 asserts a ledger that cannot
+// be read is a server fault, not a rejected request.
+func TestHandleRotateEncryptionKey_ListFailureIs500(t *testing.T) {
+	t.Parallel()
+	h := newCoverageHandler(t)
+	encryptionWith(t, h, testEncryptor(t), failingEncryptionStore(t, errors.New("ledger unavailable")))
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost,
+		"/admin/api/rotate-encryption-key", strings.NewReader(`{"old_key_id":"old"}`))
+	w := httptest.NewRecorder()
+	h.handleRotateEncryptionKey(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500; body=%s", w.Code, w.Body.String())
+	}
+}
+
+// TestHandleEncryptExisting_NotConfiguredIs400 asserts an instance started
+// without encryption reports that as the caller's problem to fix in config.
+func TestHandleEncryptExisting_NotConfiguredIs400(t *testing.T) {
+	t.Parallel()
+	h := newCoverageHandler(t)
+	encryptionWith(t, h, nil, nil)
+
+	w := httptest.NewRecorder()
+	h.handleEncryptExisting(w, httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/admin/api/encrypt-existing", nil))
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400; body=%s", w.Code, w.Body.String())
+	}
+}
+
+// TestHandleEncryptExisting_ListFailureIs500 asserts a failed listing answers
+// as a fault rather than as a skipped pass, which is what it used to do.
+func TestHandleEncryptExisting_ListFailureIs500(t *testing.T) {
+	t.Parallel()
+	h := newCoverageHandler(t)
+	encryptionWith(t, h, testEncryptor(t), failingEncryptionStore(t, errors.New("ledger unavailable")))
+
+	w := httptest.NewRecorder()
+	h.handleEncryptExisting(w, httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/admin/api/encrypt-existing", nil))
+
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500; body=%s", w.Code, w.Body.String())
+	}
+}
+
 // TestHandleRotateEncryptionKey_DrivesListLoop wires an encryptor +
 // a stub admin that returns one malformed EncryptedLocation so the
 // rotation pipeline runs end-to-end: list -> rotateBatch ->
@@ -570,7 +674,7 @@ func TestHandleDecryptExisting_HappyEmpty(t *testing.T) {
 func TestHandleRotateEncryptionKey_DrivesListLoop(t *testing.T) {
 	t.Parallel()
 	h := newRotateEncryptionKeyHandler(t)
-	h.encAdmin = &singleRowEncAdmin{}
+	encryptionWith(t, h, testEncryptor(t), singleRowEncryptionStore(t))
 
 	body := `{"old_key_id":"old"}`
 	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/admin/api/rotate-encryption-key", strings.NewReader(body))
@@ -580,12 +684,300 @@ func TestHandleRotateEncryptionKey_DrivesListLoop(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
 	}
-	var resp map[string]any
-	_ = json.NewDecoder(w.Body).Decode(&resp)
-	if resp["total"].(float64) != 1 {
-		t.Errorf("total = %v, want 1", resp["total"])
+	body2 := w.Body.Bytes()
+	var resp adminapi.RotateEncryptionKeyResponse
+	_ = json.Unmarshal(body2, &resp)
+	if resp.Total != 1 {
+		t.Errorf("total = %d, want 1", resp.Total)
 	}
-	if resp["failed"].(float64) != 1 {
-		t.Errorf("failed = %v, want 1 (malformed key trips UnpackKeyData)", resp["failed"])
+	if resp.Failed != 1 {
+		t.Errorf("failed = %d, want 1 (malformed key trips UnpackKeyData)", resp.Failed)
+	}
+
+	// BulkEncryptionOutcome is embedded, so its fields must flatten into the
+	// same top-level keys the endpoint has always emitted rather than nesting
+	// under an object.
+	var raw map[string]any
+	_ = json.Unmarshal(body2, &raw)
+	for _, k := range []string{"status", "rotated", "failed", "total"} {
+		if _, ok := raw[k]; !ok {
+			t.Errorf("response is missing top-level %q: %s", k, body2)
+		}
+	}
+	if len(raw) != 4 {
+		t.Errorf("response has %d keys, want exactly 4: %s", len(raw), body2)
+	}
+}
+
+// TestHandleScrub_ReportsUnreadableCount pins the count that used to be
+// dropped. A pass that could not read half the copies must not report the same
+// shape as a clean one, so the JSON response carries unreadable next to
+// checked and failed.
+func TestHandleScrub_ReportsUnreadableCount(t *testing.T) {
+	t.Parallel()
+	h := newCoverageHandler(t)
+	integrityWith(t, h,
+		backendOpsStub{integrity: &config.IntegrityConfig{Enabled: true, ScrubberBatchSize: 50}},
+		&scrubberStub{scrubChecked: 4, scrubFailed: 1, scrubSkipped: 7})
+
+	w := httptest.NewRecorder()
+	h.handleScrub(w, httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/admin/api/scrub", nil))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	var resp adminapi.ScrubResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Checked != 4 || resp.Failed != 1 || resp.Unreadable != 7 {
+		t.Errorf("got checked=%d failed=%d unreadable=%d, want 4/1/7",
+			resp.Checked, resp.Failed, resp.Unreadable)
+	}
+}
+
+// TestHandleScrub_StreamSummaryReportsUnreadable drives the NDJSON path, where
+// the terminal summary line is what an operator actually reads. Reporting only
+// checked and failed there is what let a pass over unreadable copies look
+// clean.
+func TestHandleScrub_StreamSummaryReportsUnreadable(t *testing.T) {
+	t.Parallel()
+	h := newCoverageHandler(t)
+	integrityWith(t, h,
+		backendOpsStub{integrity: &config.IntegrityConfig{Enabled: true, ScrubberBatchSize: 50}},
+		&scrubberStub{scrubChecked: 3, scrubFailed: 2, scrubSkipped: 5, scrubDeferred: 9})
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/admin/api/scrub", nil)
+	req.Header.Set("Accept", adminstream.ContentType)
+	w := httptest.NewRecorder()
+	h.handleScrub(w, req)
+
+	if ct := w.Header().Get("Content-Type"); ct != adminstream.ContentType {
+		t.Fatalf("Content-Type = %q, want %q", ct, adminstream.ContentType)
+	}
+
+	var result adminstream.Event
+	for line := range strings.SplitSeq(strings.TrimSpace(w.Body.String()), "\n") {
+		var ev adminstream.Event
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			t.Fatalf("decode %q: %v", line, err)
+		}
+		if ev.Kind == adminstream.KindResult {
+			result = ev
+		}
+	}
+
+	if result.Kind != adminstream.KindResult {
+		t.Fatalf("no result event in stream: %s", w.Body.String())
+	}
+	if !strings.Contains(result.Message, "unreadable 5") {
+		t.Errorf("summary = %q, want it to report unreadable 5", result.Message)
+	}
+	if got := result.Fields["unreadable"]; got != float64(5) {
+		t.Errorf("fields[unreadable] = %v, want 5", got)
+	}
+	// Deferred copies were never selected, so a summary that omits them reports
+	// a budget-limited sweep as a complete one.
+	if !strings.Contains(result.Message, "deferred 9") {
+		t.Errorf("summary = %q, want it to report deferred 9", result.Message)
+	}
+	if got := result.Fields["deferred"]; got != float64(9) {
+		t.Errorf("fields[deferred] = %v, want 9", got)
+	}
+}
+
+// TestHandleStatus_ReportsPlaintextCopies pins the figure onto the wire. The
+// status payload is what the TUI and any external monitoring read, so a fleet
+// that is only partly encrypted has to be visible there rather than only in the
+// web dashboard.
+func TestHandleStatus_ReportsPlaintextCopies(t *testing.T) {
+	t.Parallel()
+	h := newCoverageHandler(t)
+	h.dashboardOps = newDashboardOps(t, &dashboard.Data{
+		BackendOrder:    []string{"b1"},
+		QuotaStats:      map[string]core.QuotaStat{"b1": {BytesUsed: 100, BytesLimit: 1000}},
+		UsagePeriod:     "2026-05",
+		PlaintextCopies: 42,
+	}, nil)
+
+	w := httptest.NewRecorder()
+	h.handleStatus(w, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/admin/api/status", nil))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	var resp adminapi.StatusResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Integrity.PlaintextCopies != 42 {
+		t.Errorf("plaintext_copies = %d, want 42", resp.Integrity.PlaintextCopies)
+	}
+}
+
+// TestObjectLocationsResponse_VerifiedTimestamp pins the wire contract. A copy
+// never verified omits the field entirely rather than sending a zero time,
+// because "never checked" and "checked at the epoch" are different answers.
+func TestObjectLocationsResponse_VerifiedTimestamp(t *testing.T) {
+	t.Parallel()
+
+	verified := time.Date(2026, 8, 12, 4, 0, 0, 0, time.UTC)
+	resp := objectLocationsResponse("bucket/k", []core.ObjectLocation{
+		{BackendName: "b1", ContentHash: "sha256:x", LastScrubbedAt: &verified},
+		{BackendName: "b2", ContentHash: "sha256:x"},
+	})
+
+	body, err := json.Marshal(resp)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var decoded adminapi.ObjectLocationsResponse
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(decoded.Locations) != 2 {
+		t.Fatalf("got %d locations, want 2", len(decoded.Locations))
+	}
+	if decoded.Locations[0].LastScrubbedAt == nil || !decoded.Locations[0].LastScrubbedAt.Equal(verified) {
+		t.Errorf("verified copy = %v, want %v", decoded.Locations[0].LastScrubbedAt, verified)
+	}
+	if decoded.Locations[1].LastScrubbedAt != nil {
+		t.Errorf("never-verified copy = %v, want absent", decoded.Locations[1].LastScrubbedAt)
+	}
+	if strings.Contains(string(body), `"last_scrubbed_at":"0001-01-01`) {
+		t.Errorf("a never-verified copy serialised a zero time: %s", body)
+	}
+}
+
+// -------------------------------------------------------------------------
+// TARGETED SCRUB
+// -------------------------------------------------------------------------
+
+// scrubKeyRequest builds a targeted-scrub request for key.
+func scrubKeyRequest(t *testing.T, key string) *http.Request {
+	t.Helper()
+	return httptest.NewRequestWithContext(t.Context(), http.MethodPost,
+		"/admin/api/object-scrub?key="+url.QueryEscape(key), nil)
+}
+
+// TestHandleScrubKey_ReportsEachCopy pins the per-copy shape onto the wire. A
+// single verdict for the key would hide which backend holds the bad copy, which
+// is the whole reason to verify one object on demand.
+func TestHandleScrubKey_ReportsEachCopy(t *testing.T) {
+	t.Parallel()
+	h := newCoverageHandler(t)
+	integrityWith(t, h,
+		backendOpsStub{integrity: &config.IntegrityConfig{Enabled: true}},
+		&scrubberStub{scrubKeyCopies: []worker.CopyVerification{
+			{Backend: "b1", Outcome: worker.CopyVerified},
+			{Backend: "b2", Outcome: worker.CopyMismatch},
+		}})
+
+	w := httptest.NewRecorder()
+	h.handleScrubKey(w, scrubKeyRequest(t, "bucket/k"))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	var resp adminapi.ScrubKeyResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Key != "bucket/k" || len(resp.Copies) != 2 {
+		t.Fatalf("response = %+v, want two copies for bucket/k", resp)
+	}
+	if resp.Copies[0].Outcome != adminapi.CopyVerified || resp.Copies[1].Outcome != adminapi.CopyMismatch {
+		t.Errorf("outcomes = %q/%q, want verified/mismatch",
+			resp.Copies[0].Outcome, resp.Copies[1].Outcome)
+	}
+	if resp.Copies[1].Detail == "" {
+		t.Error("a mismatch should explain what happened to the copy")
+	}
+}
+
+// TestHandleScrubKey_UnknownOutcomeIsNotVerified guards the translation's
+// fallback: a verdict this transport does not recognise must not reach a caller
+// as a pass, since "we do not know" and "the bytes are intact" are opposites.
+func TestHandleScrubKey_UnknownOutcomeIsNotVerified(t *testing.T) {
+	t.Parallel()
+	h := newCoverageHandler(t)
+	integrityWith(t, h,
+		backendOpsStub{integrity: &config.IntegrityConfig{Enabled: true}},
+		&scrubberStub{scrubKeyCopies: []worker.CopyVerification{
+			{Backend: "b1", Outcome: worker.CopyOutcome(99)},
+		}})
+
+	w := httptest.NewRecorder()
+	h.handleScrubKey(w, scrubKeyRequest(t, "bucket/k"))
+
+	var resp adminapi.ScrubKeyResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Copies) != 1 || resp.Copies[0].Outcome != adminapi.CopyUnreadable {
+		t.Errorf("copies = %+v, want the unknown verdict reported as unreadable", resp.Copies)
+	}
+	if resp.Copies[0].Backend != "b1" {
+		t.Errorf("backend = %q, want it preserved through the fallback", resp.Copies[0].Backend)
+	}
+}
+
+// TestHandleScrubKey_UnknownKeyIs404 keeps "no copies recorded" from reading as
+// a successful verification of nothing.
+func TestHandleScrubKey_UnknownKeyIs404(t *testing.T) {
+	t.Parallel()
+	h := newCoverageHandler(t)
+	integrityWith(t, h, backendOpsStub{integrity: &config.IntegrityConfig{Enabled: true}}, &scrubberStub{})
+
+	w := httptest.NewRecorder()
+	h.handleScrubKey(w, scrubKeyRequest(t, "bucket/missing"))
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404; body=%s", w.Code, w.Body.String())
+	}
+}
+
+// TestHandleScrubKey_IntegrityDisabled refuses rather than reporting an empty
+// result, so a caller cannot read "nothing wrong" from a feature that is off.
+func TestHandleScrubKey_IntegrityDisabled(t *testing.T) {
+	t.Parallel()
+	h := newCoverageHandler(t)
+	integrityWith(t, h, backendOpsStub{integrity: &config.IntegrityConfig{Enabled: false}}, &scrubberStub{})
+
+	w := httptest.NewRecorder()
+	h.handleScrubKey(w, scrubKeyRequest(t, "bucket/k"))
+
+	if w.Code != http.StatusConflict {
+		t.Errorf("status = %d, want 409; body=%s", w.Code, w.Body.String())
+	}
+}
+
+// TestHandleScrubKey_MissingKeyIsBadRequest covers the empty path value.
+func TestHandleScrubKey_MissingKeyIsBadRequest(t *testing.T) {
+	t.Parallel()
+	h := newCoverageHandler(t)
+
+	w := httptest.NewRecorder()
+	h.handleScrubKey(w, httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/admin/api/object-scrub", nil))
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400; body=%s", w.Code, w.Body.String())
+	}
+}
+
+// TestHandleScrubKey_StoreFailureIs500 keeps a failed lookup from reporting a
+// clean result.
+func TestHandleScrubKey_StoreFailureIs500(t *testing.T) {
+	t.Parallel()
+	h := newCoverageHandler(t)
+	integrityWith(t, h,
+		backendOpsStub{integrity: &config.IntegrityConfig{Enabled: true}},
+		&scrubberStub{scrubKeyErr: errors.New("ledger unavailable")})
+
+	w := httptest.NewRecorder()
+	h.handleScrubKey(w, scrubKeyRequest(t, "bucket/k"))
+
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500; body=%s", w.Code, w.Body.String())
 	}
 }

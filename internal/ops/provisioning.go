@@ -1,0 +1,679 @@
+// -------------------------------------------------------------------------------
+// Ops - Bucket and Credential Provisioning
+//
+// Author: Alex Freidah
+//
+// Creating and removing the buckets, users, keypairs and grants a deployment
+// holds in the store, and reading them back beside what the config file
+// declares. Config-declared entries are visible and never editable: an operator
+// reading that file has to be able to trust what it says.
+//
+// Every mutation ends by rebuilding the request-time registry, so a credential
+// issued through the API authenticates on the next request rather than on the
+// next restart.
+// -------------------------------------------------------------------------------
+
+package ops
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/base32"
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"log/slog"
+	"strings"
+
+	"github.com/afreidah/s3-orchestrator/internal/config"
+	"github.com/afreidah/s3-orchestrator/internal/observe/audit"
+	"github.com/afreidah/s3-orchestrator/internal/observe/logfmt"
+	"github.com/afreidah/s3-orchestrator/internal/provisioning"
+	"github.com/afreidah/s3-orchestrator/internal/store/core"
+)
+
+// -------------------------------------------------------------------------
+// CONSTANTS
+// -------------------------------------------------------------------------
+
+// accessKeyBytes and secretBytes size the material a minted keypair carries.
+// The access key is base32 of 12 bytes, which reads as 20 unpadded uppercase
+// characters the way an AWS key does; the secret is base64 of 30, matching the
+// 40 characters an S3 client expects to paste.
+const (
+	accessKeyBytes = 12
+	secretBytes    = 30
+)
+
+// -------------------------------------------------------------------------
+// TYPES
+// -------------------------------------------------------------------------
+
+// ProvisioningDeps holds the collaborators Provisioning requires.
+type ProvisioningDeps struct {
+	Store    ProvisioningStore
+	Objects  NamespaceCounter
+	Registry RegistryPublisher
+	Config   *ConfigStore
+}
+
+// Provisioning serves the bucket and credential administration shared by the
+// admin API and the web UI.
+type Provisioning struct {
+	log      *slog.Logger
+	store    ProvisioningStore
+	objects  NamespaceCounter
+	registry RegistryPublisher
+	config   *ConfigStore
+}
+
+// NewProvisioning is the explicit-deps constructor.
+func NewProvisioning(d ProvisioningDeps) *Provisioning {
+	return &Provisioning{
+		log:      slog.Default().With(logfmt.Component("ops")),
+		store:    d.Store,
+		objects:  d.Objects,
+		registry: d.Registry,
+		config:   d.Config,
+	}
+}
+
+// NewCredential is a keypair as it exists exactly once: at the moment it is
+// minted. Secret is returned to the caller that asked for it and never read
+// back out of the store into any listing.
+type NewCredential struct {
+	AccessKeyID string
+	Secret      string
+	UserID      string
+	Label       string
+}
+
+// -------------------------------------------------------------------------
+// READS
+// -------------------------------------------------------------------------
+
+// View returns everything a deployment declares, from both sources, each entry
+// carrying where it came from.
+func (p *Provisioning) View(ctx context.Context) (provisioning.View, error) {
+	cfg := p.config.Load()
+	return provisioning.LoadMerged(ctx, p.store, cfg.Buckets, cfg.Auth)
+}
+
+// -------------------------------------------------------------------------
+// BUCKETS
+// -------------------------------------------------------------------------
+
+// CreateBucket adds a virtual bucket to the store.
+//
+// The backend bucket it maps onto is not created here: which backends a
+// deployment writes to, and what credentials reach them, is the operator's to
+// configure. This declares the namespace the orchestrator will accept writes
+// under.
+//
+// A name the config file already declares is allowed, and the new row sits
+// dormant behind it. That is how a bucket moves out of the config file without
+// a gap: write the row, then remove the config entry, and the row takes over
+// the moment it stops being shadowed. Only a second store row is refused.
+func (p *Provisioning) CreateBucket(ctx context.Context, b *core.Bucket) error {
+	if b.Name == "" {
+		return ErrNameRequired
+	}
+	view, err := p.View(ctx)
+	if err != nil {
+		return err
+	}
+	if _, ok := findStoredBucket(&view, b.Name); ok {
+		return fmt.Errorf("%w: %q", ErrBucketExists, b.Name)
+	}
+	// Rejected here rather than at assembly: a rule the matcher cannot read
+	// would otherwise store cleanly and then fail every registry rebuild,
+	// including the one a reload runs, taking the fleet's reloads down.
+	if errs := config.ValidateCORS(b.CORS); len(errs) > 0 {
+		return fmt.Errorf("%w: %w", ErrInvalidCORS, errors.Join(errs...))
+	}
+	if err := p.store.CreateBucket(ctx, b); err != nil {
+		return err
+	}
+	audit.Log(ctx, "provisioning.BucketCreated", slog.String("bucket", b.Name))
+	return p.republish(ctx)
+}
+
+// UpdateBucket writes what a bucket carries, leaving the name and the objects
+// stored under it alone.
+//
+// The bucket is replaced rather than merged into: what the caller sends is what
+// the bucket ends up holding, so an empty CORS set removes the rules it had.
+// Anything driving this declaratively sends whole state, and a merge would let
+// a bucket keep a rule no declaration names.
+func (p *Provisioning) UpdateBucket(ctx context.Context, b *core.Bucket) error {
+	if b.Name == "" {
+		return ErrNameRequired
+	}
+	view, err := p.View(ctx)
+	if err != nil {
+		return err
+	}
+	if _, ok := findStoredBucket(&view, b.Name); !ok {
+		if _, declared := findBucket(view.Buckets, b.Name); declared {
+			return fmt.Errorf("%w: bucket %q", ErrConfigDeclared, b.Name)
+		}
+		return fmt.Errorf("%w: %q", ErrBucketNotFound, b.Name)
+	}
+	// Rejected for the same reason create rejects it: a rule the matcher cannot
+	// read stores cleanly and then fails every registry rebuild afterwards.
+	if errs := config.ValidateCORS(b.CORS); len(errs) > 0 {
+		return fmt.Errorf("%w: %w", ErrInvalidCORS, errors.Join(errs...))
+	}
+	if err := p.store.UpdateBucket(ctx, b); err != nil {
+		return err
+	}
+	audit.Log(ctx, "provisioning.BucketUpdated", slog.String("bucket", b.Name))
+	return p.republish(ctx)
+}
+
+// DeleteBucket removes a virtual bucket.
+//
+// Refused while any object is stored under it: dropping the declaration would
+// leave those keys addressable by nothing while still occupying every backend
+// they were written to, so emptying the bucket stays a deliberate act. Grants
+// naming it are refused for the same reason - a grant to a bucket that no
+// longer exists is reported as dangling on every assembly until someone removes
+// it.
+func (p *Provisioning) DeleteBucket(ctx context.Context, name string) error {
+	view, err := p.View(ctx)
+	if err != nil {
+		return err
+	}
+	if _, ok := findStoredBucket(&view, name); !ok {
+		if _, declared := findBucket(view.Buckets, name); declared {
+			return fmt.Errorf("%w: bucket %q", ErrConfigDeclared, name)
+		}
+		return fmt.Errorf("%w: %q", ErrBucketNotFound, name)
+	}
+	// A shadowed row serves nothing, so removing it takes nothing away: the
+	// objects and grants belong to the config bucket standing in front of it,
+	// and that bucket stays. Refusing here would strand an operator who laid a
+	// row down and then thought better of it.
+	if _, shadowed := findBucket(view.Shadowed, name); !shadowed {
+		if err := p.refuseIfBucketInUse(ctx, name); err != nil {
+			return err
+		}
+	}
+	if err := p.store.DeleteBucket(ctx, name); err != nil {
+		return err
+	}
+	audit.Log(ctx, "provisioning.BucketDeleted", slog.String("bucket", name))
+	return p.republish(ctx)
+}
+
+// refuseIfBucketInUse reports the objects or grants that make a bucket
+// undeletable.
+func (p *Provisioning) refuseIfBucketInUse(ctx context.Context, name string) error {
+	n, err := p.objects.CountObjectsByPrefix(ctx, name+"/")
+	if err != nil {
+		return err
+	}
+	if n > 0 {
+		return fmt.Errorf("%w: bucket %q holds %s", ErrBucketNotEmpty, name, plural(n, "object"))
+	}
+	// Grant rows are asked rather than the merged reach, because what makes a
+	// bucket undeletable is a grant that would be left naming nothing. A
+	// wildcard does not dangle - it simply covers one bucket fewer - and an
+	// identity holding one reaches every bucket, so reading the merged view
+	// here would make every bucket permanently undeletable.
+	grants, err := p.store.ListGrants(ctx)
+	if err != nil {
+		return err
+	}
+	for i := range grants {
+		g := &grants[i]
+		if g.Resource.Kind == core.ResourceBucket && g.Resource.Name == name {
+			return fmt.Errorf("%w: bucket %q is granted to user %q", ErrBucketGranted, name, g.UserID)
+		}
+	}
+	return nil
+}
+
+// -------------------------------------------------------------------------
+// USERS
+// -------------------------------------------------------------------------
+
+// CreateUser adds an identity credentials can be issued against. The id is
+// generated rather than taken from the caller, so it is unique and stable
+// whatever the user is later renamed to.
+func (p *Provisioning) CreateUser(ctx context.Context, name string) (core.User, error) {
+	if name == "" {
+		return core.User{}, ErrNameRequired
+	}
+	id, err := mintID("user")
+	if err != nil {
+		return core.User{}, err
+	}
+	u := core.User{ID: id, Name: name}
+	if err := p.store.CreateUser(ctx, &u); err != nil {
+		return core.User{}, err
+	}
+	audit.Log(ctx, "provisioning.UserCreated", slog.String("user", id), slog.String("name", name))
+	return u, p.republish(ctx)
+}
+
+// RenameUser changes the name an operator reads an identity by.
+//
+// The ID does not move: credentials and grants reference it, so renaming is a
+// label change rather than a new identity. That is what lets a caller correct a
+// name without tearing down everything hanging off it - a delete would be
+// refused while the user holds either.
+func (p *Provisioning) RenameUser(ctx context.Context, id, name string) error {
+	if id == "" {
+		return ErrUserRequired
+	}
+	if name == "" {
+		return ErrNameRequired
+	}
+	view, err := p.View(ctx)
+	if err != nil {
+		return err
+	}
+	u, ok := findUser(view.Users, id)
+	if !ok {
+		return fmt.Errorf("%w: %q", ErrUserNotFound, id)
+	}
+	if u.Source == provisioning.SourceConfig {
+		return fmt.Errorf("%w: user %q", ErrConfigDeclared, id)
+	}
+	if err := p.store.RenameUser(ctx, id, name); err != nil {
+		return err
+	}
+	audit.Log(ctx, "provisioning.UserRenamed",
+		slog.String("user", id), slog.String("from", u.Name), slog.String("name", name))
+	return p.republish(ctx)
+}
+
+// DeleteUser removes an identity.
+//
+// Refused while the user still holds credentials or grants. The schema refuses
+// it too, but a caller deserves to be told which of the two is in the way
+// rather than a foreign-key violation.
+func (p *Provisioning) DeleteUser(ctx context.Context, id string) error {
+	view, err := p.View(ctx)
+	if err != nil {
+		return err
+	}
+	u, ok := findUser(view.Users, id)
+	if !ok {
+		return fmt.Errorf("%w: %q", ErrUserNotFound, id)
+	}
+	if u.Source == provisioning.SourceConfig {
+		return fmt.Errorf("%w: user %q", ErrConfigDeclared, id)
+	}
+	if len(u.Buckets) > 0 {
+		return fmt.Errorf("%w: user %q holds %s", ErrUserInUse, id, plural(int64(len(u.Buckets)), "grant"))
+	}
+	if n := countCredentials(view.Credentials, id); n > 0 {
+		return fmt.Errorf("%w: user %q holds %s", ErrUserInUse, id, plural(int64(n), "credential"))
+	}
+	if err := p.store.DeleteUser(ctx, id); err != nil {
+		return err
+	}
+	audit.Log(ctx, "provisioning.UserDeleted", slog.String("user", id))
+	return p.republish(ctx)
+}
+
+// -------------------------------------------------------------------------
+// CREDENTIALS
+// -------------------------------------------------------------------------
+
+// Keypair is a credential an operator supplies rather than one this package
+// mints. Both halves are required together, the same rule the config file's
+// root credential follows: a key with no secret cannot sign, and a secret with
+// no key names nothing.
+type Keypair struct {
+	AccessKeyID     string
+	SecretAccessKey string
+}
+
+// supplied reports whether the caller named a credential at all.
+func (k Keypair) supplied() bool {
+	return k.AccessKeyID != "" || k.SecretAccessKey != ""
+}
+
+// complete reports whether both halves are present.
+func (k Keypair) complete() bool {
+	return k.AccessKeyID != "" && k.SecretAccessKey != ""
+}
+
+// CreateCredential registers a keypair against an existing user and returns it,
+// secret included.
+//
+// A caller that supplies a keypair has one already - generated by whatever
+// manages its secrets - and is recording it here rather than asking for a new
+// one. That is what lets the call converge: running it twice with the same
+// keypair is an error rather than a second credential to distribute, and a
+// caller rebuilding lost state re-registers what it holds instead of rotating
+// every client. Supplying neither half mints one, which is what an operator at
+// a terminal wants.
+//
+// The user is required rather than created on demand: a keypair with no owner
+// is a credential nobody can account for, and issuing several to one identity
+// is what lets one be replaced while its siblings keep working.
+func (p *Provisioning) CreateCredential(
+	ctx context.Context, userID, label string, keys Keypair,
+) (NewCredential, error) {
+	if userID == "" {
+		return NewCredential{}, ErrUserRequired
+	}
+	if keys.supplied() && !keys.complete() {
+		return NewCredential{}, ErrKeypairIncomplete
+	}
+	view, err := p.View(ctx)
+	if err != nil {
+		return NewCredential{}, err
+	}
+	u, ok := findUser(view.Users, userID)
+	if !ok {
+		return NewCredential{}, fmt.Errorf("%w: %q", ErrUserNotFound, userID)
+	}
+	if u.Source == provisioning.SourceConfig {
+		return NewCredential{}, fmt.Errorf("%w: user %q", ErrConfigDeclared, userID)
+	}
+
+	accessKey, secret := keys.AccessKeyID, keys.SecretAccessKey
+	if !keys.complete() {
+		if accessKey, secret, err = mintKeypair(); err != nil {
+			return NewCredential{}, err
+		}
+	}
+	// Checked against the merged view rather than left to the store's unique
+	// constraint, because the collision may be with a config-declared key the
+	// store has no row for. Assembly refuses an access key claimed twice, so
+	// without this the insert would succeed and the republish behind it fail,
+	// leaving a row nothing can authenticate.
+	if _, taken := findCredential(view.Credentials, accessKey); taken {
+		return NewCredential{}, fmt.Errorf("%w: %q", ErrCredentialExists, accessKey)
+	}
+
+	row := core.Credential{AccessKeyID: accessKey, UserID: userID, Secret: secret, Label: label}
+	if err := p.store.CreateCredential(ctx, &row); err != nil {
+		return NewCredential{}, err
+	}
+	audit.Log(ctx, "provisioning.CredentialCreated",
+		slog.String("user", userID), slog.String("access_key_id", accessKey),
+		slog.Bool("supplied", keys.complete()))
+	out := NewCredential{AccessKeyID: accessKey, Secret: secret, UserID: userID, Label: label}
+	return out, p.republish(ctx)
+}
+
+// DeleteCredential revokes one keypair, leaving its siblings alone. Revocation
+// takes effect on the next request rather than the next restart, because the
+// registry is rebuilt before this returns.
+func (p *Provisioning) DeleteCredential(ctx context.Context, accessKeyID string) error {
+	view, err := p.View(ctx)
+	if err != nil {
+		return err
+	}
+	c, ok := findCredential(view.Credentials, accessKeyID)
+	if !ok {
+		return fmt.Errorf("%w: %q", ErrCredentialNotFound, accessKeyID)
+	}
+	if c.Source == provisioning.SourceConfig {
+		return fmt.Errorf("%w: credential %q", ErrConfigDeclared, accessKeyID)
+	}
+	if err := p.store.DeleteCredential(ctx, accessKeyID); err != nil {
+		return err
+	}
+	audit.Log(ctx, "provisioning.CredentialDeleted", slog.String("access_key_id", accessKeyID))
+	return p.republish(ctx)
+}
+
+// -------------------------------------------------------------------------
+// GRANTS
+// -------------------------------------------------------------------------
+
+// CreateGrant gives a user access to one resource: a bucket, a backend, or the
+// instance itself.
+//
+// A bucket may come from either source, since granting a stored user access to
+// a config-declared bucket is the normal way a deployment onboards a client
+// onto a bucket it already runs.
+func (p *Provisioning) CreateGrant(ctx context.Context, userID string, resource core.Resource, perms core.PermissionSet) error {
+	if err := p.checkGrant(ctx, userID, resource, perms); err != nil {
+		return err
+	}
+	grant := core.Grant{UserID: userID, Resource: resource, Permissions: perms}
+	if err := p.store.CreateGrant(ctx, &grant); err != nil {
+		return err
+	}
+	audit.Log(ctx, "provisioning.GrantCreated",
+		slog.String("user", userID),
+		slog.String("resource", resource.String()),
+		slog.String("permissions", perms.String()))
+	return p.republish(ctx)
+}
+
+// SetGrant declares exactly what a user reaches on one resource, writing the
+// grant when it is absent and replacing its permissions when it is not.
+//
+// Upsert rather than update, so a caller declaring access does not have to know
+// whether the grant is already there and re-applying the same call converges.
+// Replacing in place is also what keeps a narrowing from opening a window: a
+// delete followed by a create leaves the client reaching nothing in between.
+func (p *Provisioning) SetGrant(
+	ctx context.Context, userID string, resource core.Resource, perms core.PermissionSet,
+) error {
+	if err := p.checkGrant(ctx, userID, resource, perms); err != nil {
+		return err
+	}
+	grant := core.Grant{UserID: userID, Resource: resource, Permissions: perms}
+	if err := p.store.SetGrant(ctx, &grant); err != nil {
+		return err
+	}
+	audit.Log(ctx, "provisioning.GrantSet",
+		slog.String("user", userID),
+		slog.String("resource", resource.String()),
+		slog.String("permissions", perms.String()))
+	return p.republish(ctx)
+}
+
+// checkGrant resolves every rule a grant has to satisfy, whichever call writes
+// it, so declaring one and creating one cannot drift apart.
+func (p *Provisioning) checkGrant(
+	ctx context.Context, userID string, resource core.Resource, perms core.PermissionSet,
+) error {
+	view, err := p.View(ctx)
+	if err != nil {
+		return err
+	}
+	u, ok := findUser(view.Users, userID)
+	if !ok {
+		return fmt.Errorf("%w: %q", ErrUserNotFound, userID)
+	}
+	if u.Source == provisioning.SourceConfig {
+		return fmt.Errorf("%w: user %q", ErrConfigDeclared, userID)
+	}
+	if err := p.checkResource(&view, resource); err != nil {
+		return err
+	}
+	// A grant carrying nothing reaches the resource and is refused on every
+	// operation, which is a grant that does nothing but look like one.
+	if perms == 0 {
+		return ErrNoPermissions
+	}
+	if err := core.ValidatePermissions(resource.Kind, perms); err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidResource, err)
+	}
+	return nil
+}
+
+// DeleteGrant withdraws one user's access to one resource, leaving its other
+// grants and every other user's alone.
+func (p *Provisioning) DeleteGrant(ctx context.Context, userID string, resource core.Resource) error {
+	view, err := p.View(ctx)
+	if err != nil {
+		return err
+	}
+	u, ok := findUser(view.Users, userID)
+	if !ok {
+		return fmt.Errorf("%w: %q", ErrUserNotFound, userID)
+	}
+	if u.Source == provisioning.SourceConfig {
+		return fmt.Errorf("%w: user %q", ErrConfigDeclared, userID)
+	}
+	if err := p.store.DeleteGrant(ctx, userID, resource); err != nil {
+		return err
+	}
+	audit.Log(ctx, "provisioning.GrantDeleted",
+		slog.String("user", userID), slog.String("resource", resource.String()))
+	return p.republish(ctx)
+}
+
+// checkResource refuses a grant over something this deployment does not have.
+//
+// A wildcard names things that do not exist yet, which is the point of it, so
+// only a named resource is looked up. The instance carries no name because
+// there is one of it.
+func (p *Provisioning) checkResource(view *provisioning.View, r core.Resource) error {
+	switch r.Kind {
+	case core.ResourceOrchestrator:
+		if r.Name != "" {
+			return fmt.Errorf("%w: %s takes no name", ErrInvalidResource, r.Kind)
+		}
+		return nil
+	case core.ResourceBucket:
+		if r.IsWildcard() {
+			return nil
+		}
+		if _, ok := findBucket(view.Buckets, r.Name); !ok {
+			return fmt.Errorf("%w: %q", ErrBucketNotFound, r.Name)
+		}
+		return nil
+	case core.ResourceBackend:
+		if r.IsWildcard() {
+			return nil
+		}
+		backends := p.config.Load().Backends
+		for i := range backends {
+			if backends[i].Name == r.Name {
+				return nil
+			}
+		}
+		return fmt.Errorf("%w: %q", ErrBackendNotFound, r.Name)
+	default:
+		return fmt.Errorf("%w: unknown kind %q", ErrInvalidResource, r.Kind)
+	}
+}
+
+// -------------------------------------------------------------------------
+// INTERNALS
+// -------------------------------------------------------------------------
+
+// republish rebuilds the request-time registry so the change takes effect now.
+//
+// A failure here is returned rather than swallowed: the row is written and the
+// running registry is not, and a caller told the write succeeded would go on to
+// use a credential that authenticates nothing.
+func (p *Provisioning) republish(ctx context.Context) error {
+	if p.registry == nil {
+		return nil
+	}
+	if err := p.registry.Republish(ctx); err != nil {
+		return fmt.Errorf("provisioning change was stored but the registry was not rebuilt: %w", err)
+	}
+	return nil
+}
+
+// plural renders a count and its noun, so a refusal naming one thing does not
+// read as though it named several. Every message it serves is the reason an
+// operator was just told no, which is a poor place to be sloppy.
+func plural(n int64, noun string) string {
+	if n == 1 {
+		return "1 " + noun
+	}
+	return fmt.Sprintf("%d %ss", n, noun)
+}
+
+// findBucket returns the merged bucket with a name.
+func findBucket(buckets []provisioning.Bucket, name string) (provisioning.Bucket, bool) {
+	for i := range buckets {
+		if buckets[i].Name == name {
+			return buckets[i], true
+		}
+	}
+	return provisioning.Bucket{}, false
+}
+
+// findStoredBucket returns the store's row for a name, whether or not a config
+// bucket is currently shadowing it.
+//
+// The three mutations work on store rows, and a shadowed row is still a row
+// they own. Looking only at the merged buckets would hide it, and a caller that
+// wrote the row would be told it does not exist.
+func findStoredBucket(v *provisioning.View, name string) (provisioning.Bucket, bool) {
+	if b, ok := findBucket(v.Buckets, name); ok && b.Source == provisioning.SourceStore {
+		return b, true
+	}
+	return findBucket(v.Shadowed, name)
+}
+
+// findUser returns the merged user with an id.
+func findUser(users []provisioning.User, id string) (provisioning.User, bool) {
+	for i := range users {
+		if users[i].ID == id {
+			return users[i], true
+		}
+	}
+	return provisioning.User{}, false
+}
+
+// findCredential returns the merged credential with an access key.
+func findCredential(creds []provisioning.Credential, accessKeyID string) (provisioning.Credential, bool) {
+	for i := range creds {
+		if creds[i].AccessKeyID == accessKeyID {
+			return creds[i], true
+		}
+	}
+	return provisioning.Credential{}, false
+}
+
+// countCredentials counts the merged credentials belonging to a user.
+func countCredentials(creds []provisioning.Credential, userID string) int {
+	n := 0
+	for i := range creds {
+		if creds[i].UserID == userID {
+			n++
+		}
+	}
+	return n
+}
+
+// mintKeypair draws a fresh access key and secret.
+func mintKeypair() (accessKey, secret string, err error) {
+	if accessKey, err = mintAccessKey(); err != nil {
+		return "", "", err
+	}
+	raw := make([]byte, secretBytes)
+	if _, err = rand.Read(raw); err != nil {
+		return "", "", fmt.Errorf("generate secret: %w", err)
+	}
+	return accessKey, base64.RawURLEncoding.EncodeToString(raw), nil
+}
+
+// mintAccessKey draws an access key in the uppercase alphanumeric form S3
+// clients expect to see one in.
+func mintAccessKey() (string, error) {
+	raw := make([]byte, accessKeyBytes)
+	if _, err := rand.Read(raw); err != nil {
+		return "", fmt.Errorf("generate access key: %w", err)
+	}
+	return base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(raw), nil
+}
+
+// mintID draws an opaque identifier under a kind prefix, so a value that turns
+// up in a log or an audit record says what it names.
+func mintID(kind string) (string, error) {
+	raw := make([]byte, accessKeyBytes)
+	if _, err := rand.Read(raw); err != nil {
+		return "", fmt.Errorf("generate %s id: %w", kind, err)
+	}
+	enc := base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(raw)
+	return kind + "-" + strings.ToLower(enc), nil
+}

@@ -18,10 +18,11 @@ import (
 	"testing"
 	"time"
 
+	"go.uber.org/mock/gomock"
+
 	"github.com/afreidah/s3-orchestrator/internal/backend"
 	"github.com/afreidah/s3-orchestrator/internal/backend/backendtest"
 	"github.com/afreidah/s3-orchestrator/internal/store/core"
-	"go.uber.org/mock/gomock"
 )
 
 // -------------------------------------------------------------------------
@@ -35,7 +36,7 @@ import (
 func setupReaper(t *testing.T) (*PendingReaper, *MockCleanupOps, *MockPlacement, *backendtest.MockObjectBackend, *mockMetadataStore) {
 	t.Helper()
 	ctrl := gomock.NewController(t)
-	ops := NewMockCleanupOps(ctrl)
+	ops := newMockCleanupOps(ctrl)
 	pl := NewMockPlacement(ctrl)
 	be := backendtest.NewMockObjectBackend(ctrl)
 	ms := &mockMetadataStore{}
@@ -63,7 +64,7 @@ func pendingFixture(intentID, key, backendName string) core.PendingObject {
 func TestNewPendingReaper_AppliesZeroDefaults(t *testing.T) {
 	t.Parallel()
 	ctrl := gomock.NewController(t)
-	r := NewPendingReaper(PendingReaperDeps{Ops: NewMockCleanupOps(ctrl), Placement: NewMockPlacement(ctrl), Store: &mockMetadataStore{}})
+	r := NewPendingReaper(PendingReaperDeps{Ops: newMockCleanupOps(ctrl), Placement: NewMockPlacement(ctrl), Store: &mockMetadataStore{}})
 	if r.concurrency != 4 {
 		t.Errorf("concurrency = %d, want 4", r.concurrency)
 	}
@@ -173,6 +174,54 @@ func TestProcessPendingQueue_HeadOKPromotes(t *testing.T) {
 	}
 	if len(ms.promotedPending) != 1 || ms.promotedPending[0].IntentID != "i1" {
 		t.Errorf("PromotePending not called with intent: %+v", ms.promotedPending)
+	}
+}
+
+// TestProcessPendingQueue_CompanionKeptLeavesBytes verifies that an extra-copy
+// intent whose backend already holds a recorded copy is resolved without
+// touching the backend: those bytes are that copy.
+func TestProcessPendingQueue_CompanionKeptLeavesBytes(t *testing.T) {
+	t.Parallel()
+	r, ops, pl, be, ms := setupReaper(t)
+
+	ms.stalePending = []core.PendingObject{pendingFixture("i1", "bucket/k", "b1")}
+	ms.promoteResult = core.PendingPromoteCompanionKept
+	ops.EXPECT().AcquireAdmission(gomock.Any()).Return(true)
+	ops.EXPECT().ReleaseAdmission()
+	ops.EXPECT().GetBackend("b1").Return(be, nil)
+	ops.EXPECT().Acct().Return(newTestRecorder()).AnyTimes()
+	ops.EXPECT().HeadWithTimeout(gomock.Any(), gomock.Any(), "bucket/k").Return(&backend.HeadObjectResult{Size: 100}, nil)
+	pl.EXPECT().DeleteOrEnqueue(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+
+	pendSum := r.ProcessPendingQueue(context.Background())
+	if pendSum.Succeeded != 1 || pendSum.Failed != 0 {
+		t.Errorf("resolved=%d failed=%d, want 1/0", pendSum.Succeeded, pendSum.Failed)
+	}
+}
+
+// TestProcessPendingQueue_CompanionDiscardedRemovesBytes verifies that an
+// extra-copy intent with nothing recorded on its backend has its bytes deleted
+// under the reason the store labelled them with, leaving the copy for the
+// replication worker to rebuild.
+func TestProcessPendingQueue_CompanionDiscardedRemovesBytes(t *testing.T) {
+	t.Parallel()
+	r, ops, pl, be, ms := setupReaper(t)
+
+	ms.stalePending = []core.PendingObject{pendingFixture("i1", "bucket/k", "b1")}
+	ms.promoteResult = core.PendingPromoteCompanionDiscarded
+	ms.promoteDisplaced = []core.DeletedCopy{
+		{BackendName: "b1", SizeBytes: 100, Reason: core.CleanupReasonCompanionDiscarded},
+	}
+	ops.EXPECT().AcquireAdmission(gomock.Any()).Return(true)
+	ops.EXPECT().ReleaseAdmission()
+	ops.EXPECT().GetBackend("b1").Return(be, nil).Times(2)
+	ops.EXPECT().Acct().Return(newTestRecorder()).AnyTimes()
+	ops.EXPECT().HeadWithTimeout(gomock.Any(), gomock.Any(), "bucket/k").Return(&backend.HeadObjectResult{Size: 100}, nil)
+	pl.EXPECT().DeleteOrEnqueue(gomock.Any(), be, "b1", "bucket/k", core.CleanupReasonCompanionDiscarded, int64(100))
+
+	pendSum := r.ProcessPendingQueue(context.Background())
+	if pendSum.Succeeded != 1 || pendSum.Failed != 0 {
+		t.Errorf("resolved=%d failed=%d, want 1/0", pendSum.Succeeded, pendSum.Failed)
 	}
 }
 
@@ -470,7 +519,7 @@ func (f *failingDeleteStore) DeletePending(_ context.Context, _ string) error {
 func TestDropIntent_DeleteFailureCountedAsFailed(t *testing.T) {
 	t.Parallel()
 	ctrl := gomock.NewController(t)
-	ops := NewMockCleanupOps(ctrl)
+	ops := newMockCleanupOps(ctrl)
 	pl := NewMockPlacement(ctrl)
 	ms := &failingDeleteStore{
 		mockMetadataStore: &mockMetadataStore{},

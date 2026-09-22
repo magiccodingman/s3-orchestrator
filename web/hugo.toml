@@ -13,16 +13,36 @@ baseURL = "https://s3-orchestrator.munchbox.cc/"
 languageCode = "en-us"
 title = "s3-orchestrator"
 theme = "hugo-theme-relearn"
+# No page here is filed under a tag or a category, so the taxonomy listings are
+# empty pages a crawler still reaches and reports as missing a description.
+disableKinds = ["taxonomy", "term"]
 
 [params]
   themeVariant = ["s3orchestrator"]
-  description = "Unified S3-compatible storage across multiple backends"
+  # Social card. The OpenGraph and Twitter partials switch to the large-image
+  # card once a page resolves an image; without one, a link shared to Slack,
+  # Reddit, or X renders as bare text.
+  images = ["images/og-card.png"]
+  # Cloudflare Web Analytics site token, emitted as the RUM beacon by
+  # partials/custom-footer.html. Public by design: it names the site rather than
+  # authenticating, and ships in the page source on every request.
+  webAnalyticsToken = "77f2d4d9a4724baeb678a41619d533c5"
+  # Address pages by their directory rather than ".../index.html". The theme
+  # appends that suffix so a build still works opened from disk; served over
+  # HTTP it disagrees with the canonical tag every page carries, leaving og:url
+  # naming a different URL than the page claims for itself.
+  disableExplicitIndexURLs = true
+  # Sections kept out of search results. Pages under these prefixes carry a
+  # noindex robots tag and are left out of the sitemap, so the two cannot
+  # disagree about which pages a search result may land on. The generated Go
+  # API reference outnumbers the documentation two to one, and a crawler
+  # spending its budget there reaches less of what the site is for.
+  noIndexSections = ["/godoc/"]
   editURL = "https://github.com/afreidah/s3-orchestrator/edit/main/web/content/"
   showVisitedLinks = false
   disableLandingPageButton = false
   alwaysopen = true
   collapsibleMenu = true
-  disableSearch = false
   [params.topbar]
     showTableOfContents = false
     showBreadcrumbs = false
@@ -49,3 +69,9 @@ theme = "hugo-theme-relearn"
   [[module.mounts]]
     source = "../CHANGELOG.md"
     target = "assets/repo/CHANGELOG.md"
+  # Mounted as an asset rather than content so the openapi shortcode can
+  # resolve it through resources.Get. The file is generated from the admin
+  # route table; see internal/transport/admin/openapi_spec_test.go.
+  [[module.mounts]]
+    source = "../docs/openapi.yaml"
+    target = "assets/repo/openapi.yaml"

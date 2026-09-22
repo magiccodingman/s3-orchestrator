@@ -1,0 +1,326 @@
+// -------------------------------------------------------------------------------
+// Postgres Store - Bucket and Credential Provisioning
+//
+// Author: Alex Freidah
+//
+// The store half of the bucket registry: buckets, the users that reach them, the
+// keypairs those users authenticate with, and the grants pairing the two. The
+// listings are what registry assembly reads before merging with what config
+// declares; the rest is how each row comes into being and stops being.
+// -------------------------------------------------------------------------------
+
+package postgres
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+
+	"github.com/afreidah/s3-orchestrator/internal/config"
+	"github.com/afreidah/s3-orchestrator/internal/store/core"
+	db "github.com/afreidah/s3-orchestrator/internal/store/postgres/sqlc"
+)
+
+// -------------------------------------------------------------------------
+// LISTINGS
+// -------------------------------------------------------------------------
+
+// ListBuckets returns every stored bucket, ordered by name.
+func (s *Store) ListBuckets(ctx context.Context) ([]core.Bucket, error) {
+	rows, err := s.queries.ListBuckets(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list buckets: %w", err)
+	}
+	out := make([]core.Bucket, 0, len(rows))
+	for i := range rows {
+		b, err := bucketFromRow(&rows[i])
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, b)
+	}
+	return out, nil
+}
+
+// ListUsers returns every stored user, ordered by name.
+func (s *Store) ListUsers(ctx context.Context) ([]core.User, error) {
+	rows, err := s.queries.ListUsers(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list users: %w", err)
+	}
+	return mapSlice(rows, userFromRow), nil
+}
+
+// ListCredentials returns every stored keypair, ordered by access key.
+func (s *Store) ListCredentials(ctx context.Context) ([]core.Credential, error) {
+	rows, err := s.queries.ListCredentials(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list credentials: %w", err)
+	}
+	return mapSlice(rows, credentialFromRow), nil
+}
+
+// ListGrants returns every stored grant, ordered by user then bucket.
+func (s *Store) ListGrants(ctx context.Context) ([]core.Grant, error) {
+	rows, err := s.queries.ListGrants(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list grants: %w", err)
+	}
+	out := make([]core.Grant, 0, len(rows))
+	for i := range rows {
+		g, err := grantFromRow(&rows[i])
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, g)
+	}
+	return out, nil
+}
+
+// -------------------------------------------------------------------------
+// WRITES
+// -------------------------------------------------------------------------
+
+// CreateBucket inserts a bucket.
+func (s *Store) CreateBucket(ctx context.Context, b *core.Bucket) error {
+	cors, err := marshalCORS(b.CORS)
+	if err != nil {
+		return err
+	}
+	if err := s.queries.CreateBucket(ctx, db.CreateBucketParams{
+		Name:                b.Name,
+		MaxMultipartUploads: int32(b.MaxMultipartUploads), //nolint:gosec // G115: bounded by config validation
+		Cors:                cors,
+	}); err != nil {
+		return fmt.Errorf("create bucket %s: %w", b.Name, err)
+	}
+	return nil
+}
+
+// CreateUser inserts a user.
+func (s *Store) CreateUser(ctx context.Context, u *core.User) error {
+	if err := s.queries.CreateUser(ctx, db.CreateUserParams{
+		ID:   u.ID,
+		Name: u.Name,
+	}); err != nil {
+		return fmt.Errorf("create user %s: %w", u.Name, err)
+	}
+	return nil
+}
+
+// CreateCredential inserts a keypair against an existing user.
+//
+// The error names the access key rather than the secret, which never reaches a
+// log, an error string or an audit record on any path.
+func (s *Store) CreateCredential(ctx context.Context, c *core.Credential) error {
+	if err := s.queries.CreateCredential(ctx, db.CreateCredentialParams{
+		AccessKeyID: c.AccessKeyID,
+		UserID:      c.UserID,
+		Secret:      c.Secret,
+		Label:       nullableString(c.Label),
+		Disabled:    c.Disabled,
+	}); err != nil {
+		return fmt.Errorf("create credential %s: %w", c.AccessKeyID, err)
+	}
+	return nil
+}
+
+// CreateGrant gives a user access to one resource.
+func (s *Store) CreateGrant(ctx context.Context, g *core.Grant) error {
+	if err := s.queries.CreateGrant(ctx, db.CreateGrantParams{
+		UserID:       g.UserID,
+		ResourceKind: string(g.Resource.Kind),
+		ResourceName: g.Resource.Name,
+		Permissions:  g.Permissions.String(),
+	}); err != nil {
+		return fmt.Errorf("create grant %s -> %s %s: %w", g.UserID, g.Resource.Kind, g.Resource.Name, err)
+	}
+	return nil
+}
+
+// UpdateBucket writes what a bucket carries. The name identifies it and its
+// objects, so it is the lookup rather than something this can change.
+func (s *Store) UpdateBucket(ctx context.Context, b *core.Bucket) error {
+	cors, err := marshalCORS(b.CORS)
+	if err != nil {
+		return err
+	}
+	if err := s.queries.UpdateBucket(ctx, db.UpdateBucketParams{
+		Name:                b.Name,
+		MaxMultipartUploads: int32(b.MaxMultipartUploads), //nolint:gosec // G115: bounded by config validation
+		Cors:                cors,
+	}); err != nil {
+		return fmt.Errorf("update bucket %s: %w", b.Name, err)
+	}
+	return nil
+}
+
+// RenameUser changes the name an operator reads a user by. The id is what
+// credentials and grants reference and does not move.
+func (s *Store) RenameUser(ctx context.Context, id, name string) error {
+	if err := s.queries.RenameUser(ctx, db.RenameUserParams{ID: id, Name: name}); err != nil {
+		return fmt.Errorf("rename user %s: %w", id, err)
+	}
+	return nil
+}
+
+// SetGrant records exactly what a user reaches on one resource, creating the
+// grant when it is absent. The upsert is what lets a caller declare access
+// without first asking whether it is already there.
+func (s *Store) SetGrant(ctx context.Context, g *core.Grant) error {
+	if err := s.queries.SetGrant(ctx, db.SetGrantParams{
+		UserID:       g.UserID,
+		ResourceKind: string(g.Resource.Kind),
+		ResourceName: g.Resource.Name,
+		Permissions:  g.Permissions.String(),
+	}); err != nil {
+		return fmt.Errorf("set grant %s -> %s %s: %w", g.UserID, g.Resource.Kind, g.Resource.Name, err)
+	}
+	return nil
+}
+
+// DeleteBucket removes a stored bucket. Objects under it are unaffected, so a
+// caller that means to destroy data does that first.
+func (s *Store) DeleteBucket(ctx context.Context, name string) error {
+	if err := s.queries.DeleteBucket(ctx, name); err != nil {
+		return fmt.Errorf("delete bucket %s: %w", name, err)
+	}
+	return nil
+}
+
+// DeleteUser removes a user. The foreign keys refuse while it still holds
+// credentials or grants, so those are removed first and revocation stays an
+// explicit act.
+func (s *Store) DeleteUser(ctx context.Context, id string) error {
+	if err := s.queries.DeleteUser(ctx, id); err != nil {
+		return fmt.Errorf("delete user %s: %w", id, err)
+	}
+	return nil
+}
+
+// DeleteCredential revokes one keypair, leaving its siblings working.
+func (s *Store) DeleteCredential(ctx context.Context, accessKeyID string) error {
+	if err := s.queries.DeleteCredential(ctx, accessKeyID); err != nil {
+		return fmt.Errorf("delete credential %s: %w", accessKeyID, err)
+	}
+	return nil
+}
+
+// DeleteGrant withdraws a user's access to one resource, leaving its other
+// grants in place.
+func (s *Store) DeleteGrant(ctx context.Context, userID string, r core.Resource) error {
+	if err := s.queries.DeleteGrant(ctx, db.DeleteGrantParams{
+		UserID:       userID,
+		ResourceKind: string(r.Kind),
+		ResourceName: r.Name,
+	}); err != nil {
+		return fmt.Errorf("delete grant %s -> %s %s: %w", userID, r.Kind, r.Name, err)
+	}
+	return nil
+}
+
+// -------------------------------------------------------------------------
+// ROW CONVERSION
+// -------------------------------------------------------------------------
+
+// bucketFromRow converts a sqlc buckets row into the canonical core.Bucket.
+func bucketFromRow(r *db.Bucket) (core.Bucket, error) {
+	cors, err := unmarshalCORS(r.Cors)
+	if err != nil {
+		return core.Bucket{}, err
+	}
+	return core.Bucket{
+		Name:                r.Name,
+		MaxMultipartUploads: int(r.MaxMultipartUploads),
+		CORS:                cors,
+		CreatedAt:           r.CreatedAt.Time,
+	}, nil
+}
+
+// userFromRow converts a sqlc users row into the canonical type.
+func userFromRow(r *db.User) core.User {
+	return core.User{
+		ID:        r.ID,
+		Name:      r.Name,
+		CreatedAt: r.CreatedAt.Time,
+	}
+}
+
+// credentialFromRow converts a sqlc credentials row into the canonical type.
+func credentialFromRow(r *db.Credential) core.Credential {
+	label := ""
+	if r.Label != nil {
+		label = *r.Label
+	}
+	return core.Credential{
+		AccessKeyID: r.AccessKeyID,
+		UserID:      r.UserID,
+		Secret:      r.Secret,
+		Label:       label,
+		Disabled:    r.Disabled,
+		CreatedAt:   r.CreatedAt.Time,
+		LastUsedAt:  timestamptzPtr(r.LastUsedAt),
+	}
+}
+
+// grantFromRow converts a sqlc grants row into the canonical type, compiling
+// the stored permission list into the bit set the request path tests against.
+//
+// A value nothing recognises fails the read rather than resolving to some set.
+// Assembly stops, which is the safe direction: falling back to full access
+// would grant what nobody wrote down, and to none would refuse a caller the
+// operator authorized.
+func grantFromRow(r *db.ListGrantsRow) (core.Grant, error) {
+	resource := core.Resource{Kind: core.ParseResourceKind(r.ResourceKind), Name: r.ResourceName}
+	// The empty stored value means different things on the two planes, so the
+	// resource is what the parse is told.
+	perms, err := core.ParsePermissions(resource.Kind, r.Permissions)
+	if err != nil {
+		return core.Grant{}, fmt.Errorf("grant %s -> %s: %w", r.UserID, resource, err)
+	}
+	return core.Grant{
+		UserID:      r.UserID,
+		Resource:    resource,
+		Permissions: perms,
+		CreatedAt:   r.CreatedAt.Time,
+	}, nil
+}
+
+// -------------------------------------------------------------------------
+// HELPERS
+// -------------------------------------------------------------------------
+
+// nullableString returns a *string for a column that stores NULL rather than
+// the empty value, which label does when a credential carries no name.
+func nullableString(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
+}
+
+// marshalCORS renders a bucket's browser rules for storage. A bucket with no
+// rules stores NULL rather than an empty array, so "no CORS configured" is one
+// value in the column rather than two.
+func marshalCORS(rules []config.CORSRule) ([]byte, error) {
+	if len(rules) == 0 {
+		return nil, nil
+	}
+	encoded, err := json.Marshal(rules)
+	if err != nil {
+		return nil, fmt.Errorf("encode bucket cors: %w", err)
+	}
+	return encoded, nil
+}
+
+// unmarshalCORS reads a bucket's browser rules back.
+func unmarshalCORS(raw []byte) ([]config.CORSRule, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	var rules []config.CORSRule
+	if err := json.Unmarshal(raw, &rules); err != nil {
+		return nil, fmt.Errorf("decode bucket cors: %w", err)
+	}
+	return rules, nil
+}

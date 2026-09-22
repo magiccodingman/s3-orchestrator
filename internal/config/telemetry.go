@@ -12,6 +12,8 @@
 
 package config
 
+import "cmp"
+
 // TelemetryConfig holds observability settings.
 type TelemetryConfig struct {
 	Metrics MetricsConfig `yaml:"metrics"`
@@ -26,11 +28,27 @@ type TelemetryConfig struct {
 // production deployments should leave Pprof false. When enabled, it
 // is only mounted on the dedicated metrics listener (Listen must be
 // set) - never on the main S3 listener.
+//
+// RequireListener defaults to true. A deployment that reports healthy while
+// Prometheus silently receives nothing is the worse of the two failures,
+// because nothing about it looks wrong until someone goes looking for a graph.
+// Dev and embedded use set it false, where the port may well be taken and
+// best-effort metrics are fine; it is a pointer so an explicit false is
+// distinguishable from an omitted field.
 type MetricsConfig struct {
 	Enabled bool   `yaml:"enabled"`
 	Path    string `yaml:"path"`
 	Listen  string `yaml:"listen"` // Separate listener address (e.g. "127.0.0.1:9091"); if empty, metrics are served on the main listener
 	Pprof   bool   `yaml:"pprof"`  // Mount /debug/pprof/* on the metrics listener. Off by default; requires Listen to be set.
+
+	RequireListener *bool `yaml:"require_listener"` // fail startup if the metrics listener cannot bind
+}
+
+// ListenerRequired reports whether a metrics bind failure should abort startup.
+// Only meaningful when Listen is set; metrics served on the main listener share
+// its socket and have nothing separate to fail.
+func (m MetricsConfig) ListenerRequired() bool {
+	return m.RequireListener == nil || *m.RequireListener
 }
 
 // TracingConfig holds OpenTelemetry tracing settings.
@@ -45,9 +63,7 @@ type TracingConfig struct {
 func (t *TelemetryConfig) setDefaultsAndValidate() []error {
 	var errs []error
 
-	if t.Metrics.Path == "" {
-		t.Metrics.Path = "/metrics"
-	}
+	t.Metrics.Path = cmp.Or(t.Metrics.Path, "/metrics")
 	if t.Tracing.SampleRate == 0 && t.Tracing.Enabled {
 		t.Tracing.SampleRate = 1.0
 	}

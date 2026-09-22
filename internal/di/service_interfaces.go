@@ -3,9 +3,9 @@
 //
 // Author: Alex Freidah
 //
-// Narrow contracts each lifecycle.Runner service in services.go pulls
-// from *proxy.BackendManager (or its sub-managers). DI wiring still
-// passes the concrete value through without per-interface providers.
+// Narrow contracts each lifecycle.Runner service in services.go pulls from
+// the collaborators DI builds. Each names one provider's surface, so a
+// service's dependency footprint is readable without opening the provider.
 // Pattern rationale: docs/style-guide.md (Interface Design section).
 // -------------------------------------------------------------------------------
 
@@ -15,23 +15,37 @@ import (
 	"context"
 
 	"github.com/afreidah/s3-orchestrator/internal/config"
+	"github.com/afreidah/s3-orchestrator/internal/progress"
 )
 
-// usageFlushOps is the subset of *proxy.BackendManager that
-// usageFlushService needs to read flush configuration, decide whether
-// to acquire an advisory lock, and run the flush + metrics tick.
+// usageFlushOps is the subset of *usage.Service that usageFlushService needs
+// to read flush configuration, decide whether to acquire an advisory lock,
+// and run the flush itself.
 type usageFlushOps interface {
-	UsageFlushConfig() *config.UsageFlushConfig
-	NearUsageLimit(threshold float64) bool
+	Config() *config.UsageFlushConfig
 	RedisCounterConfigured() bool
 	FlushUsage(ctx context.Context) error
+	FlushQuota(ctx context.Context) error
+}
+
+// nearLimitReporter is the *counter.UsageTracker read that drives the
+// adaptive tick. Declared against the tracker rather than routed through a
+// service, because a backend approaching its limit is a fact about the
+// counters and nothing in between adds to it.
+type nearLimitReporter interface {
+	NearLimit(threshold float64) bool
+}
+
+// quotaMetricsRefresher is the *infra.BackendRuntime call that republishes the
+// quota gauges after a flush, so the numbers operators watch move with the
+// ones just written.
+type quotaMetricsRefresher interface {
 	UpdateQuotaMetrics(ctx context.Context) error
 }
 
-// lifecycleOps is the subset of *proxy.BackendManager that
-// NewLifecycleService needs to read the lifecycle config and process a
-// tick.
+// lifecycleOps is the subset of *expiry.Manager that NewLifecycleService
+// needs to read the lifecycle config and process a tick.
 type lifecycleOps interface {
-	LifecycleConfig() *config.LifecycleConfig
-	ProcessLifecycleRules(ctx context.Context, rules []config.LifecycleRule) (deleted, failed int)
+	Config() *config.LifecycleConfig
+	ProcessRules(ctx context.Context, rules []config.LifecycleRule, observer progress.Observer) (deleted, failed int)
 }

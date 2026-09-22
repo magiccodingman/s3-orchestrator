@@ -12,6 +12,7 @@ package config
 import (
 	"errors"
 	"log/slog"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -72,114 +73,115 @@ func TestConfigValidation_MissingRequired(t *testing.T) {
 	}
 }
 
-// TestConfigValidation_DuplicateBackendNames verifies the config validation duplicate backend names path by exercising cfg.SetDefaultsAndValidate.
-func TestConfigValidation_DuplicateBackendNames(t *testing.T) {
+// TestConfigValidation_FieldRules covers the per-field rules
+// SetDefaultsAndValidate enforces. Every case starts from a config that
+// validates, changes one thing, and says whether the result is still allowed -
+// so the rule under test is the line of the table, not a function of its own.
+func TestConfigValidation_FieldRules(t *testing.T) {
 	t.Parallel()
-	cfg := validBaseConfig()
-	cfg.Backends = []BackendConfig{
-		{Name: "dup", Endpoint: "e", Bucket: "b", AccessKeyID: "a", SecretAccessKey: "s", QuotaBytes: 1},
-		{Name: "dup", Endpoint: "e", Bucket: "b", AccessKeyID: "a", SecretAccessKey: "s", QuotaBytes: 1},
+	tests := []struct {
+		name    string
+		mutate  func(*Config)
+		wantErr bool
+	}{
+		{"duplicate backend names", func(c *Config) {
+			dup := BackendConfig{Name: "dup", Endpoint: "e", Bucket: "b", AccessKeyID: "a", SecretAccessKey: "s", QuotaBytes: 1}
+			c.Backends = []BackendConfig{dup, dup}
+		}, true},
+		{"negative quota", func(c *Config) { c.Backends[0].QuotaBytes = -1 }, true},
+		{"negative max_concurrent_requests", func(c *Config) { c.Server.MaxConcurrentRequests = -1 }, true},
+		{"negative max_concurrent_reads", func(c *Config) { c.Server.MaxConcurrentReads = -1 }, true},
+		{"negative max_concurrent_writes", func(c *Config) { c.Server.MaxConcurrentWrites = -1 }, true},
+		{"negative max_header_bytes", func(c *Config) { c.Server.MaxHeaderBytes = -1 }, true},
+		{"negative max_header_value_count", func(c *Config) { c.Server.MaxHeaderValueCount = -1 }, true},
+		{"explicit header limits", func(c *Config) {
+			c.Server.MaxHeaderBytes = 8192
+			c.Server.MaxHeaderValueCount = 64
+		}, false},
+		{"load_shed_threshold at or above 1.0", func(c *Config) { c.Server.LoadShedThreshold = 1.5 }, true},
+		{"negative load_shed_threshold", func(c *Config) { c.Server.LoadShedThreshold = -0.5 }, true},
+		{"load_shed_threshold in range", func(c *Config) { c.Server.LoadShedThreshold = 0.8 }, false},
+		{"negative admission_wait", func(c *Config) { c.Server.AdmissionWait = -1 * time.Second }, true},
+		{"negative api_request_limit", func(c *Config) { c.Backends[0].APIRequestLimit = -1 }, true},
+		{"negative egress_byte_limit", func(c *Config) { c.Backends[0].EgressByteLimit = -1 }, true},
+		{"negative ingress_byte_limit", func(c *Config) { c.Backends[0].IngressByteLimit = -1 }, true},
+		{"zero usage limits mean unlimited", func(c *Config) {
+			c.Backends[0].APIRequestLimit = 0
+			c.Backends[0].EgressByteLimit = 0
+			c.Backends[0].IngressByteLimit = 0
+		}, false},
+		{"request pools with a bare api_request_limit", func(c *Config) {
+			c.Backends[0].APIRequestLimit = 5000
+			c.Backends[0].RequestLimits = []RequestPoolConfig{
+				{Name: "class_a", Operations: []string{"PutObject"}, Limit: 5000},
+			}
+		}, true},
+		{"request pool without a name", func(c *Config) {
+			c.Backends[0].RequestLimits = []RequestPoolConfig{
+				{Operations: []string{"PutObject"}, Limit: 1},
+			}
+		}, true},
+		{"duplicate request pool names", func(c *Config) {
+			c.Backends[0].RequestLimits = []RequestPoolConfig{
+				{Name: "class_a", Operations: []string{"PutObject"}, Limit: 1},
+				{Name: "class_a", Operations: []string{"GetObject"}, Limit: 1},
+			}
+		}, true},
+		{"request pool with no operations", func(c *Config) {
+			c.Backends[0].RequestLimits = []RequestPoolConfig{{Name: "class_a", Limit: 1}}
+		}, true},
+		{"negative request pool limit", func(c *Config) {
+			c.Backends[0].RequestLimits = []RequestPoolConfig{
+				{Name: "class_a", Operations: []string{"PutObject"}, Limit: -1},
+			}
+		}, true},
+		{"request pool naming an unknown operation", func(c *Config) {
+			c.Backends[0].RequestLimits = []RequestPoolConfig{
+				{Name: "class_a", Operations: []string{"PutObjectTagging"}, Limit: 1},
+			}
+		}, true},
+		{"unmetered naming an unknown operation", func(c *Config) {
+			c.Backends[0].Unmetered = []string{"PutObjectTagging"}
+		}, true},
+		{"unmetered wildcard", func(c *Config) {
+			c.Backends[0].Unmetered = []string{"*"}
+		}, true},
+		{"pool charging an operation listed as unmetered", func(c *Config) {
+			c.Backends[0].Unmetered = []string{"DeleteObject"}
+			c.Backends[0].RequestLimits = []RequestPoolConfig{
+				{Name: "class_a", Operations: []string{"DeleteObject"}, Limit: 1},
+			}
+		}, true},
+		{"a provider's classes, spelled out", func(c *Config) {
+			c.Backends[0].APIRequestLimit = 0
+			c.Backends[0].Unmetered = []string{"DeleteObject", "DeleteObjects", "AbortMultipartUpload"}
+			c.Backends[0].RequestLimits = []RequestPoolConfig{
+				{Name: "class_a", Operations: []string{"PutObject", "CopyObject", "ListObjects"}, Limit: 5000},
+				{Name: "class_b", Operations: []string{"GetObject", "HeadObject", "GetParts"}, Limit: 50000},
+			}
+		}, false},
+		{"wildcard pool with an unlimited ceiling", func(c *Config) {
+			c.Backends[0].APIRequestLimit = 0
+			c.Backends[0].RequestLimits = []RequestPoolConfig{
+				{Name: "all", Operations: []string{"*"}, Limit: 0},
+			}
+		}, false},
 	}
 
-	err := cfg.SetDefaultsAndValidate()
-	if err == nil {
-		t.Error("duplicate backend names should fail validation")
-	}
-}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := validBaseConfig()
+			tt.mutate(&cfg)
 
-// TestConfigValidation_NegativeQuota verifies the config validation negative quota path by exercising cfg.SetDefaultsAndValidate.
-func TestConfigValidation_NegativeQuota(t *testing.T) {
-	t.Parallel()
-	cfg := validBaseConfig()
-	cfg.Backends[0].QuotaBytes = -1
-
-	err := cfg.SetDefaultsAndValidate()
-	if err == nil {
-		t.Error("negative quota should fail validation")
-	}
-}
-
-// TestConfigValidation_NegativeMaxConcurrentRequests verifies the config validation negative max concurrent requests path by exercising cfg.SetDefaultsAndValidate.
-func TestConfigValidation_NegativeMaxConcurrentRequests(t *testing.T) {
-	t.Parallel()
-	cfg := validBaseConfig()
-	cfg.Server.MaxConcurrentRequests = -1
-
-	err := cfg.SetDefaultsAndValidate()
-	if err == nil {
-		t.Error("negative max_concurrent_requests should fail validation")
-	}
-}
-
-// TestConfigValidation_NegativeMaxConcurrentReads verifies the config validation negative max concurrent reads path by exercising cfg.SetDefaultsAndValidate.
-func TestConfigValidation_NegativeMaxConcurrentReads(t *testing.T) {
-	t.Parallel()
-	cfg := validBaseConfig()
-	cfg.Server.MaxConcurrentReads = -1
-
-	err := cfg.SetDefaultsAndValidate()
-	if err == nil {
-		t.Error("negative max_concurrent_reads should fail validation")
-	}
-}
-
-// TestConfigValidation_NegativeMaxConcurrentWrites verifies the config validation negative max concurrent writes path by exercising cfg.SetDefaultsAndValidate.
-func TestConfigValidation_NegativeMaxConcurrentWrites(t *testing.T) {
-	t.Parallel()
-	cfg := validBaseConfig()
-	cfg.Server.MaxConcurrentWrites = -1
-
-	err := cfg.SetDefaultsAndValidate()
-	if err == nil {
-		t.Error("negative max_concurrent_writes should fail validation")
-	}
-}
-
-// TestConfigValidation_InvalidLoadShedThreshold verifies the config validation invalid load shed threshold path by exercising cfg.SetDefaultsAndValidate.
-func TestConfigValidation_InvalidLoadShedThreshold(t *testing.T) {
-	t.Parallel()
-	cfg := validBaseConfig()
-	cfg.Server.LoadShedThreshold = 1.5
-
-	err := cfg.SetDefaultsAndValidate()
-	if err == nil {
-		t.Error("load_shed_threshold >= 1.0 should fail validation")
-	}
-}
-
-// TestConfigValidation_NegativeLoadShedThreshold verifies the config validation negative load shed threshold path by exercising cfg.SetDefaultsAndValidate.
-func TestConfigValidation_NegativeLoadShedThreshold(t *testing.T) {
-	t.Parallel()
-	cfg := validBaseConfig()
-	cfg.Server.LoadShedThreshold = -0.5
-
-	err := cfg.SetDefaultsAndValidate()
-	if err == nil {
-		t.Error("negative load_shed_threshold should fail validation")
-	}
-}
-
-// TestConfigValidation_ValidLoadShedThreshold verifies the config validation valid load shed threshold contract.
-// Asserts that valid load_shed_threshold 0.8 should pass:.
-func TestConfigValidation_ValidLoadShedThreshold(t *testing.T) {
-	t.Parallel()
-	cfg := validBaseConfig()
-	cfg.Server.LoadShedThreshold = 0.8
-
-	if err := cfg.SetDefaultsAndValidate(); err != nil {
-		t.Errorf("valid load_shed_threshold 0.8 should pass: %v", err)
-	}
-}
-
-// TestConfigValidation_NegativeAdmissionWait verifies the config validation negative admission wait path by exercising cfg.SetDefaultsAndValidate.
-func TestConfigValidation_NegativeAdmissionWait(t *testing.T) {
-	t.Parallel()
-	cfg := validBaseConfig()
-	cfg.Server.AdmissionWait = -1 * time.Second
-
-	err := cfg.SetDefaultsAndValidate()
-	if err == nil {
-		t.Error("negative admission_wait should fail validation")
+			err := cfg.SetDefaultsAndValidate()
+			if tt.wantErr && err == nil {
+				t.Error("expected validation to fail")
+			}
+			if !tt.wantErr && err != nil {
+				t.Errorf("expected validation to pass, got %v", err)
+			}
+		})
 	}
 }
 
@@ -785,74 +787,21 @@ func TestConfigValidation_MultiBackendNoReplicationWarns(t *testing.T) {
 	}
 }
 
-// TestConfigValidation_NegativeAPIRequestLimit verifies the config validation negative apirequest limit path by exercising cfg.SetDefaultsAndValidate.
-func TestConfigValidation_NegativeAPIRequestLimit(t *testing.T) {
-	t.Parallel()
-	cfg := validBaseConfig()
-	cfg.Backends[0].APIRequestLimit = -1
-
-	err := cfg.SetDefaultsAndValidate()
-	if err == nil {
-		t.Error("negative api_request_limit should fail validation")
-	}
-}
-
-// TestConfigValidation_NegativeEgressByteLimit verifies the config validation negative egress byte limit path by exercising cfg.SetDefaultsAndValidate.
-func TestConfigValidation_NegativeEgressByteLimit(t *testing.T) {
-	t.Parallel()
-	cfg := validBaseConfig()
-	cfg.Backends[0].EgressByteLimit = -1
-
-	err := cfg.SetDefaultsAndValidate()
-	if err == nil {
-		t.Error("negative egress_byte_limit should fail validation")
-	}
-}
-
-// TestConfigValidation_NegativeIngressByteLimit verifies the config validation negative ingress byte limit path by exercising cfg.SetDefaultsAndValidate.
-func TestConfigValidation_NegativeIngressByteLimit(t *testing.T) {
-	t.Parallel()
-	cfg := validBaseConfig()
-	cfg.Backends[0].IngressByteLimit = -1
-
-	err := cfg.SetDefaultsAndValidate()
-	if err == nil {
-		t.Error("negative ingress_byte_limit should fail validation")
-	}
-}
-
-// TestConfigValidation_ZeroUsageLimitsMeansUnlimited verifies the config validation zero usage limits means unlimited contract.
-// Asserts that zero usage limits (unlimited) should pass validation:.
-func TestConfigValidation_ZeroUsageLimitsMeansUnlimited(t *testing.T) {
-	t.Parallel()
-	cfg := validBaseConfig()
-	// All zero  -  should pass (unlimited)
-	cfg.Backends[0].APIRequestLimit = 0
-	cfg.Backends[0].EgressByteLimit = 0
-	cfg.Backends[0].IngressByteLimit = 0
-
-	if err := cfg.SetDefaultsAndValidate(); err != nil {
-		t.Errorf("zero usage limits (unlimited) should pass validation: %v", err)
-	}
-}
-
 // -------------------------------------------------------------------------
 // BUCKET VALIDATION TESTS
 // -------------------------------------------------------------------------
 
-// TestConfigValidation_NoBuckets verifies the config validation no buckets contract.
-// Asserts that error should mention missing buckets, got:.
+// TestConfigValidation_NoBuckets verifies a config declaring no buckets is
+// accepted. The store declares buckets too, so a deployment that keeps them all
+// there has nothing to put here, and a new one boots with none and provisions
+// them through the admin API.
 func TestConfigValidation_NoBuckets(t *testing.T) {
 	t.Parallel()
 	cfg := validBaseConfig()
 	cfg.Buckets = nil
 
-	err := cfg.SetDefaultsAndValidate()
-	if err == nil {
-		t.Error("no buckets should fail validation")
-	}
-	if !strings.Contains(err.Error(), "at least one bucket") {
-		t.Errorf("error should mention missing buckets, got: %v", err)
+	if err := cfg.SetDefaultsAndValidate(); err != nil {
+		t.Errorf("declaring no buckets should validate, got: %v", err)
 	}
 }
 
@@ -965,19 +914,32 @@ func TestConfigValidation_MultipleCredentialsOnSameBucket(t *testing.T) {
 	}
 }
 
-// TestConfigValidation_TokenCredential verifies the config validation token credential contract.
-// Asserts that token-only credential should pass:.
-func TestConfigValidation_TokenCredential(t *testing.T) {
+// TestConfigValidation_CredentialNeedsAKeypair verifies a credential must carry
+// both halves of a keypair.
+//
+// A token-only credential used to be valid. Tokens are gone, so such an entry
+// now names no way to authenticate and is refused rather than silently
+// producing a credential nothing can present.
+func TestConfigValidation_CredentialNeedsAKeypair(t *testing.T) {
 	t.Parallel()
-	cfg := validBaseConfig()
-	cfg.Buckets = []BucketConfig{
-		{Name: "legacy", Credentials: []CredentialConfig{
-			{Token: "my-token"},
-		}},
-	}
-
-	if err := cfg.SetDefaultsAndValidate(); err != nil {
-		t.Errorf("token-only credential should pass: %v", err)
+	for _, tc := range []struct {
+		name string
+		cred CredentialConfig
+	}{
+		{"neither half", CredentialConfig{}},
+		{"key alone", CredentialConfig{AccessKeyID: "AK"}},
+		{"secret alone", CredentialConfig{SecretAccessKey: "SK"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := validBaseConfig()
+			cfg.Buckets = []BucketConfig{
+				{Name: "legacy", Credentials: []CredentialConfig{tc.cred}},
+			}
+			if err := cfg.SetDefaultsAndValidate(); err == nil {
+				t.Error("a credential with no usable keypair passed validation")
+			}
+		})
 	}
 }
 
@@ -1133,6 +1095,51 @@ func TestNonReloadableFieldsChanged_LoadShedThreshold(t *testing.T) {
 	changed := NonReloadableFieldsChanged(&a, &b)
 	if len(changed) != 1 || changed[0] != "server.load_shed_threshold" {
 		t.Errorf("expected [server.load_shed_threshold], got %v", changed)
+	}
+}
+
+// TestHeaderLimits_DefaultToStdlib pins the unconfigured case: an operator
+// who never sets these gets exactly what net/http would have given them,
+// so adding the knobs did not quietly retune anyone's server.
+func TestHeaderLimits_DefaultToStdlib(t *testing.T) {
+	t.Parallel()
+	cfg := validBaseConfig()
+	if err := cfg.SetDefaultsAndValidate(); err != nil {
+		t.Fatalf("SetDefaultsAndValidate: %v", err)
+	}
+	if got := cfg.Server.MaxHeaderBytes; got != http.DefaultMaxHeaderBytes {
+		t.Errorf("MaxHeaderBytes = %d, want %d", got, http.DefaultMaxHeaderBytes)
+	}
+	if got := cfg.Server.MaxHeaderValueCount; got != http.DefaultMaxHeaderValueCount {
+		t.Errorf("MaxHeaderValueCount = %d, want %d", got, http.DefaultMaxHeaderValueCount)
+	}
+}
+
+// TestNonReloadableFieldsChanged_HeaderLimits covers both knobs: they land
+// on http.Server at construction, so SIGHUP has to report them as needing
+// a restart rather than silently keeping the old caps.
+func TestNonReloadableFieldsChanged_HeaderLimits(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		field  string
+		mutate func(*Config)
+	}{
+		{"server.max_header_bytes", func(c *Config) { c.Server.MaxHeaderBytes = 8192 }},
+		{"server.max_header_value_count", func(c *Config) { c.Server.MaxHeaderValueCount = 64 }},
+	} {
+		t.Run(tt.field, func(t *testing.T) {
+			t.Parallel()
+			a := validBaseConfig()
+			b := validBaseConfig()
+			_ = a.SetDefaultsAndValidate()
+			tt.mutate(&b)
+			_ = b.SetDefaultsAndValidate()
+
+			changed := NonReloadableFieldsChanged(&a, &b)
+			if len(changed) != 1 || changed[0] != tt.field {
+				t.Errorf("expected [%s], got %v", tt.field, changed)
+			}
+		})
 	}
 }
 
@@ -1709,8 +1716,8 @@ func TestLifecycleConfig_MissingPrefix(t *testing.T) {
 	if err == nil {
 		t.Error("empty prefix should fail validation")
 	}
-	if !errors.Is(err, ErrLifecyclePrefixRequired) {
-		t.Errorf("error should wrap ErrLifecyclePrefixRequired, got: %v", err)
+	if !errors.Is(err, ErrLifecycleFilterRequired) {
+		t.Errorf("error should wrap ErrLifecycleFilterRequired, got: %v", err)
 	}
 }
 
@@ -1766,8 +1773,94 @@ func TestLifecycleConfig_DuplicatePrefix(t *testing.T) {
 	if err == nil {
 		t.Error("duplicate prefix should fail validation")
 	}
-	if !strings.Contains(err.Error(), "duplicate prefix") {
-		t.Errorf("error should mention duplicate prefix, got: %v", err)
+	if !strings.Contains(err.Error(), "duplicate filter") {
+		t.Errorf("error should mention a duplicate filter, got: %v", err)
+	}
+}
+
+// TestLifecycleConfig_TagsSatisfyTheFilterRequirement verifies a rule may
+// filter on tags alone. The prefix requirement exists to stop a rule matching
+// the whole namespace, which a tag filter also prevents.
+func TestLifecycleConfig_TagsSatisfyTheFilterRequirement(t *testing.T) {
+	t.Parallel()
+	cfg := validBaseConfig()
+	cfg.Lifecycle = LifecycleConfig{
+		Rules: []LifecycleRule{
+			{Tags: map[string]string{"scratch": "true"}, ExpirationDays: 7},
+		},
+	}
+
+	if err := cfg.SetDefaultsAndValidate(); err != nil {
+		t.Errorf("a tags-only rule should validate, got: %v", err)
+	}
+}
+
+// TestLifecycleConfig_NoFilterRejected verifies a rule with neither a prefix
+// nor tags is refused rather than expiring every object in the namespace.
+func TestLifecycleConfig_NoFilterRejected(t *testing.T) {
+	t.Parallel()
+	cfg := validBaseConfig()
+	cfg.Lifecycle = LifecycleConfig{
+		Rules: []LifecycleRule{{ExpirationDays: 7}},
+	}
+
+	err := cfg.SetDefaultsAndValidate()
+	if err == nil {
+		t.Fatal("a rule with no filter should fail validation")
+	}
+	if !errors.Is(err, ErrLifecycleFilterRequired) {
+		t.Errorf("error should wrap ErrLifecycleFilterRequired, got: %v", err)
+	}
+}
+
+// TestLifecycleConfig_EmptyTagKeyRejected verifies an empty tag key is caught
+// at startup rather than becoming a filter that silently matches nothing.
+func TestLifecycleConfig_EmptyTagKeyRejected(t *testing.T) {
+	t.Parallel()
+	cfg := validBaseConfig()
+	cfg.Lifecycle = LifecycleConfig{
+		Rules: []LifecycleRule{
+			{Prefix: "tmp/", Tags: map[string]string{"": "x"}, ExpirationDays: 7},
+		},
+	}
+
+	err := cfg.SetDefaultsAndValidate()
+	if err == nil {
+		t.Fatal("an empty tag key should fail validation")
+	}
+	if !errors.Is(err, ErrLifecycleEmptyTagKey) {
+		t.Errorf("error should wrap ErrLifecycleEmptyTagKey, got: %v", err)
+	}
+}
+
+// TestLifecycleConfig_SamePrefixDifferentTags verifies two rules sharing a
+// prefix but differing by tag are a legitimate pair: they select different
+// objects, so the duplicate check has to compare the whole filter.
+func TestLifecycleConfig_SamePrefixDifferentTags(t *testing.T) {
+	t.Parallel()
+	cfg := validBaseConfig()
+	cfg.Lifecycle = LifecycleConfig{
+		Rules: []LifecycleRule{
+			{Prefix: "logs/", Tags: map[string]string{"env": "staging"}, ExpirationDays: 7},
+			{Prefix: "logs/", Tags: map[string]string{"env": "prod"}, ExpirationDays: 90},
+		},
+	}
+
+	if err := cfg.SetDefaultsAndValidate(); err != nil {
+		t.Errorf("rules differing only by tag should validate, got: %v", err)
+	}
+}
+
+// TestLifecycleRule_FilterIDIgnoresMapOrder verifies two rules carrying the
+// same tags compare equal regardless of the order the map yields them, so
+// duplicate detection cannot depend on Go's map iteration.
+func TestLifecycleRule_FilterIDIgnoresMapOrder(t *testing.T) {
+	t.Parallel()
+	a := LifecycleRule{Prefix: "p/", Tags: map[string]string{"x": "1", "y": "2"}}
+	b := LifecycleRule{Prefix: "p/", Tags: map[string]string{"y": "2", "x": "1"}}
+
+	if a.filterID() != b.filterID() {
+		t.Errorf("filterID differs by map order: %q vs %q", a.filterID(), b.filterID())
 	}
 }
 
@@ -2241,19 +2334,23 @@ backends:
 // UI CONFIG TESTS
 // -------------------------------------------------------------------------
 
-// TestUIConfig_EnabledMissingCredentials verifies the uiconfig enabled missing credentials contract.
-// Asserts that error = , want mention of admin_key and admin_secret.
-func TestUIConfig_EnabledMissingCredentials(t *testing.T) {
+// TestUIConfig_EnabledRequiresARootCredential verifies the dashboard cannot be
+// enabled without an identity able to log into it.
+//
+// The dashboard has no login of its own: it authenticates the same credentials
+// every other surface does, so enabling it with no root credential declared
+// would serve a login page that nothing can get past.
+func TestUIConfig_EnabledRequiresARootCredential(t *testing.T) {
 	t.Parallel()
 	cfg := validBaseConfig()
-	cfg.UI = UIConfig{Enabled: true}
+	cfg.UI = UIConfig{Enabled: true, SessionSecret: "sess"}
 
 	err := cfg.SetDefaultsAndValidate()
 	if err == nil {
-		t.Fatal("expected validation error for UI enabled without credentials")
+		t.Fatal("expected validation error for UI enabled without a root credential")
 	}
-	if !strings.Contains(err.Error(), "admin_key") || !strings.Contains(err.Error(), "admin_secret") {
-		t.Errorf("error = %q, want mention of admin_key and admin_secret", err)
+	if !strings.Contains(err.Error(), "auth.root") {
+		t.Errorf("error = %q, want mention of auth.root", err)
 	}
 }
 
@@ -2262,7 +2359,8 @@ func TestUIConfig_EnabledMissingCredentials(t *testing.T) {
 func TestUIConfig_EnabledMissingSessionSecret(t *testing.T) {
 	t.Parallel()
 	cfg := validBaseConfig()
-	cfg.UI = UIConfig{Enabled: true, AdminKey: "key", AdminSecret: "secret"}
+	cfg.Auth.Root = RootCredential{AccessKeyID: "AK", SecretAccessKey: "SK"}
+	cfg.UI = UIConfig{Enabled: true}
 
 	err := cfg.SetDefaultsAndValidate()
 	if err == nil {
@@ -2278,7 +2376,8 @@ func TestUIConfig_EnabledMissingSessionSecret(t *testing.T) {
 func TestUIConfig_EnabledWithCredentials(t *testing.T) {
 	t.Parallel()
 	cfg := validBaseConfig()
-	cfg.UI = UIConfig{Enabled: true, AdminKey: "key", AdminSecret: "secret", SessionSecret: "sess"}
+	cfg.Auth.Root = RootCredential{AccessKeyID: "AK", SecretAccessKey: "SK"}
+	cfg.UI = UIConfig{Enabled: true, SessionSecret: "sess"}
 
 	if err := cfg.SetDefaultsAndValidate(); err != nil {
 		t.Errorf("valid UI config should pass: %v", err)
@@ -2305,10 +2404,9 @@ func TestUIConfig_DisabledSkipsValidation(t *testing.T) {
 func TestUIConfig_SessionSecret(t *testing.T) {
 	t.Parallel()
 	cfg := validBaseConfig()
+	cfg.Auth.Root = RootCredential{AccessKeyID: "AK", SecretAccessKey: "SK"}
 	cfg.UI = UIConfig{ //nolint:gosec // G101: test config values
 		Enabled:       true,
-		AdminKey:      "key",
-		AdminSecret:   "secret",
 		SessionSecret: "my-session-secret",
 	}
 
@@ -3288,8 +3386,8 @@ func TestParseByteSize_Overflow(t *testing.T) {
 	t.Parallel()
 	cases := []string{
 		"9999999999999999999GB",
-		"9223372036854775808",  // math.MaxInt64 + 1
-		"8589934592GB",         // 8GB * 1Gi overflows
+		"9223372036854775808", // math.MaxInt64 + 1
+		"8589934592GB",        // 8GB * 1Gi overflows
 	}
 	for _, input := range cases {
 		t.Run(input, func(t *testing.T) {
@@ -3310,8 +3408,9 @@ func TestParseByteSize_Negative(t *testing.T) {
 	}
 }
 
-// TestLifecycleConfig_EmptyPrefixRejected verifies the lifecycle config empty prefix rejected contract.
-// Asserts that error = , want mention of empty prefix.
+// TestLifecycleConfig_EmptyPrefixRejected verifies that a rule filtering on
+// nothing at all is refused. An empty prefix is only acceptable when tags
+// narrow the rule instead.
 func TestLifecycleConfig_EmptyPrefixRejected(t *testing.T) {
 	t.Parallel()
 	cfg := validBaseConfig()
@@ -3323,10 +3422,10 @@ func TestLifecycleConfig_EmptyPrefixRejected(t *testing.T) {
 
 	err := cfg.SetDefaultsAndValidate()
 	if err == nil {
-		t.Fatal("expected validation error for empty lifecycle prefix")
+		t.Fatal("expected validation error for a rule with no filter")
 	}
-	if !strings.Contains(err.Error(), "prefix must not be empty") {
-		t.Errorf("error = %q, want mention of empty prefix", err)
+	if !errors.Is(err, ErrLifecycleFilterRequired) {
+		t.Errorf("error = %q, want ErrLifecycleFilterRequired", err)
 	}
 }
 
@@ -3439,5 +3538,318 @@ func TestRateLimitConfig_CIDRValidatedWhenDisabled(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("invalid CIDR should be caught even when disabled, got: %v", errs)
+	}
+}
+
+// TestConfigValidation_EmptyTokensAccepted verifies buckets authenticating by
+// SigV4 alone are unaffected: an absent token is not a duplicate of another
+// absent token.
+func TestConfigValidation_EmptyTokensAccepted(t *testing.T) {
+	t.Parallel()
+	cfg := validBaseConfig()
+	cfg.Buckets = []BucketConfig{
+		{Name: "b1", Credentials: []CredentialConfig{{AccessKeyID: "A1", SecretAccessKey: "s1"}}},
+		{Name: "b2", Credentials: []CredentialConfig{{AccessKeyID: "A2", SecretAccessKey: "s2"}}},
+	}
+
+	if err := cfg.SetDefaultsAndValidate(); err != nil {
+		t.Errorf("credentials without tokens must validate, got: %v", err)
+	}
+}
+
+// TestSpillDir_RejectedWhenNotAUsableDirectory pins the startup check. Without
+// it a typo'd spill directory is discovered on the first object too large to
+// hold in memory, which is the worst moment for writes to start failing.
+func TestSpillDir_RejectedWhenNotAUsableDirectory(t *testing.T) {
+	t.Parallel()
+
+	file := filepath.Join(t.TempDir(), "a-file")
+	if err := os.WriteFile(file, []byte("x"), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	for name, dir := range map[string]string{
+		"missing":   filepath.Join(t.TempDir(), "no-such-directory"),
+		"not-a-dir": file,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			cfg := validBaseConfig()
+			cfg.Server.SpillDir = dir
+			err := cfg.SetDefaultsAndValidate()
+			if !errors.Is(err, ErrSpillDirUnusable) {
+				t.Errorf("err = %v, want ErrSpillDirUnusable", err)
+			}
+		})
+	}
+}
+
+// TestSpillDir_EmptyIsAccepted holds that the knob stays optional: a config
+// that never mentions it keeps the OS temp directory rather than failing.
+func TestSpillDir_EmptyIsAccepted(t *testing.T) {
+	t.Parallel()
+	cfg := validBaseConfig()
+	if err := cfg.SetDefaultsAndValidate(); err != nil {
+		t.Errorf("config without spill_dir should validate, got %v", err)
+	}
+}
+
+// TestBackendHTTP_DefaultsPreserveTheOldFixedValues holds the compatibility
+// promise: a config that never mentions the http block is dialled exactly as it
+// was before the block existed.
+func TestBackendHTTP_DefaultsPreserveTheOldFixedValues(t *testing.T) {
+	t.Parallel()
+	cfg := validBaseConfig()
+	if err := cfg.SetDefaultsAndValidate(); err != nil {
+		t.Fatalf("SetDefaultsAndValidate: %v", err)
+	}
+
+	got := cfg.Backends[0].HTTP
+	if got.MaxIdleConns != DefaultMaxIdleConns ||
+		got.MaxIdleConnsPerHost != DefaultMaxIdleConnsPerHost ||
+		got.MaxConnsPerHost != DefaultMaxConnsPerHost ||
+		got.ResponseHeaderTimeout != DefaultResponseHeaderTimeout {
+		t.Errorf("http = %+v, want the documented defaults", got)
+	}
+	if !got.HTTP2Enabled() {
+		t.Error("HTTP/2 should be attempted when force_http2 is unset")
+	}
+}
+
+// TestBackendHTTP_ExplicitValuesSurviveDefaulting asserts a configured value is
+// not overwritten by the default, which cmp.Or would do for anything the
+// operator deliberately set to a smaller number.
+func TestBackendHTTP_ExplicitValuesSurviveDefaulting(t *testing.T) {
+	t.Parallel()
+	off := false
+	cfg := validBaseConfig()
+	cfg.Backends[0].HTTP = BackendHTTPConfig{
+		MaxIdleConns:          4,
+		MaxIdleConnsPerHost:   2,
+		MaxConnsPerHost:       8,
+		ResponseHeaderTimeout: time.Second,
+		ForceHTTP2:            &off,
+	}
+	if err := cfg.SetDefaultsAndValidate(); err != nil {
+		t.Fatalf("SetDefaultsAndValidate: %v", err)
+	}
+
+	got := cfg.Backends[0].HTTP
+	if got.MaxIdleConns != 4 || got.MaxIdleConnsPerHost != 2 || got.MaxConnsPerHost != 8 {
+		t.Errorf("pool sizes = %d/%d/%d, want 4/2/8",
+			got.MaxIdleConns, got.MaxIdleConnsPerHost, got.MaxConnsPerHost)
+	}
+	if got.ResponseHeaderTimeout != time.Second {
+		t.Errorf("ResponseHeaderTimeout = %s, want 1s", got.ResponseHeaderTimeout)
+	}
+	if got.HTTP2Enabled() {
+		t.Error("an explicit force_http2: false must survive defaulting")
+	}
+}
+
+// TestBackendHTTP_RejectsNegativeValues covers the validation the acceptance
+// criteria call for. Zero is legal and means "use the default"; negative is
+// not, and no transport field accepts it.
+func TestBackendHTTP_RejectsNegativeValues(t *testing.T) {
+	t.Parallel()
+	for name, httpCfg := range map[string]BackendHTTPConfig{
+		"max_idle_conns":          {MaxIdleConns: -1},
+		"max_idle_conns_per_host": {MaxIdleConnsPerHost: -1},
+		"max_conns_per_host":      {MaxConnsPerHost: -1},
+		"response_header_timeout": {ResponseHeaderTimeout: -time.Second},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			cfg := validBaseConfig()
+			cfg.Backends[0].HTTP = httpCfg
+			if err := cfg.SetDefaultsAndValidate(); !errors.Is(err, ErrNegativeHTTPSetting) {
+				t.Errorf("err = %v, want ErrNegativeHTTPSetting", err)
+			}
+		})
+	}
+}
+
+// -------------------------------------------------------------------------
+// WRITE-PATH PARALLEL COPIES
+// -------------------------------------------------------------------------
+
+// TestParallelCopies_DefaultsToTheReplicationFactor verifies an operator who
+// turns the fan-out on without naming a count gets one copy per replica, which
+// is the only count that leaves the object at factor.
+func TestParallelCopies_DefaultsToTheReplicationFactor(t *testing.T) {
+	t.Parallel()
+	cfg := validBaseConfigTwoBackends()
+	cfg.Replication.Factor = 2
+	cfg.WritePath.ParallelCopies.Enabled = true
+
+	if err := cfg.SetDefaultsAndValidate(); err != nil {
+		t.Fatalf("SetDefaultsAndValidate: %v", err)
+	}
+	if got := cfg.WritePath.ParallelCopies.Count; got != 2 {
+		t.Errorf("count = %d, want the replication factor", got)
+	}
+	if got := cfg.CopiesPerWrite(); got != 2 {
+		t.Errorf("CopiesPerWrite = %d, want 2", got)
+	}
+}
+
+// TestParallelCopies_OffMeansOneCopy verifies a deployment that never asked for
+// the fan-out places one copy, whatever count is left lying in the file.
+func TestParallelCopies_OffMeansOneCopy(t *testing.T) {
+	t.Parallel()
+	cfg := validBaseConfigTwoBackends()
+	cfg.Replication.Factor = 2
+	cfg.WritePath.ParallelCopies.Count = 2
+
+	if err := cfg.SetDefaultsAndValidate(); err != nil {
+		t.Fatalf("SetDefaultsAndValidate: %v", err)
+	}
+	if got := cfg.CopiesPerWrite(); got != 1 {
+		t.Errorf("CopiesPerWrite = %d with the gate off, want 1", got)
+	}
+}
+
+// TestParallelCopies_InertWithoutReplication verifies a single-copy deployment
+// is unaffected even with the gate on: there is no second copy to place, and
+// the over-replication cleaner would remove one that appeared.
+func TestParallelCopies_InertWithoutReplication(t *testing.T) {
+	t.Parallel()
+	cfg := validBaseConfig()
+	cfg.Replication.Factor = 1
+	cfg.WritePath.ParallelCopies.Enabled = true
+
+	if err := cfg.SetDefaultsAndValidate(); err != nil {
+		t.Fatalf("SetDefaultsAndValidate: %v", err)
+	}
+	if got := cfg.CopiesPerWrite(); got != 1 {
+		t.Errorf("CopiesPerWrite = %d at factor 1, want 1", got)
+	}
+}
+
+// TestParallelCopies_RejectsACountOverTheFactor verifies a count past the
+// factor is refused at boot rather than producing copies the over-replication
+// cleaner deletes as fast as writes create them.
+func TestParallelCopies_RejectsACountOverTheFactor(t *testing.T) {
+	t.Parallel()
+	cfg := validBaseConfigTwoBackends()
+	cfg.Replication.Factor = 2
+	cfg.WritePath.ParallelCopies = ParallelCopiesConfig{Enabled: true, Count: 3}
+
+	if err := cfg.SetDefaultsAndValidate(); !errors.Is(err, ErrParallelCopiesOverFactor) {
+		t.Errorf("err = %v, want ErrParallelCopiesOverFactor", err)
+	}
+}
+
+// TestParallelCopies_RejectsACountBelowOne verifies a count that places no
+// copies is refused, since a write has to land somewhere.
+func TestParallelCopies_RejectsACountBelowOne(t *testing.T) {
+	t.Parallel()
+	cfg := validBaseConfigTwoBackends()
+	cfg.Replication.Factor = 2
+	cfg.WritePath.ParallelCopies = ParallelCopiesConfig{Enabled: true, Count: -1}
+
+	if err := cfg.SetDefaultsAndValidate(); !errors.Is(err, ErrParallelCopiesMin) {
+		t.Errorf("err = %v, want ErrParallelCopiesMin", err)
+	}
+}
+
+// TestParallelCopies_CapsAtTheFactor verifies CopiesPerWrite never reports more
+// than the factor even if a count slipped past validation, since it is the one
+// place the write path asks how many copies to place.
+func TestParallelCopies_CapsAtTheFactor(t *testing.T) {
+	t.Parallel()
+	cfg := validBaseConfigTwoBackends()
+	cfg.Replication.Factor = 2
+	cfg.WritePath.ParallelCopies = ParallelCopiesConfig{Enabled: true, Count: 5}
+
+	if got := cfg.CopiesPerWrite(); got != 2 {
+		t.Errorf("CopiesPerWrite = %d, want the factor", got)
+	}
+}
+
+// TestParallelCopies_InFlightCeilingFollowsWriteAdmission verifies the ceiling
+// on tracked tails defaults to the write admission limit. A tail is the residue
+// of a write, so an instance carrying more of them than it would admit writes
+// is one whose backends have stopped keeping up.
+func TestParallelCopies_InFlightCeilingFollowsWriteAdmission(t *testing.T) {
+	t.Parallel()
+	cfg := validBaseConfigTwoBackends()
+	cfg.Replication.Factor = 2
+	cfg.Server.MaxConcurrentWrites = 250
+	cfg.WritePath.ParallelCopies.Enabled = true
+
+	if err := cfg.SetDefaultsAndValidate(); err != nil {
+		t.Fatalf("SetDefaultsAndValidate: %v", err)
+	}
+	if got := cfg.WritePath.ParallelCopies.MaxInFlight; got != 250 {
+		t.Errorf("max_in_flight = %d, want the write admission limit", got)
+	}
+}
+
+// TestParallelCopies_InFlightCeilingFallsBackToTheRequestLimit verifies a
+// deployment that caps requests as a whole rather than writes specifically
+// still derives a ceiling from what it configured.
+func TestParallelCopies_InFlightCeilingFallsBackToTheRequestLimit(t *testing.T) {
+	t.Parallel()
+	cfg := validBaseConfigTwoBackends()
+	cfg.Replication.Factor = 2
+	cfg.Server.MaxConcurrentRequests = 300
+	cfg.WritePath.ParallelCopies.Enabled = true
+
+	if err := cfg.SetDefaultsAndValidate(); err != nil {
+		t.Fatalf("SetDefaultsAndValidate: %v", err)
+	}
+	if got := cfg.WritePath.ParallelCopies.MaxInFlight; got != 300 {
+		t.Errorf("max_in_flight = %d, want the request admission limit", got)
+	}
+}
+
+// TestParallelCopies_InFlightCeilingHasAFloor verifies a deployment with no
+// write-side admission limit still gets a ceiling. Capping reads alone leaves
+// both write limits at zero, and deriving from that would refuse to boot over a
+// knob the operator never set.
+func TestParallelCopies_InFlightCeilingHasAFloor(t *testing.T) {
+	t.Parallel()
+	cfg := validBaseConfigTwoBackends()
+	cfg.Replication.Factor = 2
+	cfg.Server.MaxConcurrentReads = 500
+	cfg.WritePath.ParallelCopies.Enabled = true
+
+	if err := cfg.SetDefaultsAndValidate(); err != nil {
+		t.Fatalf("SetDefaultsAndValidate: %v", err)
+	}
+	if got := cfg.WritePath.ParallelCopies.MaxInFlight; got != DefaultDetachedUploadCeiling {
+		t.Errorf("max_in_flight = %d, want the default ceiling", got)
+	}
+}
+
+// TestParallelCopies_InFlightCeilingFollowsTheImpliedRequestLimit verifies a
+// deployment that caps nothing inherits the ceiling from the request limit the
+// server section defaults to, rather than from the floor.
+func TestParallelCopies_InFlightCeilingFollowsTheImpliedRequestLimit(t *testing.T) {
+	t.Parallel()
+	cfg := validBaseConfigTwoBackends()
+	cfg.Replication.Factor = 2
+	cfg.WritePath.ParallelCopies.Enabled = true
+
+	if err := cfg.SetDefaultsAndValidate(); err != nil {
+		t.Fatalf("SetDefaultsAndValidate: %v", err)
+	}
+	if got, want := cfg.WritePath.ParallelCopies.MaxInFlight, cfg.Server.MaxConcurrentRequests; got != want {
+		t.Errorf("max_in_flight = %d, want the defaulted request limit of %d", got, want)
+	}
+}
+
+// TestParallelCopies_RejectsAnInFlightCeilingBelowOne verifies a ceiling that
+// admits nothing is refused at boot rather than silently turning the fan-out
+// off on a deployment that asked for it.
+func TestParallelCopies_RejectsAnInFlightCeilingBelowOne(t *testing.T) {
+	t.Parallel()
+	cfg := validBaseConfigTwoBackends()
+	cfg.Replication.Factor = 2
+	cfg.WritePath.ParallelCopies = ParallelCopiesConfig{Enabled: true, MaxInFlight: -1}
+
+	if err := cfg.SetDefaultsAndValidate(); !errors.Is(err, ErrParallelCopiesInFlightMin) {
+		t.Errorf("err = %v, want ErrParallelCopiesInFlightMin", err)
 	}
 }

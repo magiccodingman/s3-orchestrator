@@ -22,13 +22,12 @@ import (
 	"sync"
 	"time"
 
-
 	"golang.org/x/time/rate"
 
-	"github.com/afreidah/s3-orchestrator/internal/observe/audit"
 	"github.com/afreidah/s3-orchestrator/internal/config"
-	"github.com/afreidah/s3-orchestrator/internal/transport/httputil"
+	"github.com/afreidah/s3-orchestrator/internal/observe/audit"
 	"github.com/afreidah/s3-orchestrator/internal/observe/telemetry"
+	"github.com/afreidah/s3-orchestrator/internal/transport/httputil"
 )
 
 // -------------------------------------------------------------------------
@@ -179,9 +178,4 @@ func (rl *RateLimiter) extractIP(r *http.Request) string {
 // ExtractClientIP delegates to httputil.ExtractClientIP.
 func ExtractClientIP(r *http.Request, trustedProxies []*net.IPNet) string {
 	return httputil.ExtractClientIP(r, trustedProxies)
-}
-
-// ParseTrustedProxies delegates to httputil.ParseTrustedProxies.
-func ParseTrustedProxies(cidrs []string) []*net.IPNet {
-	return httputil.ParseTrustedProxies(cidrs)
 }

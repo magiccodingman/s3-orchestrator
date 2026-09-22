@@ -17,10 +17,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"sort"
+	"maps"
+	"slices"
 	"strconv"
 	"strings"
 )
+
+// -------------------------------------------------------------------------
+// PUBLIC API
+// -------------------------------------------------------------------------
 
 // RenderValue decodes raw JSON and writes it as an indented, YAML-like text
 // block to w. Non-JSON input is written through unchanged.
@@ -35,6 +40,10 @@ func RenderValue(w io.Writer, raw []byte) error {
 	}
 	return writeValue(w, v, 0)
 }
+
+// -------------------------------------------------------------------------
+// INTERNALS
+// -------------------------------------------------------------------------
 
 // writeValue dispatches on the dynamic type of a decoded JSON value, writing
 // it at the given indent level.
@@ -115,12 +124,7 @@ func scalar(v any) string {
 
 // sortedKeys returns the map keys in sorted order for deterministic output.
 func sortedKeys(m map[string]any) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return keys
+	return slices.Sorted(maps.Keys(m))
 }
 
 // indentOf returns the leading whitespace for the given nesting level.

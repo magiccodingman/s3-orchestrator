@@ -25,10 +25,16 @@ import (
 	"testing"
 	"time"
 
-	"github.com/afreidah/s3-orchestrator/internal/store/core"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+
+	"github.com/afreidah/s3-orchestrator/internal/proxy/object"
+	"github.com/afreidah/s3-orchestrator/internal/store/core"
 )
+
+// -------------------------------------------------------------------------
+// INTERNALS
+// -------------------------------------------------------------------------
 
 // queryPendingCount returns the number of pending intents for a key.
 func queryPendingCount(t *testing.T, key string) int {
@@ -63,6 +69,10 @@ func runReaperTick(t *testing.T) (resolved, failed int) {
 	sum := testWorkers.PendingReaper.ProcessPendingQueue(context.Background())
 	return sum.Succeeded, sum.Failed
 }
+
+// -------------------------------------------------------------------------
+// PUBLIC API
+// -------------------------------------------------------------------------
 
 // TestPending_HappyPath verifies that a successful PUT clears the pending
 // intent in the same transaction that records the object location.
@@ -111,9 +121,12 @@ func TestPending_DBBlipMidPUT_RecoveredByReaper(t *testing.T) {
 	// on the retry  -  masking the failure we're trying to observe.
 	testFailableStore.SetFailCommitOnce()
 
-	_, err := testManager.Objects().PutObject(
-		ctx, internalKey(key), bytes.NewReader([]byte("payload")), 7, "application/octet-stream", nil,
-	)
+	_, err := testStack.Objects.PutObject(ctx, &object.PutObjectRequest{
+		Key:         internalKey(key),
+		Body:        bytes.NewReader([]byte("payload")),
+		Size:        7,
+		ContentType: "application/octet-stream",
+	})
 	if err == nil {
 		t.Fatal("expected PutObject to fail after armed commit failure")
 	}
@@ -178,7 +191,7 @@ func TestPending_ReaperDropsIntentWhenBackendHas404(t *testing.T) {
 		BackendName: "minio-1",
 		SizeBytes:   42,
 	}
-	if err := testStore.InsertPending(ctx, intent); err != nil {
+	if _, err := testStore.InsertPendingIfFits(ctx, intent); err != nil {
 		t.Fatalf("InsertPending: %v", err)
 	}
 	if got := queryPendingCount(t, key); got != 1 {
@@ -213,7 +226,7 @@ func TestPending_ReaperRespectsMinAge(t *testing.T) {
 		BackendName: "minio-1",
 		SizeBytes:   10,
 	}
-	if err := testStore.InsertPending(ctx, intent); err != nil {
+	if _, err := testStore.InsertPendingIfFits(ctx, intent); err != nil {
 		t.Fatalf("InsertPending: %v", err)
 	}
 

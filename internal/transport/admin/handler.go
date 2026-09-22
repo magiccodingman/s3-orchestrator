@@ -13,146 +13,158 @@
 // integrity scrub/backfill/reconcile in handler_integrity.go.
 // -------------------------------------------------------------------------------
 
-// Package admin provides the admin API handler for operational control endpoints.
 package admin
 
 import (
 	"context"
+	"crypto/rand"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 
-	"github.com/afreidah/s3-orchestrator/internal/backend"
 	"github.com/afreidah/s3-orchestrator/internal/cache"
-	"github.com/afreidah/s3-orchestrator/internal/config"
-	"github.com/afreidah/s3-orchestrator/internal/encryption"
 	"github.com/afreidah/s3-orchestrator/internal/observe/logfmt"
-	"github.com/afreidah/s3-orchestrator/internal/proxy"
-	"github.com/afreidah/s3-orchestrator/internal/proxy/dashboard"
+	"github.com/afreidah/s3-orchestrator/internal/ops"
 	"github.com/afreidah/s3-orchestrator/internal/proxy/drain"
-	"github.com/afreidah/s3-orchestrator/internal/proxy/infra"
 	"github.com/afreidah/s3-orchestrator/internal/store/core"
+	"github.com/afreidah/s3-orchestrator/internal/transport/admin/adminapi"
+	"github.com/afreidah/s3-orchestrator/internal/transport/auth"
 	"github.com/afreidah/s3-orchestrator/internal/transport/httputil"
 	"github.com/afreidah/s3-orchestrator/internal/util/must"
 )
 
-// BackendOps is the narrow surface of *proxy.BackendManager that the admin
-// handler depends on for store-coupled operations not encapsulated by a named
-// sub-manager (replicator, drain, scrubber, etc.). *proxy.BackendManager
-// satisfies it.
-type BackendOps interface {
-	GetDashboardData(ctx context.Context) (*dashboard.Data, error)
-	FlushUsage(ctx context.Context) error
-	ReconcileUsage(ctx context.Context) (map[string]int64, error)
-	RecordUsage(backendName string, requests, ingressBytes, egressBytes int64)
-	IntegrityConfig() *config.IntegrityConfig
-}
-
-// RuntimeOps is the backend-runtime surface the admin handler reaches
-// directly: backend lookup and the post-mutation quota-metric refresh.
-// *infra.BackendRuntime satisfies it.
-type RuntimeOps interface {
-	GetBackend(name string) (backend.ObjectBackend, error)
-	UpdateQuotaMetrics(ctx context.Context) error
-}
-
-// Compile-time assertions.
-var (
-	_ BackendOps = (*proxy.BackendManager)(nil)
-	_ RuntimeOps = (*infra.BackendRuntime)(nil)
-)
+// -------------------------------------------------------------------------
+// TYPES
+// -------------------------------------------------------------------------
 
 // Handler serves the admin API endpoints.
+//
+// reloadStatus is a function set after construction rather than a dependency,
+// so this package does not import internal/reload - which would cycle back
+// here through the UI.
 type Handler struct {
 	log          *slog.Logger
 	backendOps   BackendOps
-	runtimeOps   RuntimeOps
-	replicator   ReplicatorOps
-	rebalancer   RebalancerOps // nil when the worker pool is not wired
-	overRep      OverReplicationOps
+	dashboardOps DashboardReader
+	objects      *ops.Objects
+	integrity    *ops.Integrity
+	replication  *ops.Replication
+	rebalance    *ops.Rebalance
+	expiry       *ops.Lifecycle
+	encryption   *ops.Encryption
+	compression  *ops.Compression
+	provision    *ops.Provisioning
 	drain        *drain.Manager
-	scrubber     ScrubberOps
 	lifecycle    core.BackendLifecycleStore
 	reconciler   Reconciler
 	dbHealthy    func() bool
-	workerHealth func() []WorkerHealth // nil when lifecycle manager is not wired
-	logs         logReader             // nil when the log buffer is not wired
-	objects      core.ObjectStore
+	workerHealth func() []adminapi.WorkerHealth // nil when lifecycle manager is not wired
+	logs         logReader                      // nil when the log buffer is not wired
+	replMetrics  replicationSnapshotter         // nil when the metrics collector is not wired
 	cleanup      core.CleanupStore
-	encAdmin     core.EncryptionAdmin
-	encryptor    *encryption.Encryptor
 	objectCache  cache.ObjectCache
 	flightRec    io.WriterTo // nil when debug.flight_recorder.enabled is false
-	token        string
+	registry     func() *auth.BucketRegistry
+	backendNames func() []string
 	logLevel     *slog.LevelVar
-	// reloadStatus is the per-process snapshot of the last reload
-	// result. Set post-construction by the runtime so the admin handler
-	// does not import the reload package (which would cycle via UI).
-	// Returns nil before any reload has happened.
-	reloadStatus func() any
+	confirmKey   []byte
+	reloadStatus func() *adminapi.ReloadStatusResponse // nil before the first reload
 }
 
 // Deps groups the narrow role interfaces and infrastructure the admin
 // handler touches. Each field carries the smallest contract the handler
 // actually uses, so the constructor (and the backing DI provider) never
-// hand the handler a god-shaped *proxy.BackendManager.
+// hand the handler a god-shaped orchestration object.
 type Deps struct {
 	BackendOps   BackendOps
-	RuntimeOps   RuntimeOps
-	Replicator   ReplicatorOps
-	Rebalancer   RebalancerOps // nil when the worker pool is not wired
-	OverRep      OverReplicationOps
+	Dashboard    DashboardReader
+	Objects      *ops.Objects
+	Integrity    *ops.Integrity
+	Replication  *ops.Replication
+	Rebalance    *ops.Rebalance
+	Expiry       *ops.Lifecycle
+	Encryption   *ops.Encryption
+	Compression  *ops.Compression
+	Provision    *ops.Provisioning
 	Drain        *drain.Manager
-	Scrubber     ScrubberOps
 	Lifecycle    core.BackendLifecycleStore
-	DBHealthy    func() bool           // typically *breaker.CircuitBreaker.IsHealthy
-	WorkerHealth func() []WorkerHealth // typically lifecycle.Manager.Health adapted
-	LogBuffer    logReader             // nil when the log buffer is not wired
-	Encryption   core.EncryptionAdmin
-	Objects      core.ObjectStore
+	DBHealthy    func() bool                    // typically *breaker.CircuitBreaker.IsHealthy
+	WorkerHealth func() []adminapi.WorkerHealth // typically lifecycle.Manager.Health adapted
+	LogBuffer    logReader                      // nil when the log buffer is not wired
+	ReplMetrics  replicationSnapshotter         // nil when the metrics collector is not wired
 	Cleanup      core.CleanupStore
-	Encryptor    *encryption.Encryptor
 	ObjectCache  cache.ObjectCache // nil when object data caching is disabled
 	FlightRec    io.WriterTo       // nil when debug.flight_recorder.enabled is false
 	Reconciler   Reconciler
-	Token        string
+	Registry     func() *auth.BucketRegistry // the live registry, re-read so a reload is not missed
+	BackendNames func() []string             // typically *infra.BackendRuntime.BackendOrder
 	LogLevel     *slog.LevelVar
 }
+
+// -------------------------------------------------------------------------
+// CONSTRUCTOR
+// -------------------------------------------------------------------------
 
 // New creates a new admin API handler from its narrow dependency bag.
 func New(d *Deps) *Handler {
 	must.NotNil("d", d)
 	must.NotNil("d.BackendOps", d.BackendOps)
-	must.NotNil("d.RuntimeOps", d.RuntimeOps)
+	must.NotNil("d.Objects", d.Objects)
+	must.NotNil("d.Integrity", d.Integrity)
+	must.NotNil("d.Replication", d.Replication)
+	must.NotNil("d.Rebalance", d.Rebalance)
+	must.NotNil("d.Encryption", d.Encryption)
+	must.NotNil("d.Compression", d.Compression)
+	must.NotNil("d.Provision", d.Provision)
 	must.NotNil("d.Drain", d.Drain)
 	must.NotNil("d.Lifecycle", d.Lifecycle)
-	must.NotNil("d.Objects", d.Objects)
 	must.NotNil("d.Cleanup", d.Cleanup)
-	must.NotNil("d.Encryption", d.Encryption)
 	must.NotNil("d.LogLevel", d.LogLevel)
+	must.NotNil("d.Registry", d.Registry)
+	must.NotNil("d.BackendNames", d.BackendNames)
 	return &Handler{
 		log:          slog.Default().With(logfmt.Component("admin")),
 		backendOps:   d.BackendOps,
-		runtimeOps:   d.RuntimeOps,
-		replicator:   d.Replicator,
-		rebalancer:   d.Rebalancer,
-		overRep:      d.OverRep,
+		dashboardOps: d.Dashboard,
+		objects:      d.Objects,
+		integrity:    d.Integrity,
+		replication:  d.Replication,
+		rebalance:    d.Rebalance,
+		expiry:       d.Expiry,
+		encryption:   d.Encryption,
+		compression:  d.Compression,
+		provision:    d.Provision,
 		drain:        d.Drain,
-		scrubber:     d.Scrubber,
 		lifecycle:    d.Lifecycle,
 		reconciler:   d.Reconciler,
 		dbHealthy:    d.DBHealthy,
 		workerHealth: d.WorkerHealth,
 		logs:         d.LogBuffer,
-		objects:      d.Objects,
+		replMetrics:  d.ReplMetrics,
 		cleanup:      d.Cleanup,
-		encAdmin:     d.Encryption,
-		encryptor:    d.Encryptor,
 		objectCache:  d.ObjectCache,
 		flightRec:    d.FlightRec,
-		token:        d.Token,
+		registry:     d.Registry,
+		backendNames: d.BackendNames,
 		logLevel:     d.LogLevel,
+		confirmKey:   mustConfirmKey(),
 	}
+}
+
+// mustConfirmKey mints the key a purge confirmation token is signed with.
+//
+// Random per process rather than derived from configuration: the token only has
+// to survive between the preview call and the execute call that follows it, and
+// a key that never leaves memory cannot be used to forge one from a leaked
+// config. A restart invalidates any confirmation in flight, which costs the
+// operator one repeated preview.
+func mustConfirmKey() []byte {
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		panic("admin: cannot read random bytes for the confirmation key: " + err.Error())
+	}
+	return key
 }
 
 // SetReloadStatusProvider wires the callback that returns the most recent
@@ -160,8 +172,31 @@ func New(d *Deps) *Handler {
 // built. Routing through a setter rather than constructor injection
 // avoids the import cycle that would result from admin importing the
 // reload package directly.
-func (h *Handler) SetReloadStatusProvider(fn func() any) {
+func (h *Handler) SetReloadStatusProvider(fn func() *adminapi.ReloadStatusResponse) {
 	h.reloadStatus = fn
+}
+
+// Outcome values every operation response carries, so a client can branch on
+// what happened before reading the operation-specific counts.
+const (
+	statusOK       = "ok"
+	statusSkipped  = "skipped"
+	statusComplete = "complete"
+)
+
+// -------------------------------------------------------------------------
+// INTERNALS
+// -------------------------------------------------------------------------
+
+// skipReason reports the reason an operation declined to run, and whether it
+// declined at all. An operation that skips is answering the caller, not
+// failing, so every handler renders it as a successful response carrying the
+// reason rather than as a server error.
+func skipReason(err error) (string, bool) {
+	if skip, ok := errors.AsType[*ops.SkipError](err); ok {
+		return skip.Reason, true
+	}
+	return "", false
 }
 
 // internalError logs the underlying error against the operator-facing

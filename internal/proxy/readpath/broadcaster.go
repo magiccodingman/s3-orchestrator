@@ -26,8 +26,13 @@ import (
 	"github.com/afreidah/s3-orchestrator/internal/backend"
 	"github.com/afreidah/s3-orchestrator/internal/observe"
 	"github.com/afreidah/s3-orchestrator/internal/observe/telemetry"
+	"github.com/afreidah/s3-orchestrator/internal/s3op"
 	"github.com/afreidah/s3-orchestrator/internal/store/core"
 )
+
+// -------------------------------------------------------------------------
+// TYPES
+// -------------------------------------------------------------------------
 
 // Broadcaster fans a degraded-mode read out across every configured backend
 // and returns the first success. It holds no metadata-store dependency -
@@ -46,6 +51,10 @@ type Broadcaster struct {
 // zero-value construction (notably in tests).
 const defaultDrainTimeout = 30 * time.Second
 
+// -------------------------------------------------------------------------
+// INTERNALS
+// -------------------------------------------------------------------------
+
 // drainTimeoutOrDefault returns the configured backend timeout, or
 // defaultDrainTimeout when it is unset, so the drain bound is never zero.
 func drainTimeoutOrDefault(backendTimeout time.Duration) time.Duration {
@@ -58,15 +67,14 @@ func drainTimeoutOrDefault(backendTimeout time.Duration) time.Duration {
 // Read tries all backends when the DB is unavailable. Checks the location
 // cache first for a known-good backend, then dispatches to either parallel
 // or sequential broadcast based on configuration.
-func broadcastRead[T any](ctx context.Context, b *Broadcaster, op readOp, probe Probe[T]) (value T, winner string, retErr error) {
+func (b *Broadcaster) broadcastRead[T any](ctx context.Context, op readOp, probe Probe[T]) (value T, winner string, retErr error) {
 	bcStart := time.Now()
 	cacheHit := false
 	defer func() {
-		telemetry.DegradedBroadcastDuration.WithLabelValues(op.operation, broadcastOutcome(cacheHit, retErr)).
+		telemetry.DegradedBroadcastDuration.WithLabelValues(op.operation.String(), broadcastOutcome(cacheHit, retErr)).
 			Observe(time.Since(bcStart).Seconds())
 	}()
 
-	// --- Check location cache first ---
 	if cachedBackend, ok := b.cache.Get(op.key); ok {
 		if be, exists := b.core.Backends()[cachedBackend]; exists {
 			// Degraded mode: no DB row available, probe must handle nil loc.
@@ -90,7 +98,7 @@ func broadcastRead[T any](ctx context.Context, b *Broadcaster, op readOp, probe 
 	if b.parallel {
 		concurrency = len(b.core.BackendOrder())
 	}
-	return tryAllBackends(ctx, b, op, concurrency, probe)
+	return b.tryAllBackends(ctx, op, concurrency, probe)
 }
 
 // broadcastOutcome classifies the terminal state of a degraded broadcast
@@ -114,17 +122,17 @@ func broadcastOutcome(cacheHit bool, err error) string {
 // tryAllBackends dispatches to the sequential or parallel branch based
 // on concurrency. Both branches return the first backend whose probe
 // succeeds and cache the winner's name for future degraded reads.
-func tryAllBackends[T any](ctx context.Context, b *Broadcaster, op readOp, concurrency int, probe Probe[T]) (T, string, error) {
+func (b *Broadcaster) tryAllBackends[T any](ctx context.Context, op readOp, concurrency int, probe Probe[T]) (T, string, error) {
 	if concurrency <= 1 {
-		return tryBackendsSequentially(ctx, b, op, probe)
+		return b.tryBackendsSequentially(ctx, op, probe)
 	}
-	return tryBackendsInParallel(ctx, b, op, probe)
+	return b.tryBackendsInParallel(ctx, op, probe)
 }
 
 // tryBackendsSequentially walks BackendOrder one backend at a time. The
 // first success short-circuits and is recorded as the broadcast winner;
 // otherwise the last error (if any) is wrapped as a degraded-read failure.
-func tryBackendsSequentially[T any](ctx context.Context, b *Broadcaster, op readOp, probe Probe[T]) (T, string, error) {
+func (b *Broadcaster) tryBackendsSequentially[T any](ctx context.Context, op readOp, probe Probe[T]) (T, string, error) {
 	var lastErr error
 	var tally broadcastErrTally
 	for _, name := range b.core.BackendOrder() {
@@ -163,9 +171,9 @@ func (t *broadcastErrTally) add(err error) {
 	}
 }
 
-func (t *broadcastErrTally) recordMixedOutcomes(operation string) {
+func (t *broadcastErrTally) recordMixedOutcomes(operation s3op.Operation) {
 	if t.notFound > 0 && t.other > 0 {
-		telemetry.DegradedBroadcastMixedOutcomesTotal.WithLabelValues(operation).Inc()
+		telemetry.DegradedBroadcastMixedOutcomesTotal.WithLabelValues(operation.String()).Inc()
 	}
 }
 
@@ -185,7 +193,7 @@ type broadcastResult[T any] struct {
 // window via ProbeScheduler, then applies degraded-read policy to the outcome:
 // record the winner, or classify the collected failures (404 vs other) and wrap
 // the all-failed terminal. The concurrency mechanics live in the scheduler.
-func tryBackendsInParallel[T any](ctx context.Context, b *Broadcaster, op readOp, probe Probe[T]) (T, string, error) {
+func (b *Broadcaster) tryBackendsInParallel[T any](ctx context.Context, op readOp, probe Probe[T]) (T, string, error) {
 	pending := b.eligibleBackends()
 	if len(pending) == 0 {
 		return broadcastAllFailed[T](op.span, nil)

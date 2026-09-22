@@ -29,6 +29,7 @@ import (
 	"github.com/afreidah/s3-orchestrator/internal/lifecycle"
 	"github.com/afreidah/s3-orchestrator/internal/lifecycle/tickrunner"
 	"github.com/afreidah/s3-orchestrator/internal/observe/telemetry"
+	"github.com/afreidah/s3-orchestrator/internal/provisioning"
 	"github.com/afreidah/s3-orchestrator/internal/proxy/multipart"
 	"github.com/afreidah/s3-orchestrator/internal/worker"
 )
@@ -42,13 +43,16 @@ func allLockedTickerServices(t *testing.T) []*tickrunner.Service {
 	locker := fakeLocker{}
 
 	runners := []lifecycle.Runner{
-		multipart.NewCleanupService(f.mgr.Multipart(), locker, 0),
+		multipart.NewCleanupService(f.stack.Multipart, locker, 0),
 		worker.NewCleanupQueueService(f.cleanupWorker, locker),
-		worker.NewRebalancerService(f.mgr, f.rebalancer, locker),
-		NewLifecycleService(f.mgr, locker),
-		worker.NewOverReplicationService(f.mgr, f.overRep, locker),
-		worker.NewReplicatorService(f.mgr, f.replicator, locker),
-		worker.NewReconcileService(worker.NewReconciler(f.mgr, nil), locker, time.Hour),
+		worker.NewRebalancerService(f.stack.Runtime, f.rebalancer, locker),
+		NewLifecycleService(f.expirer, locker),
+		worker.NewOverReplicationService(f.stack.Runtime, f.overRep, locker),
+		worker.NewReplicatorService(f.stack.Runtime, f.replicator, locker),
+		worker.NewReconcileService(worker.NewReconciler(&worker.ReconcilerDeps{
+			Syncer: f.reconciler, Fleet: f.stack.Runtime, Usage: f.stack.Usage,
+			Buckets: provisioning.NewDeclared(),
+		}), locker, time.Hour),
 		worker.NewScrubberService(f.scrubber, locker),
 	}
 	out := make([]*tickrunner.Service, 0, len(runners))
@@ -106,7 +110,6 @@ func TestPeriodicServiceSpecs_IntervalsSane(t *testing.T) {
 func lifecycleManagerForMode(t *testing.T, mode config.Mode) *lifecycle.Manager {
 	t.Helper()
 	cfg := happyPathConfig(t.TempDir())
-	cfg.WritePath.PendingPattern.Enabled = new(true)
 	if err := cfg.SetDefaultsAndValidate(); err != nil {
 		t.Fatalf("config validation: %v", err)
 	}

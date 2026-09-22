@@ -12,10 +12,6 @@
 // to detect absence.
 // -------------------------------------------------------------------------------
 
-// Package di is the single wiring point for the orchestrator. It uses
-// samber/do/v2 to register every store role, backend, worker, and
-// transport handler as a lazy provider; consumers resolve their
-// dependencies through the injector at the moment they need them.
 package di
 
 import (
@@ -26,7 +22,14 @@ import (
 	"github.com/afreidah/s3-orchestrator/internal/config"
 	"github.com/afreidah/s3-orchestrator/internal/observe/audit"
 	"github.com/afreidah/s3-orchestrator/internal/observe/telemetry"
+	"github.com/afreidah/s3-orchestrator/internal/provisioning"
+	"github.com/afreidah/s3-orchestrator/internal/proxy/metrics"
+	"github.com/afreidah/s3-orchestrator/internal/store/core"
 )
+
+// -------------------------------------------------------------------------
+// TYPES
+// -------------------------------------------------------------------------
 
 // InjectorDeps groups the values NewInjector seeds the container with.
 type InjectorDeps struct {
@@ -54,6 +57,10 @@ func NewInjector(deps InjectorDeps) do.Injector {
 	return inj
 }
 
+// -------------------------------------------------------------------------
+// INTERNALS
+// -------------------------------------------------------------------------
+
 // registerValues seeds the injector with already-constructed values
 // (config, mode, log level, log buffer) so providers can resolve them
 // via do.Invoke without re-reading the YAML on every call.
@@ -69,27 +76,37 @@ func registerValues(inj do.Injector, cfg *config.Config, mode config.Mode, logLe
 // on (metadata store, lifecycle / encryption admin views, notification
 // outbox, database circuit breaker, instance id, metric deps).
 func registerInfrastructure(inj do.Injector) {
-	do.Provide(inj, ProvideMetadataStore)
-	do.Provide(inj, ProvideLifecycleAdmin)
-	do.Provide(inj, ProvideEncryptionAdmin)
-	do.Provide(inj, ProvideNotificationOutbox)
+	do.Provide(inj, provideMetadataStore)
 	do.Provide(inj, ProvideDatabaseBreaker)
 	do.Provide(inj, ProvideInstanceID)
-	do.Provide(inj, ProvideMetricsDeps)
+
+	// Narrow role views of the wide metadata store: do.MustAs aliases the
+	// concrete under each consumer interface, and verifies the cast at
+	// registration instead of at first resolve.
+	do.MustAs[metadataStore, core.AdvisoryLocker](inj)
+	do.MustAs[metadataStore, core.LifecycleAdmin](inj)
+	do.MustAs[metadataStore, core.EncryptionAdmin](inj)
+	do.MustAs[metadataStore, core.NotificationOutbox](inj)
+	do.MustAs[metadataStore, core.ProvisioningStore](inj)
+	do.MustAs[metadataStore, metrics.Deps](inj)
 }
 
-// registerBackendStack wires the storage-fleet root composition
-// objects: per-backend clients, the shared circuit-breaker registry,
-// and the BackendManager that orchestrates routing / replication /
-// drain across them.
+// registerBackendStack wires the storage-fleet composition objects:
+// per-backend clients, the shared circuit-breaker registry, and each
+// collaborator that routes, replicates or drains across them.
 func registerBackendStack(inj do.Injector) {
 	do.Provide(inj, ProvideBackends)
 	do.Provide(inj, ProvideBreakerRegistry)
 	do.Provide(inj, ProvideBackendRuntime)
 	do.Provide(inj, ProvideIntegrityConfig)
 	do.Provide(inj, ProvideWriteCoordinator)
+	do.Provide(inj, ProvideDetachedUploads)
 	do.Provide(inj, ProvideMultipartManager)
-	do.Provide(inj, ProvideBackendManager)
+	do.Provide(inj, ProvideObjectManager)
+	do.Provide(inj, ProvideDashboardAggregator)
+	do.Provide(inj, ProvideExpiryManager)
+	do.Provide(inj, ProvideReconcileManager)
+	do.Provide(inj, ProvideUsageService)
 }
 
 // registerWorkers wires the background workers and the drain manager.
@@ -100,9 +117,10 @@ func registerWorkers(inj do.Injector, cfg *config.Config, mode config.Mode) {
 	do.Provide(inj, ProvideReplicator)
 	do.Provide(inj, ProvideOverReplicationCleaner)
 	do.Provide(inj, ProvideCleanupWorker)
-	if cfg.WritePath.PendingPattern.IsEnabled() {
-		do.Provide(inj, ProvidePendingReaper)
-	}
+	// Always registered: every write claims its bytes with an intent, so a
+	// deployment without the reaper would accumulate rows that hold a backend's
+	// headroom against writes that are never coming.
+	do.Provide(inj, ProvidePendingReaper)
 	do.Provide(inj, ProvideScrubber)
 	do.Provide(inj, ProvideDrainManager)
 	if mode.IsWorker() {
@@ -111,12 +129,16 @@ func registerWorkers(inj do.Injector, cfg *config.Config, mode config.Mode) {
 }
 
 // registerTransport wires the always-on HTTP-side providers: bucket
-// auth, the S3 API server, and the lifecycle manager that supervises
-// the background services registered above. Conditional transport
-// surfaces (UI, admin) live in registerOptionalFeatures.
+// auth, the S3 API server, the operations layer both operator surfaces
+// call, and the lifecycle manager that supervises the background services
+// registered above. Conditional transport surfaces (UI, admin) live in
+// registerOptionalFeatures.
 func registerTransport(inj do.Injector) {
+	do.ProvideValue(inj, provisioning.NewDeclared())
 	do.Provide(inj, ProvideBucketAuth)
+	do.Provide(inj, ProvideCORS)
 	do.Provide(inj, ProvideS3Server)
+	do.Provide(inj, ProvideOps)
 	do.Provide(inj, ProvideLifecycleManager)
 }
 
@@ -134,6 +156,7 @@ func provideIf[T any](inj do.Injector, enabled bool, provider func(do.Injector) 
 // registerOptionalFeatures wires every provider whose registration is gated on
 // a config flag. Reads top to bottom as "provide X when its flag is set".
 func registerOptionalFeatures(inj do.Injector, cfg *config.Config) {
+	do.Provide(inj, ProvideCodec)
 	provideIf(inj, cfg.Encryption.Enabled, ProvideEncryptor)
 	provideIf(inj, cfg.Encryption.Enabled, ProvideEncryptionProvider)
 	provideIf(inj, cfg.Redis != nil, ProvideRedisCounterBackend)
@@ -141,7 +164,9 @@ func registerOptionalFeatures(inj do.Injector, cfg *config.Config) {
 	provideIf(inj, cfg.RateLimit.Enabled, ProvideRateLimiter)
 	provideIf(inj, cfg.UI.Enabled, ProvideLoginThrottle)
 	provideIf(inj, cfg.UI.Enabled, ProvideUIHandler)
-	provideIf(inj, cfg.UI.AdminKey != "", ProvideAdminHandler)
+	// The admin API authenticates credentials rather than a configured token, so
+	// it is served whatever the dashboard is set to.
+	do.Provide(inj, ProvideAdminHandler)
 	provideIf(inj, len(cfg.Notifications.Endpoints) > 0, ProvideNotifier)
 	provideIf(inj, cfg.Debug.FlightRecorder.Enabled, ProvideFlightRecorderService)
 }

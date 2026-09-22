@@ -48,6 +48,101 @@ func (q *Queries) CheckObjectExistsOnBackend(ctx context.Context, arg CheckObjec
 	return exists, err
 }
 
+const compressionStats = `-- name: CompressionStats :many
+SELECT backend_name,
+       count(*) AS objects,
+       COALESCE(SUM(logical_size), 0)::bigint AS logical_bytes,
+       COALESCE(SUM(size_bytes), 0)::bigint AS stored_bytes
+FROM object_locations
+WHERE compression_algorithm IS NOT NULL
+GROUP BY backend_name
+`
+
+type CompressionStatsRow struct {
+	BackendName  string
+	Objects      int64
+	LogicalBytes int64
+	StoredBytes  int64
+}
+
+// What compression is worth, per backend. Only encoded copies are counted:
+// including the verbatim ones would report a ratio no encoder produced. The
+// saving is logical - stored, left to the caller so it cannot disagree with the
+// two figures it comes from.
+func (q *Queries) CompressionStats(ctx context.Context) ([]CompressionStatsRow, error) {
+	rows, err := q.db.Query(ctx, compressionStats)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []CompressionStatsRow{}
+	for rows.Next() {
+		var i CompressionStatsRow
+		if err := rows.Scan(
+			&i.BackendName,
+			&i.Objects,
+			&i.LogicalBytes,
+			&i.StoredBytes,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const countObjectsByPrefix = `-- name: CountObjectsByPrefix :one
+SELECT count(DISTINCT object_key)
+FROM object_locations
+WHERE object_key LIKE $1::text || '%' ESCAPE '\'
+`
+
+// Distinct keys, not copies: an object replicated three times is one object to
+// an operator asking whether a bucket is empty. The prefix is escaped the same
+// way ListObjectsByPrefix escapes it, so a bucket whose name contains a LIKE
+// metacharacter counts its own keys rather than a wider set.
+func (q *Queries) CountObjectsByPrefix(ctx context.Context, prefix string) (int64, error) {
+	row := q.db.QueryRow(ctx, countObjectsByPrefix, prefix)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
+const countScrubCandidatesOnBackends = `-- name: CountScrubCandidatesOnBackends :one
+SELECT count(*)
+FROM object_locations
+WHERE content_hash IS NOT NULL AND managed
+  AND backend_name = ANY($1::text[])
+`
+
+// Copies eligible for scrubbing that live on the named backends. Used to report
+// how much of the queue a cycle declined to read, which a sampled count of the
+// batch cannot show.
+func (q *Queries) CountScrubCandidatesOnBackends(ctx context.Context, backendNames []string) (int64, error) {
+	row := q.db.QueryRow(ctx, countScrubCandidatesOnBackends, backendNames)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
+const countUnencryptedLocations = `-- name: CountUnencryptedLocations :one
+SELECT count(*) FROM object_locations WHERE encrypted = FALSE
+`
+
+// Copies still stored as plaintext. Uses the same predicate as
+// ListUnencryptedLocations, so the figure is exactly what encrypt-existing
+// would process rather than a differently-scoped count that happens to be near
+// it.
+func (q *Queries) CountUnencryptedLocations(ctx context.Context) (int64, error) {
+	row := q.db.QueryRow(ctx, countUnencryptedLocations)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const deleteObjectCopies = `-- name: DeleteObjectCopies :exec
 DELETE FROM object_locations
 WHERE object_key = $1
@@ -95,22 +190,30 @@ func (q *Queries) DeleteObjectsByKeys(ctx context.Context, objectKeys []string) 
 }
 
 const getAllObjectLocations = `-- name: GetAllObjectLocations :many
-SELECT object_key, backend_name, size_bytes, encrypted, encryption_key, key_id, plaintext_size, content_hash, created_at
+SELECT object_key, backend_name, size_bytes, encrypted, encryption_key, key_id, plaintext_size, content_hash, compression_algorithm, compression_level, compression_format_version, logical_size, etag, content_type, user_metadata, created_at, last_scrubbed_at
 FROM object_locations
 WHERE object_key = $1
 ORDER BY created_at ASC
 `
 
 type GetAllObjectLocationsRow struct {
-	ObjectKey     string
-	BackendName   string
-	SizeBytes     int64
-	Encrypted     bool
-	EncryptionKey []byte
-	KeyID         *string
-	PlaintextSize *int64
-	ContentHash   *string
-	CreatedAt     pgtype.Timestamptz
+	ObjectKey                string
+	BackendName              string
+	SizeBytes                int64
+	Encrypted                bool
+	EncryptionKey            []byte
+	KeyID                    *string
+	PlaintextSize            *int64
+	ContentHash              *string
+	CompressionAlgorithm     *string
+	CompressionLevel         *string
+	CompressionFormatVersion *int16
+	LogicalSize              *int64
+	Etag                     *string
+	ContentType              *string
+	UserMetadata             []byte
+	CreatedAt                pgtype.Timestamptz
+	LastScrubbedAt           pgtype.Timestamptz
 }
 
 func (q *Queries) GetAllObjectLocations(ctx context.Context, objectKey string) ([]GetAllObjectLocationsRow, error) {
@@ -131,7 +234,15 @@ func (q *Queries) GetAllObjectLocations(ctx context.Context, objectKey string) (
 			&i.KeyID,
 			&i.PlaintextSize,
 			&i.ContentHash,
+			&i.CompressionAlgorithm,
+			&i.CompressionLevel,
+			&i.CompressionFormatVersion,
+			&i.LogicalSize,
+			&i.Etag,
+			&i.ContentType,
+			&i.UserMetadata,
 			&i.CreatedAt,
+			&i.LastScrubbedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -246,7 +357,8 @@ func (q *Queries) GetDirectoryStats(ctx context.Context, arg GetDirectoryStatsPa
 }
 
 const getExistingCopiesForUpdate = `-- name: GetExistingCopiesForUpdate :many
-SELECT backend_name, size_bytes, created_at
+SELECT backend_name, size_bytes, created_at, encrypted,
+       (encryption_key IS NOT NULL AND length(encryption_key) > 0) AS has_dek
 FROM object_locations
 WHERE object_key = $1
 FOR UPDATE
@@ -256,6 +368,8 @@ type GetExistingCopiesForUpdateRow struct {
 	BackendName string
 	SizeBytes   int64
 	CreatedAt   pgtype.Timestamptz
+	Encrypted   bool
+	HasDek      *bool
 }
 
 func (q *Queries) GetExistingCopiesForUpdate(ctx context.Context, objectKey string) ([]GetExistingCopiesForUpdateRow, error) {
@@ -267,7 +381,92 @@ func (q *Queries) GetExistingCopiesForUpdate(ctx context.Context, objectKey stri
 	items := []GetExistingCopiesForUpdateRow{}
 	for rows.Next() {
 		var i GetExistingCopiesForUpdateRow
-		if err := rows.Scan(&i.BackendName, &i.SizeBytes, &i.CreatedAt); err != nil {
+		if err := rows.Scan(
+			&i.BackendName,
+			&i.SizeBytes,
+			&i.CreatedAt,
+			&i.Encrypted,
+			&i.HasDek,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const getLeastRecentlyScrubbedObjects = `-- name: GetLeastRecentlyScrubbedObjects :many
+SELECT object_key, backend_name, size_bytes, encrypted, encryption_key, key_id, plaintext_size, content_hash, compression_algorithm, compression_level, compression_format_version, logical_size, created_at, last_scrubbed_at
+FROM object_locations
+WHERE content_hash IS NOT NULL AND managed
+  AND backend_name = ANY($1::text[])
+ORDER BY COALESCE(last_scrubbed_at, created_at) ASC, object_key ASC
+LIMIT $2
+`
+
+type GetLeastRecentlyScrubbedObjectsParams struct {
+	BackendNames []string
+	RowLimit     int32
+}
+
+type GetLeastRecentlyScrubbedObjectsRow struct {
+	ObjectKey                string
+	BackendName              string
+	SizeBytes                int64
+	Encrypted                bool
+	EncryptionKey            []byte
+	KeyID                    *string
+	PlaintextSize            *int64
+	ContentHash              *string
+	CompressionAlgorithm     *string
+	CompressionLevel         *string
+	CompressionFormatVersion *int16
+	LogicalSize              *int64
+	CreatedAt                pgtype.Timestamptz
+	LastScrubbedAt           pgtype.Timestamptz
+}
+
+// Return the copies least recently touched, by verification or by writing.
+//
+// Falling back to created_at is what keeps the sweep alive on a busy fleet: a
+// copy written moments ago sorts to the back rather than jumping the queue, so
+// a write rate above the scrub rate cannot starve older data. It also puts the
+// effort where rot actually accumulates, since churn is deleted long before it
+// degrades while the copies that persist for months are the ones at risk.
+//
+// backend_names restricts the batch to copies the scrubber can afford to read.
+// Filtering here rather than after selection is what keeps a sweep useful when
+// a backend is over its usage limit: a copy the scrubber would decline never
+// occupies a slot, so it is neither stamped as examined nor left at the head of
+// the queue to be re-selected every cycle.
+func (q *Queries) GetLeastRecentlyScrubbedObjects(ctx context.Context, arg GetLeastRecentlyScrubbedObjectsParams) ([]GetLeastRecentlyScrubbedObjectsRow, error) {
+	rows, err := q.db.Query(ctx, getLeastRecentlyScrubbedObjects, arg.BackendNames, arg.RowLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []GetLeastRecentlyScrubbedObjectsRow{}
+	for rows.Next() {
+		var i GetLeastRecentlyScrubbedObjectsRow
+		if err := rows.Scan(
+			&i.ObjectKey,
+			&i.BackendName,
+			&i.SizeBytes,
+			&i.Encrypted,
+			&i.EncryptionKey,
+			&i.KeyID,
+			&i.PlaintextSize,
+			&i.ContentHash,
+			&i.CompressionAlgorithm,
+			&i.CompressionLevel,
+			&i.CompressionFormatVersion,
+			&i.LogicalSize,
+			&i.CreatedAt,
+			&i.LastScrubbedAt,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -314,33 +513,41 @@ func (q *Queries) GetObjectBackendsForKeys(ctx context.Context, objectKeys []str
 }
 
 const getObjectsWithoutHash = `-- name: GetObjectsWithoutHash :many
-SELECT object_key, backend_name, size_bytes, encrypted, encryption_key, key_id, plaintext_size, content_hash, created_at
+SELECT object_key, backend_name, size_bytes, encrypted, encryption_key, key_id, plaintext_size, content_hash, compression_algorithm, compression_level, compression_format_version, logical_size, created_at
 FROM object_locations
-WHERE content_hash IS NULL
+WHERE content_hash IS NULL AND managed
+  AND ($1::text = '' OR backend_name = $1::text)
 ORDER BY created_at ASC
-LIMIT $1 OFFSET $2
+LIMIT $3 OFFSET $2
 `
 
 type GetObjectsWithoutHashParams struct {
-	Limit  int32
-	Offset int32
+	BackendFilter string
+	RowOffset     int32
+	RowLimit      int32
 }
 
 type GetObjectsWithoutHashRow struct {
-	ObjectKey     string
-	BackendName   string
-	SizeBytes     int64
-	Encrypted     bool
-	EncryptionKey []byte
-	KeyID         *string
-	PlaintextSize *int64
-	ContentHash   *string
-	CreatedAt     pgtype.Timestamptz
+	ObjectKey                string
+	BackendName              string
+	SizeBytes                int64
+	Encrypted                bool
+	EncryptionKey            []byte
+	KeyID                    *string
+	PlaintextSize            *int64
+	ContentHash              *string
+	CompressionAlgorithm     *string
+	CompressionLevel         *string
+	CompressionFormatVersion *int16
+	LogicalSize              *int64
+	CreatedAt                pgtype.Timestamptz
 }
 
-// Return object locations that have no content hash, for backfill.
+// Return object locations that have no content hash, for backfill. Hashing
+// reads the whole body, so unmanaged rows are left alone rather than spending
+// egress on data the orchestrator does not manage.
 func (q *Queries) GetObjectsWithoutHash(ctx context.Context, arg GetObjectsWithoutHashParams) ([]GetObjectsWithoutHashRow, error) {
-	rows, err := q.db.Query(ctx, getObjectsWithoutHash, arg.Limit, arg.Offset)
+	rows, err := q.db.Query(ctx, getObjectsWithoutHash, arg.BackendFilter, arg.RowOffset, arg.RowLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -357,59 +564,10 @@ func (q *Queries) GetObjectsWithoutHash(ctx context.Context, arg GetObjectsWitho
 			&i.KeyID,
 			&i.PlaintextSize,
 			&i.ContentHash,
-			&i.CreatedAt,
-		); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
-const getRandomHashedObjects = `-- name: GetRandomHashedObjects :many
-SELECT object_key, backend_name, size_bytes, encrypted, encryption_key, key_id, plaintext_size, content_hash, created_at
-FROM object_locations TABLESAMPLE BERNOULLI (10)
-WHERE content_hash IS NOT NULL
-LIMIT $1
-`
-
-type GetRandomHashedObjectsRow struct {
-	ObjectKey     string
-	BackendName   string
-	SizeBytes     int64
-	Encrypted     bool
-	EncryptionKey []byte
-	KeyID         *string
-	PlaintextSize *int64
-	ContentHash   *string
-	CreatedAt     pgtype.Timestamptz
-}
-
-// Return random object locations that have a content hash, for scrubber
-// verification. Uses TABLESAMPLE to avoid a full table sort, then filters
-// and limits. The sample percentage is generous (10%) to ensure enough rows
-// pass the WHERE filter; the LIMIT caps the final result.
-func (q *Queries) GetRandomHashedObjects(ctx context.Context, limit int32) ([]GetRandomHashedObjectsRow, error) {
-	rows, err := q.db.Query(ctx, getRandomHashedObjects, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []GetRandomHashedObjectsRow{}
-	for rows.Next() {
-		var i GetRandomHashedObjectsRow
-		if err := rows.Scan(
-			&i.ObjectKey,
-			&i.BackendName,
-			&i.SizeBytes,
-			&i.Encrypted,
-			&i.EncryptionKey,
-			&i.KeyID,
-			&i.PlaintextSize,
-			&i.ContentHash,
+			&i.CompressionAlgorithm,
+			&i.CompressionLevel,
+			&i.CompressionFormatVersion,
+			&i.LogicalSize,
 			&i.CreatedAt,
 		); err != nil {
 			return nil, err
@@ -423,19 +581,26 @@ func (q *Queries) GetRandomHashedObjects(ctx context.Context, limit int32) ([]Ge
 }
 
 const insertObjectLocation = `-- name: InsertObjectLocation :exec
-INSERT INTO object_locations (object_key, backend_name, size_bytes, encrypted, encryption_key, key_id, plaintext_size, content_hash, created_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+INSERT INTO object_locations (object_key, backend_name, size_bytes, encrypted, encryption_key, key_id, plaintext_size, content_hash, compression_algorithm, compression_level, compression_format_version, logical_size, etag, content_type, user_metadata, created_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, NOW())
 `
 
 type InsertObjectLocationParams struct {
-	ObjectKey     string
-	BackendName   string
-	SizeBytes     int64
-	Encrypted     bool
-	EncryptionKey []byte
-	KeyID         *string
-	PlaintextSize *int64
-	ContentHash   *string
+	ObjectKey                string
+	BackendName              string
+	SizeBytes                int64
+	Encrypted                bool
+	EncryptionKey            []byte
+	KeyID                    *string
+	PlaintextSize            *int64
+	ContentHash              *string
+	CompressionAlgorithm     *string
+	CompressionLevel         *string
+	CompressionFormatVersion *int16
+	LogicalSize              *int64
+	Etag                     *string
+	ContentType              *string
+	UserMetadata             []byte
 }
 
 func (q *Queries) InsertObjectLocation(ctx context.Context, arg InsertObjectLocationParams) error {
@@ -448,26 +613,42 @@ func (q *Queries) InsertObjectLocation(ctx context.Context, arg InsertObjectLoca
 		arg.KeyID,
 		arg.PlaintextSize,
 		arg.ContentHash,
+		arg.CompressionAlgorithm,
+		arg.CompressionLevel,
+		arg.CompressionFormatVersion,
+		arg.LogicalSize,
+		arg.Etag,
+		arg.ContentType,
+		arg.UserMetadata,
 	)
 	return err
 }
 
 const insertObjectLocationIfNotExists = `-- name: InsertObjectLocationIfNotExists :one
-INSERT INTO object_locations (object_key, backend_name, size_bytes, encrypted, encryption_key, key_id, plaintext_size, content_hash, created_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+INSERT INTO object_locations (object_key, backend_name, size_bytes, encrypted, encryption_key, key_id, plaintext_size, content_hash, compression_algorithm, compression_level, compression_format_version, logical_size, etag, content_type, user_metadata, managed, created_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
 ON CONFLICT (object_key, backend_name) DO NOTHING
 RETURNING true AS inserted
 `
 
 type InsertObjectLocationIfNotExistsParams struct {
-	ObjectKey     string
-	BackendName   string
-	SizeBytes     int64
-	Encrypted     bool
-	EncryptionKey []byte
-	KeyID         *string
-	PlaintextSize *int64
-	ContentHash   *string
+	ObjectKey                string
+	BackendName              string
+	SizeBytes                int64
+	Encrypted                bool
+	EncryptionKey            []byte
+	KeyID                    *string
+	PlaintextSize            *int64
+	ContentHash              *string
+	CompressionAlgorithm     *string
+	CompressionLevel         *string
+	CompressionFormatVersion *int16
+	LogicalSize              *int64
+	Etag                     *string
+	ContentType              *string
+	UserMetadata             []byte
+	Managed                  bool
+	CreatedAt                pgtype.Timestamptz
 }
 
 func (q *Queries) InsertObjectLocationIfNotExists(ctx context.Context, arg InsertObjectLocationIfNotExistsParams) (bool, error) {
@@ -480,23 +661,76 @@ func (q *Queries) InsertObjectLocationIfNotExists(ctx context.Context, arg Inser
 		arg.KeyID,
 		arg.PlaintextSize,
 		arg.ContentHash,
+		arg.CompressionAlgorithm,
+		arg.CompressionLevel,
+		arg.CompressionFormatVersion,
+		arg.LogicalSize,
+		arg.Etag,
+		arg.ContentType,
+		arg.UserMetadata,
+		arg.Managed,
+		arg.CreatedAt,
 	)
 	var inserted bool
 	err := row.Scan(&inserted)
 	return inserted, err
 }
 
+const integrityCoverage = `-- name: IntegrityCoverage :one
+SELECT
+    COALESCE(EXTRACT(EPOCH FROM (NOW() - MIN(COALESCE(last_scrubbed_at, created_at))
+        FILTER (WHERE backend_name = ANY($1::text[])))), 0)::bigint AS age_seconds,
+    COUNT(*) FILTER (WHERE last_scrubbed_at IS NULL
+        AND backend_name = ANY($1::text[]))::bigint AS never_verified,
+    COUNT(*) FILTER (WHERE NOT (backend_name = ANY($1::text[])))::bigint AS deferred
+FROM object_locations
+WHERE content_hash IS NOT NULL AND managed
+`
+
+type IntegrityCoverageRow struct {
+	AgeSeconds    int64
+	NeverVerified int64
+	Deferred      int64
+}
+
+// How far behind verification is, split by whether the sweep can reach the copy
+// at all. Reachable is the same backend set the scrub queue draws from.
+//
+// The age and the never-verified count cover reachable copies only. A copy the
+// sweep is not allowed to read can never be stamped, so counting it pins
+// MIN(COALESCE(last_scrubbed_at, created_at)) to a fixed timestamp and the age
+// then tracks wall clock rather than the backlog: it climbs by a day every day
+// no matter how much the sweep verifies, and no amount of scrubbing lowers it.
+//
+// Deferred counts the rest rather than discarding them, so a fleet holding most
+// of its copies on a backend over its usage limit cannot report as healthy.
+//
+// The age falls back to created_at exactly as the queue ordering does, so a
+// never-verified copy is measured from when it was written. Taking MIN over
+// last_scrubbed_at alone skips those rows entirely, which reports a fleet that
+// has never been scrubbed as an age of zero.
+func (q *Queries) IntegrityCoverage(ctx context.Context, reachableBackends []string) (IntegrityCoverageRow, error) {
+	row := q.db.QueryRow(ctx, integrityCoverage, reachableBackends)
+	var i IntegrityCoverageRow
+	err := row.Scan(&i.AgeSeconds, &i.NeverVerified, &i.Deferred)
+	return i, err
+}
+
 const listAllEncryptedLocations = `-- name: ListAllEncryptedLocations :many
-SELECT object_key, backend_name, size_bytes, encryption_key, key_id, plaintext_size
+SELECT object_key, backend_name, size_bytes, encryption_key, key_id, plaintext_size, etag
 FROM object_locations
 WHERE encrypted = TRUE
+  AND ($1::text = '' OR backend_name = $1::text)
+  AND (object_key, backend_name) > ($2::text, $3::text)
 ORDER BY object_key, backend_name
-LIMIT $1 OFFSET $2
+LIMIT $4
 `
 
 type ListAllEncryptedLocationsParams struct {
-	Limit  int32
-	Offset int32
+	BackendFilter string
+	AfterKey      string
+	AfterBackend  string
+	RowLimit      int32
 }
 
 type ListAllEncryptedLocationsRow struct {
@@ -506,10 +740,18 @@ type ListAllEncryptedLocationsRow struct {
 	EncryptionKey []byte
 	KeyID         *string
 	PlaintextSize *int64
+	Etag          *string
 }
 
+// Cursor-paged for the same reason as ListUnencryptedLocations: decrypting a
+// copy removes it from this set mid-walk.
 func (q *Queries) ListAllEncryptedLocations(ctx context.Context, arg ListAllEncryptedLocationsParams) ([]ListAllEncryptedLocationsRow, error) {
-	rows, err := q.db.Query(ctx, listAllEncryptedLocations, arg.Limit, arg.Offset)
+	rows, err := q.db.Query(ctx, listAllEncryptedLocations,
+		arg.BackendFilter,
+		arg.AfterKey,
+		arg.AfterBackend,
+		arg.RowLimit,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -524,6 +766,83 @@ func (q *Queries) ListAllEncryptedLocations(ctx context.Context, arg ListAllEncr
 			&i.EncryptionKey,
 			&i.KeyID,
 			&i.PlaintextSize,
+			&i.Etag,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listCompressedLocations = `-- name: ListCompressedLocations :many
+SELECT object_key, backend_name, size_bytes, encrypted, encryption_key, key_id,
+       plaintext_size, compression_algorithm, compression_level,
+       compression_format_version, logical_size, etag
+FROM object_locations
+WHERE compression_algorithm IS NOT NULL
+  AND ($1::text = '' OR backend_name = $1::text)
+  AND (object_key, backend_name) > ($2::text, $3::text)
+ORDER BY object_key, backend_name
+LIMIT $4
+`
+
+type ListCompressedLocationsParams struct {
+	BackendFilter string
+	AfterKey      string
+	AfterBackend  string
+	RowLimit      int32
+}
+
+type ListCompressedLocationsRow struct {
+	ObjectKey                string
+	BackendName              string
+	SizeBytes                int64
+	Encrypted                bool
+	EncryptionKey            []byte
+	KeyID                    *string
+	PlaintextSize            *int64
+	CompressionAlgorithm     *string
+	CompressionLevel         *string
+	CompressionFormatVersion *int16
+	LogicalSize              *int64
+	Etag                     *string
+}
+
+// The complement of ListUncompressedLocations, which is what
+// decompress-existing rewrites. Cursor-paged for the same reason, and the case
+// that makes it matter most: every object this pass succeeds on leaves the
+// predicate, so an offset walk would skip whole pages and stop early.
+func (q *Queries) ListCompressedLocations(ctx context.Context, arg ListCompressedLocationsParams) ([]ListCompressedLocationsRow, error) {
+	rows, err := q.db.Query(ctx, listCompressedLocations,
+		arg.BackendFilter,
+		arg.AfterKey,
+		arg.AfterBackend,
+		arg.RowLimit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListCompressedLocationsRow{}
+	for rows.Next() {
+		var i ListCompressedLocationsRow
+		if err := rows.Scan(
+			&i.ObjectKey,
+			&i.BackendName,
+			&i.SizeBytes,
+			&i.Encrypted,
+			&i.EncryptionKey,
+			&i.KeyID,
+			&i.PlaintextSize,
+			&i.CompressionAlgorithm,
+			&i.CompressionLevel,
+			&i.CompressionFormatVersion,
+			&i.LogicalSize,
+			&i.Etag,
 		); err != nil {
 			return nil, err
 		}
@@ -639,18 +958,30 @@ func (q *Queries) ListEncryptedLocations(ctx context.Context, arg ListEncryptedL
 }
 
 const listExpiredObjects = `-- name: ListExpiredObjects :many
-SELECT DISTINCT ON (object_key) object_key, backend_name, size_bytes, created_at
-FROM object_locations
-WHERE object_key LIKE $1::text || '%' ESCAPE '\'
-  AND created_at < $2
-ORDER BY object_key, created_at ASC
-LIMIT $3
+SELECT DISTINCT ON (ol.object_key COLLATE "C") ol.object_key, ol.backend_name, ol.size_bytes, ol.created_at
+FROM object_locations ol
+WHERE ol.object_key LIKE $1::text || '%' ESCAPE '\'
+  AND ol.created_at < $2
+  AND (
+    $3::int = 0
+    OR (
+      SELECT COUNT(*)
+      FROM object_tags t
+      JOIN jsonb_each_text($4::jsonb) AS f(k, v)
+        ON t.tag_key = f.k AND t.tag_value = f.v
+      WHERE t.object_key = ol.object_key
+    ) = $3::int
+  )
+ORDER BY ol.object_key COLLATE "C", ol.created_at ASC
+LIMIT $5
 `
 
 type ListExpiredObjectsParams struct {
-	Prefix  string
-	Cutoff  pgtype.Timestamptz
-	MaxKeys int32
+	Prefix   string
+	Cutoff   pgtype.Timestamptz
+	TagCount int32
+	Tags     []byte
+	MaxKeys  int32
 }
 
 type ListExpiredObjectsRow struct {
@@ -660,8 +991,26 @@ type ListExpiredObjectsRow struct {
 	CreatedAt   pgtype.Timestamptz
 }
 
+// Collated for the same reason as ListObjectsByPrefix. The expiry worker does
+// not depend on the order, but a batch that differs by engine is one more thing
+// an operator has to hold in their head when a run is reproduced elsewhere.
+//
+// The tag filter is a correlated subquery rather than a join: a join against
+// object_tags multiplies the row per matching tag, and this query's DISTINCT ON
+// and its matching ORDER BY are what reduce an object's replicas to one row.
+// Counting in a subquery leaves both untouched.
+//
+// Requiring the count to equal tag_count is what makes several tags an AND.
+// The primary key allows one row per (object_key, tag_key), so a count equal to
+// the number of pairs asked for means every one of them matched.
 func (q *Queries) ListExpiredObjects(ctx context.Context, arg ListExpiredObjectsParams) ([]ListExpiredObjectsRow, error) {
-	rows, err := q.db.Query(ctx, listExpiredObjects, arg.Prefix, arg.Cutoff, arg.MaxKeys)
+	rows, err := q.db.Query(ctx, listExpiredObjects,
+		arg.Prefix,
+		arg.Cutoff,
+		arg.TagCount,
+		arg.Tags,
+		arg.MaxKeys,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -688,7 +1037,7 @@ func (q *Queries) ListExpiredObjects(ctx context.Context, arg ListExpiredObjects
 const listObjectsByBackend = `-- name: ListObjectsByBackend :many
 SELECT object_key, backend_name, size_bytes, created_at
 FROM object_locations
-WHERE backend_name = $1
+WHERE backend_name = $1 AND managed
 ORDER BY size_bytes ASC
 LIMIT $2
 `
@@ -705,6 +1054,10 @@ type ListObjectsByBackendRow struct {
 	CreatedAt   pgtype.Timestamptz
 }
 
+// ListObjectsByBackend backs the rebalance, placement and drain candidate
+// scans, so it returns managed rows only. Objects outside every configured
+// bucket prefix are tracked for accounting but are not the orchestrator's to
+// move.
 func (q *Queries) ListObjectsByBackend(ctx context.Context, arg ListObjectsByBackendParams) ([]ListObjectsByBackendRow, error) {
 	rows, err := q.db.Query(ctx, listObjectsByBackend, arg.BackendName, arg.Limit)
 	if err != nil {
@@ -787,11 +1140,11 @@ func (q *Queries) ListObjectsByBackendKeyAsc(ctx context.Context, arg ListObject
 }
 
 const listObjectsByPrefix = `-- name: ListObjectsByPrefix :many
-SELECT DISTINCT ON (object_key) object_key, backend_name, size_bytes, created_at
+SELECT DISTINCT ON (object_key COLLATE "C") object_key, backend_name, size_bytes, etag, created_at
 FROM object_locations
 WHERE object_key LIKE $1::text || '%' ESCAPE '\'
-  AND object_key > $2
-ORDER BY object_key, created_at ASC
+  AND object_key COLLATE "C" > $2
+ORDER BY object_key COLLATE "C", created_at ASC
 LIMIT $3
 `
 
@@ -805,9 +1158,16 @@ type ListObjectsByPrefixRow struct {
 	ObjectKey   string
 	BackendName string
 	SizeBytes   int64
+	Etag        *string
 	CreatedAt   pgtype.Timestamptz
 }
 
+// COLLATE "C" is required: S3 ListObjectsV2 returns keys in UTF-8 byte order,
+// and object_key is plain TEXT so it would otherwise sort under the database's
+// LC_COLLATE. The cursor predicate carries the same collation as the ORDER BY -
+// splitting them would page a byte-ordered scan with a locale-ordered cursor and
+// skip or repeat keys. DISTINCT ON must carry it too, or Postgres rejects the
+// query for not matching the leading ORDER BY expression.
 func (q *Queries) ListObjectsByPrefix(ctx context.Context, arg ListObjectsByPrefixParams) ([]ListObjectsByPrefixRow, error) {
 	rows, err := q.db.Query(ctx, listObjectsByPrefix, arg.Prefix, arg.StartAfter, arg.MaxKeys)
 	if err != nil {
@@ -821,6 +1181,7 @@ func (q *Queries) ListObjectsByPrefix(ctx context.Context, arg ListObjectsByPref
 			&i.ObjectKey,
 			&i.BackendName,
 			&i.SizeBytes,
+			&i.Etag,
 			&i.CreatedAt,
 		); err != nil {
 			return nil, err
@@ -869,10 +1230,11 @@ SELECT
         ELSE w.k END)::text AS skip_bound,
     COALESCE(leaf.backend_name, '')::text AS backend_name,
     COALESCE(leaf.size_bytes, 0)::bigint AS size_bytes,
+    COALESCE(leaf.etag, '')::text AS etag,
     COALESCE(leaf.created_at, to_timestamp(0)) AS created_at
 FROM walk w
 LEFT JOIN LATERAL (
-    SELECT backend_name, size_bytes, created_at
+    SELECT backend_name, size_bytes, etag, created_at
       FROM object_locations o2
      WHERE o2.object_key = w.k
        AND position($2::text IN substr(w.k, length($1::text) + 1)) = 0
@@ -899,6 +1261,7 @@ type ListObjectsDelimitedRow struct {
 	SkipBound    string
 	BackendName  string
 	SizeBytes    int64
+	Etag         string
 	CreatedAt    pgtype.Timestamptz
 }
 
@@ -928,6 +1291,7 @@ func (q *Queries) ListObjectsDelimited(ctx context.Context, arg ListObjectsDelim
 			&i.SkipBound,
 			&i.BackendName,
 			&i.SizeBytes,
+			&i.Etag,
 			&i.CreatedAt,
 		); err != nil {
 			return nil, err
@@ -940,27 +1304,152 @@ func (q *Queries) ListObjectsDelimited(ctx context.Context, arg ListObjectsDelim
 	return items, nil
 }
 
+const listUncompressedLocations = `-- name: ListUncompressedLocations :many
+SELECT object_key, backend_name, size_bytes, encrypted, encryption_key, key_id,
+       plaintext_size, compression_algorithm, compression_level,
+       compression_format_version, logical_size, etag
+FROM object_locations
+WHERE compression_algorithm IS NULL
+  AND ($1::text = '' OR backend_name = $1::text)
+  AND (CASE WHEN encrypted THEN plaintext_size ELSE size_bytes END) >= $2::bigint
+  AND (compression_probe_size IS NULL
+       OR compression_probe_level IS DISTINCT FROM $3::text
+       OR compression_probe_size::float8
+          / NULLIF(CASE WHEN encrypted THEN plaintext_size ELSE size_bytes END, 0)::float8
+          <= $4::float8)
+  AND (object_key, backend_name) > ($5::text, $6::text)
+ORDER BY object_key, backend_name
+LIMIT $7
+`
+
+type ListUncompressedLocationsParams struct {
+	BackendFilter string
+	MinSize       int64
+	ProbeLevel    string
+	MinRatio      float64
+	AfterKey      string
+	AfterBackend  string
+	RowLimit      int32
+}
+
+type ListUncompressedLocationsRow struct {
+	ObjectKey                string
+	BackendName              string
+	SizeBytes                int64
+	Encrypted                bool
+	EncryptionKey            []byte
+	KeyID                    *string
+	PlaintextSize            *int64
+	CompressionAlgorithm     *string
+	CompressionLevel         *string
+	CompressionFormatVersion *int16
+	LogicalSize              *int64
+	Etag                     *string
+}
+
+// Copies whose stored bytes carry no encoding, which is what compress-existing
+// rewrites. The encryption columns come along because compression sits inside
+// encryption: an encrypted copy is decrypted, encoded, and re-encrypted under
+// the key it already had.
+//
+// Paged by cursor, not offset: an encoded copy leaves this predicate, so the
+// set shrinks under the pass walking it.
+//
+// Copies already measured as not worth encoding are excluded here rather than
+// downloaded and encoded again to reach the same verdict, which on an
+// incompressible fleet is the pass's largest wasted expense. The stored
+// measurement is judged against the current settings, so it excludes a copy
+// only while it would still be declined: lowering min_ratio returns those
+// copies to the pass without reading any of them. A probe taken at a different
+// level says nothing about this one and is ignored, since the levels are names
+// from an ordered set rather than numbers.
+//
+// The divisor is NULLIF'd because a zero-length copy cannot shrink: the
+// comparison goes NULL and the row is excluded, matching WorthStoring, which
+// declines a logical size of zero outright.
+//
+// The size floor is applied here for the same reason, one the row can answer:
+// a copy below it is never a candidate, so listing it only to decline it costs
+// a page slot on every pass forever.
+func (q *Queries) ListUncompressedLocations(ctx context.Context, arg ListUncompressedLocationsParams) ([]ListUncompressedLocationsRow, error) {
+	rows, err := q.db.Query(ctx, listUncompressedLocations,
+		arg.BackendFilter,
+		arg.MinSize,
+		arg.ProbeLevel,
+		arg.MinRatio,
+		arg.AfterKey,
+		arg.AfterBackend,
+		arg.RowLimit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListUncompressedLocationsRow{}
+	for rows.Next() {
+		var i ListUncompressedLocationsRow
+		if err := rows.Scan(
+			&i.ObjectKey,
+			&i.BackendName,
+			&i.SizeBytes,
+			&i.Encrypted,
+			&i.EncryptionKey,
+			&i.KeyID,
+			&i.PlaintextSize,
+			&i.CompressionAlgorithm,
+			&i.CompressionLevel,
+			&i.CompressionFormatVersion,
+			&i.LogicalSize,
+			&i.Etag,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listUnencryptedLocations = `-- name: ListUnencryptedLocations :many
-SELECT object_key, backend_name, size_bytes
+SELECT object_key, backend_name, size_bytes, etag
 FROM object_locations
 WHERE encrypted = FALSE
+  AND ($1::text = '' OR backend_name = $1::text)
+  AND (object_key, backend_name) > ($2::text, $3::text)
 ORDER BY object_key, backend_name
-LIMIT $1 OFFSET $2
+LIMIT $4
 `
 
 type ListUnencryptedLocationsParams struct {
-	Limit  int32
-	Offset int32
+	BackendFilter string
+	AfterKey      string
+	AfterBackend  string
+	RowLimit      int32
 }
 
 type ListUnencryptedLocationsRow struct {
 	ObjectKey   string
 	BackendName string
 	SizeBytes   int64
+	Etag        *string
 }
 
+// Paged by cursor rather than offset. Encrypting a copy takes it out of this
+// predicate, so the set shrinks as encrypt-existing walks it and an offset
+// would step over the rows that moved up.
+//
+// An empty backend_filter selects every backend, which is what a pass over the
+// whole fleet asks for. Filtering here rather than after the page is read is
+// what keeps the row_limit spent on candidates the pass will act on.
 func (q *Queries) ListUnencryptedLocations(ctx context.Context, arg ListUnencryptedLocationsParams) ([]ListUnencryptedLocationsRow, error) {
-	rows, err := q.db.Query(ctx, listUnencryptedLocations, arg.Limit, arg.Offset)
+	rows, err := q.db.Query(ctx, listUnencryptedLocations,
+		arg.BackendFilter,
+		arg.AfterKey,
+		arg.AfterBackend,
+		arg.RowLimit,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -968,7 +1457,12 @@ func (q *Queries) ListUnencryptedLocations(ctx context.Context, arg ListUnencryp
 	items := []ListUnencryptedLocationsRow{}
 	for rows.Next() {
 		var i ListUnencryptedLocationsRow
-		if err := rows.Scan(&i.ObjectKey, &i.BackendName, &i.SizeBytes); err != nil {
+		if err := rows.Scan(
+			&i.ObjectKey,
+			&i.BackendName,
+			&i.SizeBytes,
+			&i.Etag,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -1001,7 +1495,9 @@ func (q *Queries) LockObjectKeyForWrite(ctx context.Context, hashtext string) er
 }
 
 const lockObjectOnBackend = `-- name: LockObjectOnBackend :one
-SELECT size_bytes, encrypted, encryption_key, key_id, plaintext_size, content_hash
+SELECT size_bytes, encrypted, encryption_key, key_id, plaintext_size, content_hash,
+       compression_algorithm, compression_level, compression_format_version, logical_size,
+       compression_probe_size, compression_probe_level, etag, content_type, user_metadata
 FROM object_locations
 WHERE object_key = $1 AND backend_name = $2
 FOR UPDATE
@@ -1013,14 +1509,32 @@ type LockObjectOnBackendParams struct {
 }
 
 type LockObjectOnBackendRow struct {
-	SizeBytes     int64
-	Encrypted     bool
-	EncryptionKey []byte
-	KeyID         *string
-	PlaintextSize *int64
-	ContentHash   *string
+	SizeBytes                int64
+	Encrypted                bool
+	EncryptionKey            []byte
+	KeyID                    *string
+	PlaintextSize            *int64
+	ContentHash              *string
+	CompressionAlgorithm     *string
+	CompressionLevel         *string
+	CompressionFormatVersion *int16
+	LogicalSize              *int64
+	CompressionProbeSize     *int64
+	CompressionProbeLevel    *string
+	Etag                     *string
+	ContentType              *string
+	UserMetadata             []byte
 }
 
+// Every column describing the stored bytes, because the caller moving this row
+// to another backend rebuilds the destination from what this returns. A column
+// missing here is one the moved copy silently stops claiming, which for the
+// compression columns means a still-encoded object recorded as verbatim.
+//
+// The probe columns come along because a verbatim move does not change the
+// bytes, so what the encoder measured about them still holds. Dropping them
+// would have the next pass download and encode the copy again to learn what
+// this row already knows.
 func (q *Queries) LockObjectOnBackend(ctx context.Context, arg LockObjectOnBackendParams) (LockObjectOnBackendRow, error) {
 	row := q.db.QueryRow(ctx, lockObjectOnBackend, arg.ObjectKey, arg.BackendName)
 	var i LockObjectOnBackendRow
@@ -1031,11 +1545,79 @@ func (q *Queries) LockObjectOnBackend(ctx context.Context, arg LockObjectOnBacke
 		&i.KeyID,
 		&i.PlaintextSize,
 		&i.ContentHash,
+		&i.CompressionAlgorithm,
+		&i.CompressionLevel,
+		&i.CompressionFormatVersion,
+		&i.LogicalSize,
+		&i.CompressionProbeSize,
+		&i.CompressionProbeLevel,
+		&i.Etag,
+		&i.ContentType,
+		&i.UserMetadata,
 	)
 	return i, err
 }
 
-const markObjectDecrypted = `-- name: MarkObjectDecrypted :exec
+const markObjectCompressed = `-- name: MarkObjectCompressed :execrows
+UPDATE object_locations
+SET compression_algorithm = $3,
+    compression_level = $4,
+    compression_format_version = $5,
+    logical_size = $6,
+    size_bytes = $7,
+    plaintext_size = $8,
+    encryption_key = $9,
+    key_id = $10
+WHERE object_key = $1 AND backend_name = $2
+  AND etag IS NOT DISTINCT FROM $11::text
+`
+
+type MarkObjectCompressedParams struct {
+	ObjectKey                string
+	BackendName              string
+	CompressionAlgorithm     *string
+	CompressionLevel         *string
+	CompressionFormatVersion *int16
+	LogicalSize              *int64
+	SizeBytes                int64
+	PlaintextSize            *int64
+	EncryptionKey            []byte
+	KeyID                    *string
+	ExpectedEtag             *string
+}
+
+// Records how a rewritten copy is now stored. A NULL algorithm is the
+// decompress direction, which also clears the columns that only describe an
+// encoding. The envelope columns are rewritten too: re-encrypting an object
+// mints a new base nonce and wrapped key, so leaving the old ones would
+// describe bytes nothing can decrypt.
+//
+// Committed only while the row still reports the etag the transform read. A
+// client writing the key mid-pass changes it, and the bytes this would describe
+// are then no longer the bytes stored - so no row matches and the caller skips
+// the copy. IS NOT DISTINCT FROM rather than =, so a row that carried no etag
+// and gained one from a client write fails the check instead of matching NULL.
+func (q *Queries) MarkObjectCompressed(ctx context.Context, arg MarkObjectCompressedParams) (int64, error) {
+	result, err := q.db.Exec(ctx, markObjectCompressed,
+		arg.ObjectKey,
+		arg.BackendName,
+		arg.CompressionAlgorithm,
+		arg.CompressionLevel,
+		arg.CompressionFormatVersion,
+		arg.LogicalSize,
+		arg.SizeBytes,
+		arg.PlaintextSize,
+		arg.EncryptionKey,
+		arg.KeyID,
+		arg.ExpectedEtag,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const markObjectDecrypted = `-- name: MarkObjectDecrypted :execrows
 UPDATE object_locations
 SET encrypted = FALSE,
     encryption_key = NULL,
@@ -1043,20 +1625,35 @@ SET encrypted = FALSE,
     size_bytes = $3,
     plaintext_size = NULL
 WHERE object_key = $1 AND backend_name = $2
+  AND etag IS NOT DISTINCT FROM $4::text
 `
 
 type MarkObjectDecryptedParams struct {
-	ObjectKey   string
-	BackendName string
-	SizeBytes   int64
+	ObjectKey    string
+	BackendName  string
+	SizeBytes    int64
+	ExpectedEtag *string
 }
 
-func (q *Queries) MarkObjectDecrypted(ctx context.Context, arg MarkObjectDecryptedParams) error {
-	_, err := q.db.Exec(ctx, markObjectDecrypted, arg.ObjectKey, arg.BackendName, arg.SizeBytes)
-	return err
+// Committed only while the row still reports the etag the transform read. A
+// client writing the key mid-pass changes it, and the bytes this would describe
+// are then no longer the bytes stored - so no row matches and the caller skips
+// the copy. IS NOT DISTINCT FROM rather than =, so a row that carried no etag
+// and gained one from a client write fails the check instead of matching NULL.
+func (q *Queries) MarkObjectDecrypted(ctx context.Context, arg MarkObjectDecryptedParams) (int64, error) {
+	result, err := q.db.Exec(ctx, markObjectDecrypted,
+		arg.ObjectKey,
+		arg.BackendName,
+		arg.SizeBytes,
+		arg.ExpectedEtag,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
-const markObjectEncrypted = `-- name: MarkObjectEncrypted :exec
+const markObjectEncrypted = `-- name: MarkObjectEncrypted :execrows
 UPDATE object_locations
 SET encrypted = TRUE,
     encryption_key = $3,
@@ -1064,6 +1661,7 @@ SET encrypted = TRUE,
     plaintext_size = $5,
     size_bytes = $6
 WHERE object_key = $1 AND backend_name = $2
+  AND etag IS NOT DISTINCT FROM $7::text
 `
 
 type MarkObjectEncryptedParams struct {
@@ -1073,23 +1671,115 @@ type MarkObjectEncryptedParams struct {
 	KeyID         *string
 	PlaintextSize *int64
 	SizeBytes     int64
+	ExpectedEtag  *string
 }
 
-func (q *Queries) MarkObjectEncrypted(ctx context.Context, arg MarkObjectEncryptedParams) error {
-	_, err := q.db.Exec(ctx, markObjectEncrypted,
+// Committed only while the row still reports the etag the transform read. A
+// client writing the key mid-pass changes it, and the bytes this would describe
+// are then no longer the bytes stored - so no row matches and the caller skips
+// the copy. IS NOT DISTINCT FROM rather than =, so a row that carried no etag
+// and gained one from a client write fails the check instead of matching NULL.
+func (q *Queries) MarkObjectEncrypted(ctx context.Context, arg MarkObjectEncryptedParams) (int64, error) {
+	result, err := q.db.Exec(ctx, markObjectEncrypted,
 		arg.ObjectKey,
 		arg.BackendName,
 		arg.EncryptionKey,
 		arg.KeyID,
 		arg.PlaintextSize,
 		arg.SizeBytes,
+		arg.ExpectedEtag,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const markObjectScrubbed = `-- name: MarkObjectScrubbed :exec
+UPDATE object_locations
+SET last_scrubbed_at = NOW()
+WHERE object_key = $1 AND backend_name = $2
+`
+
+type MarkObjectScrubbedParams struct {
+	ObjectKey   string
+	BackendName string
+}
+
+// Stamp a copy the scrubber just examined. Applied to every attempted copy,
+// not only the ones that verified: a copy that cannot be read would otherwise
+// stay at the head of the queue and starve the rest of the sweep.
+func (q *Queries) MarkObjectScrubbed(ctx context.Context, arg MarkObjectScrubbedParams) error {
+	_, err := q.db.Exec(ctx, markObjectScrubbed, arg.ObjectKey, arg.BackendName)
+	return err
+}
+
+const recordCompressionProbe = `-- name: RecordCompressionProbe :exec
+UPDATE object_locations
+SET compression_probe_size = $3,
+    compression_probe_level = $4
+WHERE object_key = $1 AND backend_name = $2
+`
+
+type RecordCompressionProbeParams struct {
+	ObjectKey             string
+	BackendName           string
+	CompressionProbeSize  *int64
+	CompressionProbeLevel *string
+}
+
+// Records what the encoder produced for a copy it declined to store compressed,
+// so the next pass reaches the same verdict from the row instead of downloading
+// and encoding the object again.
+//
+// Only the min_ratio decline writes here. A min_size decline is answered from
+// the row at no cost, a copy declined by usage limits never reached the encoder,
+// and a failure measured nothing.
+func (q *Queries) RecordCompressionProbe(ctx context.Context, arg RecordCompressionProbeParams) error {
+	_, err := q.db.Exec(ctx, recordCompressionProbe,
+		arg.ObjectKey,
+		arg.BackendName,
+		arg.CompressionProbeSize,
+		arg.CompressionProbeLevel,
+	)
+	return err
+}
+
+const recordObjectIdentity = `-- name: RecordObjectIdentity :exec
+UPDATE object_locations
+SET etag          = COALESCE(etag, $2),
+    content_type  = COALESCE(content_type, $3),
+    user_metadata = COALESCE(user_metadata, $4)
+WHERE object_key = $1
+`
+
+type RecordObjectIdentityParams struct {
+	ObjectKey    string
+	Etag         *string
+	ContentType  *string
+	UserMetadata []byte
+}
+
+// RecordObjectIdentity fills in what a read had to ask a backend for, so the
+// next one does not. Every copy of the key is written, not just the one that
+// answered: a per-copy value is what lets a failover change the ETag under a
+// conditional request, which is the divergence this column exists to end.
+//
+// Only NULL columns are filled. A recorded identity is what the write computed
+// over the client's own bytes, and a backend's answer must never overwrite it.
+func (q *Queries) RecordObjectIdentity(ctx context.Context, arg RecordObjectIdentityParams) error {
+	_, err := q.db.Exec(ctx, recordObjectIdentity,
+		arg.ObjectKey,
+		arg.Etag,
+		arg.ContentType,
+		arg.UserMetadata,
 	)
 	return err
 }
 
 const updateContentHash = `-- name: UpdateContentHash :exec
 UPDATE object_locations
-SET content_hash = $3
+SET content_hash = $3, last_scrubbed_at = NOW()
 WHERE object_key = $1 AND backend_name = $2
 `
 
@@ -1099,6 +1789,11 @@ type UpdateContentHashParams struct {
 	ContentHash *string
 }
 
+// Record the hash the backfill pass computed and stamp the copy as verified in
+// the same statement. The pass read the whole body to produce the digest, so the
+// copy is verified by construction at that moment. Leaving last_scrubbed_at NULL
+// would report it as never verified and sort it to the head of the scrub queue
+// on its original created_at, so the next sweep would re-read the same bytes.
 func (q *Queries) UpdateContentHash(ctx context.Context, arg UpdateContentHashParams) error {
 	_, err := q.db.Exec(ctx, updateContentHash, arg.ObjectKey, arg.BackendName, arg.ContentHash)
 	return err

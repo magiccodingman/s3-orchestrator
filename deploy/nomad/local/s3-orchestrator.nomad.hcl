@@ -75,8 +75,8 @@ job "s3-orchestrator" {
       }
 
       env {
-        GOMEMLIMIT  = "2048MiB"
-        GOMAXPROCS  = "4"
+        GOMEMLIMIT = "2048MiB"
+        GOMAXPROCS = "4"
       }
 
       template {
@@ -141,8 +141,25 @@ job "s3-orchestrator" {
 
           replication:
             factor: 2
-            worker_interval: "10s"
-            batch_size: 500
+            worker_interval: "20s"
+            batch_size: 400
+
+          # Both copies are placed by the write itself, so the replicator is
+          # left with repair rather than the read-back that making the second
+          # copy would cost. The count defaults to replication.factor.
+          #
+          # max_in_flight caps the writes whose second copy is still uploading
+          # after the client was answered, and defaults to
+          # server.max_concurrent_writes. Set here well above the handful a
+          # keeping-up fleet carries, so tripping it means a backend has gone
+          # slow: watch s3o_detached_uploads_depth for that, and
+          # s3o_replication_write_fanout_skipped_total for the writes that
+          # then fell back to one copy. Drop it to single digits to watch the
+          # fallback fire on purpose.
+          write_path:
+            parallel_copies:
+              enabled: true
+              max_in_flight: 256
 
           rebalance:
             enabled: true
@@ -157,11 +174,18 @@ job "s3-orchestrator" {
             master_key: "F2rpnHM7TmwJ4/DalNfk0cvCCPmHTfvB9LyhBLPoCVc="
             chunk_size: 262144
 
+          compression:
+            enabled: true
+            level: "default"
+            chunk_size: 1048576
+            min_size: 4096
+            min_ratio: 0.95
+
           integrity:
             enabled: true
             verify_on_read: true
-            scrubber_interval: "1h"
-            scrubber_batch_size: 50
+            scrubber_interval: "20m"
+            scrubber_batch_size: 200
 
           # --- Object data cache (disabled by default) ---
           # In-memory LRU cache for frequently read objects. Reduces backend
@@ -206,13 +230,21 @@ job "s3-orchestrator" {
             requests_per_sec: 2500
             burst: 4000
 
+          # The credential that administers this deployment. An ordinary
+          # identity holding every permission, which is what the admin API,
+          # the TUI and the dashboard all authenticate as. demo.sh mints the
+          # keypair per run and substitutes it here.
+          auth:
+            root:
+              access_key_id: "__ROOT_ACCESS_KEY__"
+              secret_access_key: "__ROOT_SECRET_KEY__"
+
+          # The dashboard logs in against the credential store, so the root
+          # keypair above is what reaches it. There is one thing to hold.
           ui:
             enabled: true
-            admin_key: "admin"
-            admin_secret: "admin"
             session_secret: "local-dev-session-key"
-            admin_token: "admin"     # Separate token for admin API (defaults to admin_key)
-            # force_secure_cookies: false        # Local dev — no TLS proxy
+            # force_secure_cookies: false        # Local dev - no TLS proxy
         YAML
       }
 

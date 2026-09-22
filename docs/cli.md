@@ -1,10 +1,9 @@
 ---
+description: "Every s3-orchestrator subcommand: serving, admin control, database migrations, the object browser, benchmarks, and version reporting."
 title: "CLI Subcommands"
 linkTitle: "CLI Subcommands"
-weight: 32
+weight: 34
 ---
-
-# CLI Subcommands
 
 
 ### version
@@ -26,11 +25,12 @@ s3-orchestrator validate -config config.yaml
 
 ### admin
 
-Operational CLI for inspecting and controlling a running instance. Resolves the server address and admin token with the precedence **flag &rarr; environment &rarr; config file**, loading `config.yaml` only when a value is still missing. This lets a local binary target a remote instance with just env vars and no server config:
+Operational CLI for inspecting and controlling a running instance. Requests are signed, so a keypair is required; it comes from the flags or the environment and never from the server's config file. The address resolves with the precedence **flag &rarr; environment &rarr; config file**, and `config.yaml` is loaded only when it is still missing. This lets a local binary target a remote instance with three environment variables and no server config:
 
 ```bash
 export S3O_ADMIN_ADDR="https://s3.example.com"
-export S3O_ADMIN_TOKEN="$(your-secret-tool get admin-token)"
+export S3O_ACCESS_KEY_ID="$(your-secret-tool get access-key)"
+export S3O_SECRET_ACCESS_KEY="$(your-secret-tool get secret-key)"
 s3-orchestrator admin usage-reconcile
 ```
 
@@ -42,9 +42,10 @@ s3-orchestrator admin [flags] <command>
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-config` | `config.yaml` | Path to config file; loaded only when `-addr`/`-token` (or their env vars) are unset |
+| `-config` | `config.yaml` | Path to config file; loaded only when `-addr` and its env var are unset |
 | `-addr` | `$S3O_ADMIN_ADDR`, else config `server.listen_addr` | Server address |
-| `-token` | `$S3O_ADMIN_TOKEN`, else config `ui.admin_token` / `ui.admin_key` | Admin API token |
+| `-access-key` | `$S3O_ACCESS_KEY_ID` | Access key ID to sign requests with |
+| `-secret-key` | `$S3O_SECRET_ACCESS_KEY` | Secret access key to sign requests with |
 | `-json` | off | Emit raw JSON instead of human-readable text |
 
 **Output format:**
@@ -72,11 +73,13 @@ item, and a terminal `result`.
 
 | Command | Per-item verb | Item |
 |---------|---------------|------|
+| `rebalance` | `moving` | object key and the backends it moves between |
 | `backfill-checksums` | `hashing` | object key |
 | `scrub` | `verifying` | object key |
 | `reconcile` | `reconciling` | backend |
 | `replicate` | `replicating` | object key |
 | `over-replication --execute` | `removing` | object key |
+| `lifecycle` | `expiring` | object key |
 | `remove-backend --purge --confirm` | `deleting` | object key |
 
 ```text
@@ -149,6 +152,9 @@ s3-orchestrator admin status
 # (s3-orchestrator tui browses the same data interactively)
 s3-orchestrator admin object-locations -key "my-bucket/path/to/file.txt"
 
+# Read, replace, or clear an object's tag set
+s3-orchestrator admin object-tags -key "my-bucket/path/to/file.txt"
+
 # Show cleanup queue depth and pending items
 s3-orchestrator admin cleanup-queue
 
@@ -174,6 +180,12 @@ s3-orchestrator admin replicate
 # Trigger one rebalance cycle (redistribute objects across backends per the
 # configured strategy; falls back to "spread" with defaults when unconfigured)
 s3-orchestrator admin rebalance
+
+# Run one lifecycle expiration sweep now, instead of waiting for the hourly
+# tick. Streams a line per expired object, then the deleted and failed counts,
+# so a rule that matches nothing is distinguishable from one that ran and
+# found nothing expired.
+s3-orchestrator admin lifecycle
 
 # Show count of over-replicated objects
 s3-orchestrator admin over-replication
@@ -217,14 +229,36 @@ s3-orchestrator admin decrypt-existing
 # Re-wrap all DEKs encrypted with a specific key ID (key rotation)
 s3-orchestrator admin rotate-encryption-key --old-key-id config-0
 
+# Store every uncompressed object as chunked zstd (requires a compression codec)
+s3-orchestrator admin compress-existing
+
+# Convert part of a fleet and stop; run it again to continue where it left off
+s3-orchestrator admin compress-existing -max=1000
+
+# Convert only one backend's copies, to bound the blast radius or pace the run
+# against a single provider's read cost
+s3-orchestrator admin compress-existing -backend wasabi-eu
+
+# Rewrite every compressed object back to the bytes the client wrote
+s3-orchestrator admin decompress-existing
+
 # Trigger an on-demand integrity scrub cycle (verify stored hashes)
 s3-orchestrator admin scrub
 
 # Scrub with a custom batch size
 s3-orchestrator admin scrub -batch-size 500
 
+# Verify every copy of one object now, without waiting for its turn in the queue
+s3-orchestrator admin scrub -key photos/2024/beach.jpg
+
+# Scrub only one backend's copies
+s3-orchestrator admin scrub -backend wasabi-eu
+
 # Compute and store content hashes for all unhashed objects
 s3-orchestrator admin backfill-checksums
+
+# Hash only the copies on one backend, which is what a restored backend needs
+s3-orchestrator admin backfill-checksums -backend wasabi-eu
 
 # Backfill with a custom batch size (objects fetched per pass)
 s3-orchestrator admin backfill-checksums -batch-size 50
@@ -250,17 +284,127 @@ s3-orchestrator admin reload-status
 # Download the flight-recorder trace ring buffer to a file for `go tool trace`
 # (requires debug.flight_recorder.enabled; -o sets the output path)
 s3-orchestrator admin trace-snapshot -o trace.bin
+
+# Declare virtual buckets and the credentials that reach them without editing
+# the config file. Each of these takes a verb; run one without a verb to list
+# what it accepts.
+s3-orchestrator admin bucket list
+s3-orchestrator admin user create -name nightly-backup
+s3-orchestrator admin credential issue -user user-abc123
+s3-orchestrator admin grant add -user user-abc123 -name backups
 ```
 
-The admin API requires `ui.admin_token` (or `ui.admin_key` as fallback) to be set in the configuration. All requests are authenticated via the `X-Admin-Token` header.
+Requests are authenticated by a keypair, SigV4-signed, which is the same credential the S3 API takes. Pass `-access-key` and `-secret-key`, or set `$S3O_ACCESS_KEY_ID` and `$S3O_SECRET_ACCESS_KEY`; declare the administering keypair under `auth.root` in the configuration file.
+
+What a keypair reaches is decided by the grants its user holds, so a narrower credential runs the subcommands it was granted and is refused the rest with `403`.
+
+#### object-tags
+
+`object-tags` has three modes, selected by which flags are present. With `-key` alone it reads the object's tag set; with `-tag` it replaces the set; with `-clear` it removes every tag:
+
+```bash
+s3-orchestrator admin object-tags -key photos/report.pdf
+s3-orchestrator admin object-tags -key photos/report.pdf -tag team=infra -tag retain=30d
+s3-orchestrator admin object-tags -key photos/report.pdf -clear
+```
+
+Tags are given as repeatable `key=value` pairs rather than a JSON document, so a set can be written from a shell without quoting one. Only the first `=` splits, so a value may itself contain one: `-tag expr=a=b` is the key `expr` with the value `a=b`.
+
+`-tag` replaces the whole set, matching `PutObjectTagging`, so adding one tag to an object that has three means passing all four. `-clear` and `-tag` are refused together: they describe different outcomes for the same call. See [Object Tagging](tagging.md) for the limits and the storage model.
+
+#### bucket, user, credential and grant
+
+These four commands provision what the config file otherwise declares, storing it in the database instead. Each takes a verb after the command word:
+
+| Command | Verbs |
+|---|---|
+| `bucket` | `list`, `create -name <name> [-max-multipart N]`, `delete -name <name>` |
+| `user` | `list`, `create -name <name>`, `rename -id <id> -name <name>`, `delete -id <id>` |
+| `credential` | `list`, `issue -user <id> [-label <text>] [-access-key <id> -secret-key <secret>]`, `revoke -access-key <id>` |
+| `grant` | `add -user <id> [-kind <kind>] -name <name> [-permissions <list>]`, `set -user <id> [-kind <kind>] -name <name> [-permissions <list>]`, `remove -user <id> [-kind <kind>] -name <name>` |
+
+Onboarding a client is three calls. The user comes first, because a keypair belongs to an identity rather than to a bucket:
+
+```bash
+s3-orchestrator admin user create -name nightly-backup
+s3-orchestrator admin credential issue -user user-abc123 -label "backup job"
+s3-orchestrator admin grant add -user user-abc123 -name backups -permissions list,read,write
+```
+
+##### What a grant names
+
+`-kind` is one of `bucket` (the default), `backend`, or `orchestrator`. A **bucket** is the namespace clients address; a **backend** is one storage provider holding copies of those objects; the **orchestrator** is the service running in front of both, and is what a grant names for an operation belonging to no single bucket or provider - reading logs, rotating keys, provisioning.
+
+`-name` is the one resource of that kind, or `*` for every one of them including those added later; the orchestrator takes no name, because a deployment has only one. `-bucket` remains an alias for `-name` on a bucket grant.
+
+`instance` is still accepted as a spelling of `orchestrator`, and grants stored under it still authorize, but it renders as `orchestrator` in every listing. It was renamed because it read as one process of a deployment running several, when the grant has always covered every process.
+
+`-permissions` is a comma-separated list, defaulting to `all`. A bucket grant takes `list-buckets`, `list`, `read`, `write`, `delete` and `tags`, or `all` for every one. `read` covers an object's tags as well as its bytes; `tags` is the right to change them. A backend or instance grant takes the `admin-` permissions -- `admin-read`, `admin-logs`, `admin-maintain`, `admin-convert`, `admin-keys`, `admin-cache`, `admin-drain`, `admin-decommission`, `admin-config` and `admin-provision` -- or `admin-all`. Mixing the two in one grant is refused: a bucket cannot be drained, and the instance holds no objects.
+
+```bash
+# A monitoring credential that reads status and nothing else
+s3-orchestrator admin grant add -user user-mon -kind orchestrator -permissions admin-read
+
+# An operator who may drain and decommission any backend, present or future
+s3-orchestrator admin grant add -user user-ops -kind backend -name '*' -permissions admin-drain,admin-decommission
+
+# Broad read access that reaches buckets created later, narrowed on one
+s3-orchestrator admin grant add -user user-ci -name '*' -permissions list-buckets,list,read
+s3-orchestrator admin grant add -user user-ci -name secrets -permissions list-buckets
+```
+
+A named grant replaces the wildcard for the bucket it names rather than adding to it, which is what lets broad access be carved down on one bucket. A bucket wildcard is expanded against the buckets a deployment declares when the registry is published, so creating a bucket extends it.
+
+##### add versus set
+
+`add` is the imperative form: give this user access to this resource. `set` is the declarative one: this user's access here is exactly these permissions, whether or not a grant already exists.
+
+```bash
+# Narrow an existing grant without a window where the client reaches nothing.
+s3-orchestrator admin grant set -user user-abc123 -name backups -permissions list,read
+```
+
+`set` upserts, so re-running it converges rather than failing the second time, and changing a permission set replaces it in place rather than revoking and re-granting. That is what a caller driving this from a config file or a Terraform run wants; `add` stays the one to reach for at a terminal.
+
+##### Renaming an identity
+
+`user rename` changes the name an identity is read by and leaves its ID alone, so the credentials and grants hanging off it are untouched:
+
+```bash
+s3-orchestrator admin user rename -id user-abc123 -name nightly-backup-v2
+```
+
+There is no other way to correct a name: `user delete` is refused while the user holds a credential or a grant, so destroy-and-recreate cannot get there.
+
+`credential issue` prints the secret once, on stdout and nowhere else, so it can be captured into a secret store without passing through a log line. Nothing reads it back afterwards: a caller that loses it issues a replacement and revokes the old one. Several keypairs may name one user, which is what lets one be rotated while the rest keep working.
+
+##### Registering a keypair you already hold
+
+`-access-key` and `-secret-key` record a keypair instead of minting one, for a caller whose secrets are generated somewhere else - Terraform, a secret manager, a config-management run:
+
+```bash
+s3-orchestrator admin credential issue -user user-abc123 -label "vault-managed" \
+  -access-key "$ACCESS_KEY" -secret-key "$SECRET_KEY"
+```
+
+Both are required together; one alone is refused rather than half-minted. The response echoes what was recorded, so the same command shape covers both paths.
+
+This is what makes the call safe to re-run. A caller rebuilding lost state re-registers the keypair it holds rather than minting a second one it then has to distribute. An access key another credential already claims - from either source - is refused with `409` rather than overwriting it.
+
+Every listing carries a source column. An entry marked `config` comes from the config file, and the server refuses to change it - those are edited in the file and applied with `SIGHUP`. See [config versus the provisioning API](configuration.md#config-versus-the-provisioning-api) for the precedence rule.
+
+Removal is refused while something still depends on it. A bucket that holds objects or is granted to a user, and a user that holds credentials or grants, all fail with the reason, so emptying a bucket and revoking a credential stay deliberate acts.
+
+Every change takes effect on the next request rather than the next restart: the registry the request path authenticates against is rebuilt before the command returns.
 
 ### tui
 
-Full-screen, read-only terminal UI. Launches an interactive [Bubble Tea](https://github.com/charmbracelet/bubbletea) app with a persistent left navigation bar: **Files** browses the object namespace one prefix at a time and, on any object, opens an inspector pane showing every backend copy; **Backends** shows the configured backends and their live status; **Logs** shows recent structured log entries. The pane with keyboard focus is shown with a bright title bar (the other is muted). Resolves the server address and admin token with the same precedence as `admin` (**flag &rarr; environment &rarr; config file**), loading `config.yaml` only when a value is still missing:
+Full-screen terminal UI. Launches an interactive [Bubble Tea](https://github.com/charmbracelet/bubbletea) app with a persistent left navigation bar: **Files** browses the object namespace one prefix at a time and, on any object, opens an inspector pane showing every backend copy; **Backends** shows the configured backends and their live status; **Buckets** lists the virtual buckets both the config file and the store declare, marking which are read-only and which identities reach each one; **Replication** shows a self-refreshing view of replication health; **Workers** shows each background service's last-tick health; **Cleanup** shows the cleanup queue and its dead-letter table; **Cache** shows the object data cache's utilization and hit rate; **Logs** shows recent structured log entries; **Ops** runs admin write actions. The pane with keyboard focus is shown with a bright title bar (the other is muted). Resolves the address and the signing keypair the same way `admin` does:
 
 ```bash
 export S3O_ADMIN_ADDR="https://s3.example.com"
-export S3O_ADMIN_TOKEN="$(your-secret-tool get admin-token)"
+export S3O_ACCESS_KEY_ID="$(your-secret-tool get access-key)"
+export S3O_SECRET_ACCESS_KEY="$(your-secret-tool get secret-key)"
 s3-orchestrator tui
 ```
 
@@ -270,9 +414,10 @@ s3-orchestrator tui
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-config` | `config.yaml` | Path to config file; loaded only when `-addr`/`-token` (or their env vars) are unset |
+| `-config` | `config.yaml` | Path to config file; loaded only when `-addr` and its env var are unset |
 | `-addr` | `$S3O_ADMIN_ADDR`, else config `server.listen_addr` | Server address |
-| `-token` | `$S3O_ADMIN_TOKEN`, else config `ui.admin_token` / `ui.admin_key` | Admin API token |
+| `-access-key` | `$S3O_ACCESS_KEY_ID` | Access key ID to sign requests with |
+| `-secret-key` | `$S3O_SECRET_ACCESS_KEY` | Secret access key to sign requests with |
 
 **Keys:**
 
@@ -281,10 +426,23 @@ s3-orchestrator tui
 | `tab` | Move focus between the sidebar and the content area |
 | `f` | Jump to the Files section |
 | `b` | Jump to the Backends section |
+| `v` | Jump to the Buckets section |
+| `p` | Jump to the Replication section |
+| `w` | Jump to the Workers section |
+| `u` | Jump to the Cleanup section |
+| `c` | Jump to the Cache section |
 | `l` | Jump to the Logs section |
+| `o` | Jump to the Ops section |
 | `L` | Cycle the Logs level filter (all / INFO / WARN / ERROR) |
-| `R` | Reconcile usage counters across all backends (asks to confirm) |
-| `F` | Flush the in-memory object cache (asks to confirm) |
+| `t` | In Cleanup, switch between the pending and dead-letter listings |
+| `R` | In Cleanup's dead-letter listing, requeue the selected row's backend; in Backends, reconcile the selected backend (asks to confirm) |
+| `d` | In Backends, drain the selected backend (asks to confirm) |
+| `Q` | In Backends, requeue the selected backend's dead-lettered cleanups (asks to confirm) |
+| `x` | In Backends, cancel the drain the pane is following (asks to confirm) |
+| `D` | In Files, download the selected object to a prompted local path |
+| `U` | In Files, upload a local file under a prompted key |
+| `X` | In Files, delete the selected object, or everything under the selected directory (asks to confirm) |
+| `S` | In the inspector, verify every copy of the object now (asks to confirm) |
 | `y` / `n` | Accept / cancel a pending action confirmation |
 | `up` / `down` | Move the selection (or the sidebar highlight when it has focus) |
 | `enter` / `right` / `l` | Open: a sidebar section, a prefix, or the inspector on an object |
@@ -297,15 +455,45 @@ s3-orchestrator tui
 
 The listing pages lazily: scrolling past the bottom of a truncated prefix pulls the next page. Press `/` to filter the loaded rows by substring, and `s` to sort by name or size. Objects show their stored size in human-readable units alongside child prefixes.
 
-The inspector renders one row per backend copy - backend, size, age, whether the copy is encrypted, its key id, and a content-hash prefix - sourced from `GET /admin/api/object-locations`. It is the interactive equivalent of `admin object-locations`, and like the rest of the admin surface it never displays raw key material.
+The inspector renders one row per backend copy - backend, size, age, whether the copy is encrypted, its key id, a content-hash prefix, and how long ago that hash was last checked against the stored bytes - sourced from `GET /admin/api/object-locations`. It is the interactive equivalent of `admin object-locations`, and like the rest of the admin surface it never displays raw key material.
+
+Above the table, a `tags:` line shows the object's [tag set](tagging.md), or `(none)`. It sits outside the table because a tag set belongs to the object rather than to any one copy, so repeating it down every row would suggest the copies could differ. A failed tag read leaves the line empty rather than replacing the copy ledger with an error, since that ledger is what the pane is for.
+
+A copy reading `never` under `VERIFIED` has a recorded hash that nothing has ever read back, which is not the same as a copy known to be intact. Press `S` to verify every copy of the object immediately rather than waiting for the scrub queue to reach it; the footer reports how many passed and names any that did not. A copy whose bytes do not match its hash is discarded and rebuilt from a healthy one, exactly as a scrub pass would, so the confirmation says so.
 
 ![The TUI inspector showing an object's backend copies](/docs/images/tui-file-details.png)
 
-The **Backends** section is the interactive equivalent of `admin status`, sourced from `GET /admin/api/status`. It renders one row per configured backend - circuit-breaker health, drain state, quota used and limit, object count, and the current period's API request, ingress, and egress counters - with the metadata database health and usage period in the title bar. Press `r` to refresh the snapshot.
+The **Backends** section is the interactive equivalent of `admin status`, sourced from `GET /admin/api/status`. It renders one row per configured backend - circuit-breaker health, drain state, quota used and limit, a `USE%` column (used / limit), object count, and the current period's API request, ingress, and egress counters. A stats line under the title shows the metadata database health (green when healthy, red when not) and the total usage across backends (`used / limit (pct%)`, coloured by fill). Press `r` to refresh the snapshot.
+
+Three admin actions act on the highlighted row, each behind a confirmation naming that backend so a keystroke on the wrong row cannot start work on it: `d` drains every copy off it, `R` reconciles metadata against its storage, and `Q` requeues its dead-lettered cleanups. Backend removal is deliberately not here - it is irreversible with `purge=true` and stays an `admin remove-backend` operation, behind its two-phase confirmation.
+
+A drain runs for as long as it takes, so the pane follows it: once accepted, a line under the stats reports the objects moved and what remains, refreshed every couple of seconds until the drain finishes or is cancelled. Press `x` to cancel the drain the pane is following; copies already moved stay moved. The key is only offered while a drain is in flight.
+
+The metadata database health is also shown persistently at the bottom of the sidebar (`db ok` green / `db DOWN` red), fetched at startup so it is visible from every section.
+
+The **Replication** section shows cluster-wide replication health, sourced from `GET /admin/api/replication` - the configured replication factor and the current under-replicated and over-replicated object counts, with the age of the underlying snapshot. It auto-refreshes every few seconds while it is the active section (the counts drift constantly as workers reconcile), so the view stays live without a keypress; the ticker stops once you leave. The pending counts are coloured amber when there is a backlog and green at zero. Press `r` to force an immediate refresh. Because the endpoint reads a snapshot the metrics collector already computes on its own interval, polling it is cheap.
+
+The **Workers** section shows every registered background service's last-tick health, sourced from `GET /admin/api/workers` - last success, last failure, consecutive failure count, and the last error. A worker that is running but failing every tick looks identical to a healthy one in `/health`, so this is where that difference surfaces; the title bar reports how many services are currently failing. A proxy-only deployment registers no worker pool, and the pane says so rather than reporting an error.
+
+The **Cleanup** section shows the cleanup queue and its dead-letter table, sourced from `GET /admin/api/cleanup-queue` and `GET /admin/api/cleanup-dlq`. Both listings share the pane, toggled with `t`, and the title bar carries both depths so a backlog in the listing you are not looking at stays visible. The depth is the true total; the listing itself is one page of it. On the dead-letter listing, `R` requeues every dead-lettered row for the selected row's backend (`POST /admin/api/cleanup-dlq/requeue`) - a whole-backend operation, which is what the confirmation names, and the pane reloads afterwards so the depths stay honest.
+
+The **Cache** section shows the object data cache, sourced from `GET /admin/api/cache` - entry count, bytes held against the configured maximum, and the lifetime hit rate. The hit rate is coloured for a cache doing its job rather than a full one: green at 60% and above, amber down to 25%, red below. A cache nothing has read yet says so instead of reporting 0%, which would read as a broken cache. When object caching is disabled the endpoint answers 503 and the pane reports that as configuration, not failure.
 
 The **Logs** section shows recent structured log entries from the instance's in-memory log buffer, sourced from `GET /admin/api/logs` - the same buffer the web dashboard's logs pane reads. Each row is time, level, component, and a human-readable message with its structured attributes appended as `key=value` pairs (not raw JSON). The level is colour-coded by severity (WARN and ERROR stand out; INFO stays neutral). Press `L` to cycle the minimum-level filter (all / INFO / WARN / ERROR) and `r` to refresh.
 
-Beyond browsing, the TUI can trigger a growing set of **admin actions**. Every write action shows a `y/N` confirmation in the footer before it runs, and its result (or error) is reported there afterwards. The instance-wide actions available from any section are `R` (reconcile usage counters) and `F` (flush the object cache); more will land over time.
+Beyond browsing, the TUI can trigger a growing set of **admin actions**. Every write action shows a `y/N` confirmation before it runs, and its result (or error) is reported afterwards. Instance-wide actions live on the Ops menu; an action that targets one row, such as the Cleanup pane's requeue, lives on the pane that shows the row.
+
+The **Files** section acts on objects as well as browsing them. `D` downloads the highlighted object to a prompted local path, `U` uploads a local file under a prompted key, and `X` removes the highlighted row. Both prompts start filled with a sensible answer - the object's base name, or the current prefix plus the file's name - so the usual case is a keystroke away and anything else is an edit.
+
+Deleting a directory removes everything under it, so the confirmation states how many objects that is rather than just naming the prefix: the pane counts a page of keys first and asks "Delete 128 objects under bucket/photos/?". A prefix with more objects than one page holds reads as "at least 1,000", since understating what a delete will remove is worse than being vague about the total.
+
+Downloads and uploads move real bytes, so the status line reports the progress (`downloading bucket/db.sql   45.2 MiB / 120.0 MiB (37%)`) while the interface stays responsive. A download writes to a temporary file beside its destination and renames it into place only once the whole body has landed, so an interrupted transfer leaves nothing where a complete file would be - a failure reports what went wrong rather than leaving a truncated file to be discovered later.
+
+The **Ops** section, reached with `o`, is the full menu, grouped by kind: the maintenance passes (rebalance, replicate under-replicated objects, clean over-replicated copies, scrub, backfill checksums, reconcile metadata, reconcile usage counters, flush usage counters to the database, expire objects by lifecycle rule), cache control (flush the cache, invalidate one key, invalidate a prefix), and the encryption transitions (encrypt existing, decrypt existing, rotate the encryption key). Accepting the confirmation switches to a scrolling output pane immediately, so an operation that takes minutes reports that it started rather than leaving the menu live until it finishes.
+
+An entry ending in `...` asks for a value first: the key or prefix to invalidate, or the key id to rotate away from. Type it and press `enter`, or `esc` to abandon the action. An empty value is refused in the prompt rather than sent, since the endpoints that take one reject an empty value on purpose. Rotation still confirms after the key id is entered; cache invalidation does not, because the value typed is itself the statement of intent and nothing is lost but a cached copy.
+
+The long-running operations render the same live progress stream `admin` shows on the command line, one line per item - a rebalance names each object and the backends it travelled between. The rest finish in a single round trip and report what changed in the operation's own terms: `dropped 1,204 cache entries`, `corrected 2 backends: e2 -162.1 MiB, oci +4.1 MiB`, `encrypted 1,200 objects, 3 failed`. An operation that did not run - a rebalance already within threshold, a feature not configured - says so instead of reporting a false zero. Press `esc` to step back to the menu, then to the nav.
 
 ![The TUI Logs section showing recent structured log entries](/docs/images/tui-logs.png)
 
@@ -313,7 +501,30 @@ Beyond browsing, the TUI can trigger a growing set of **admin actions**. Every w
 
 ## Importing Existing Data
 
-The `sync` subcommand imports objects from an existing backend bucket into the orchestrator's metadata database. Use this when bringing a bucket that already has data under orchestrator management.
+The `sync` subcommand imports objects from an existing backend bucket into the orchestrator's metadata database, on demand, without waiting for the reconcile cycle to reach that backend.
+
+Objects are recorded at the key the backend actually holds them under. An object already under a virtual bucket's prefix (`my-files/photos/cat.jpg`) is imported as a managed object and behaves like any other. An object outside every configured prefix (`cat.jpg` at the bucket root) is recorded as **unmanaged**: it counts toward the backend's quota, because the bytes are really there and placement decisions depend on accurate totals, but replication, rebalance, drain and integrity passes leave it alone. It is also not reachable through the S3 API, since no virtual bucket claims it.
+
+Importing raw data at the bucket root therefore makes the orchestrator *aware* of it, not responsible for it. To bring such objects under management, move them under a virtual bucket's prefix on the backend first, then sync.
+
+### Encrypted objects
+
+Import reads the start of each object to see whether it is an orchestrator encryption envelope, because recording ciphertext as plaintext would make the read path serve raw encrypted bytes to clients.
+
+An envelope needs the key that encrypted it. Every write mints its own key, so a matching object key is not enough to prove a stray copy belongs to the row the ledger still holds: import adopts an existing copy's key only when the object's header shows the two came from the same encryption. That is the normal case for a replica whose row was lost, and it is imported fully readable.
+
+An envelope no surviving row can decrypt is recorded as encrypted with no key. It counts toward quota, but reads of that copy fail rather than returning ciphertext, and it is counted under `s3o_import_classified_total{decision="unreadable"}`. Restore those objects from another source or delete them; the key is gone.
+
+### Compressed objects
+
+An object stored compressed is recognised by its seek table, not by the Zstandard frame magic. The stored form is a valid Zstandard stream by design, so the magic alone would equally match a `.zst` file uploaded as ordinary content, and decoding one of those on read would hand the client back something they never uploaded. A plain zstd encoder never writes a seek table, so its presence is what separates the two.
+
+Recognised objects are imported with the logical size their seek table declares and counted under `s3o_import_classified_total{decision="compressed"}`. Anything not recognised is imported as the verbatim bytes it appears to be.
+
+The frame magic is checked against the object header the import already reads, so only an object that could plausibly be an encoding pays the extra read of its tail. Importing a backend of ordinary objects costs exactly what it did before.
+
+A compressed object that is also encrypted cannot be recognised this way, since compression runs first and its encoding is inside the ciphertext. Those are covered by the same key adoption described above, which carries the compression columns along with the key.
+
 
 ### Dry run first
 
@@ -336,7 +547,7 @@ s3-orchestrator sync \
   --bucket my-files
 ```
 
-The `--bucket` flag specifies which virtual bucket the imported objects belong to. Keys are stored internally as `{bucket}/{key}`, so this determines the namespace.
+`--bucket` records which virtual bucket the import was run for and appears in the log. It does not affect the keys written: those come from the backend listing verbatim, and whether an object is managed is decided by the prefixes of every configured bucket.
 
 ### Partial import with --prefix
 
@@ -358,7 +569,7 @@ Objects already tracked in the database for that backend are automatically skipp
 |------|---------|-------------|
 | `--config` | `config.yaml` | Path to configuration file |
 | `--backend` | (required) | Backend name to sync from |
-| `--bucket` | (required) | Virtual bucket name to assign to imported objects |
+| `--bucket` | `""` | Virtual bucket the import is being run for; recorded in the log, not used to build keys |
 | `--prefix` | `""` | Only sync objects with this key prefix |
 | `--dry-run` | `false` | Preview without writing to the database |
 

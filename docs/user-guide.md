@@ -1,4 +1,8 @@
-This guide shows how to use the S3 Orchestrator from common S3 clients and SDKs. The orchestrator is a standard S3-compatible endpoint — any tool that speaks the S3 protocol will work.
+---
+description: "Using the orchestrator from common S3 clients and SDKs, since it presents a standard S3-compatible endpoint to any tool that speaks S3."
+---
+
+This guide shows how to use the S3 Orchestrator from common S3 clients and SDKs. The orchestrator is a standard S3-compatible endpoint - any tool that speaks the S3 protocol will work.
 
 ## Prerequisites
 
@@ -27,7 +31,7 @@ aws configure --profile orchestrator
 # Default output format: json
 ```
 
-The region value doesn't matter — the orchestrator accepts any region in the SigV4 signature. Pick any valid region name.
+The region value doesn't matter - the orchestrator accepts any region in the SigV4 signature. Pick any valid region name.
 
 For convenience, set an alias or shell function:
 
@@ -81,6 +85,28 @@ s3o s3 cp s3://app1-files/old/location.txt s3://app1-files/new/location.txt
 
 Cross-bucket copies are not supported. Both source and destination must be in the same bucket.
 
+By default a copy carries the source object's tags. Pass `--tagging-directive REPLACE` with `--tagging` to give the copy a different set.
+
+### Tag an object
+
+```bash
+# Tag on upload
+s3o s3api put-object --bucket app1-files --key report.pdf \
+    --body report.pdf --tagging "team=infra&retain=30d"
+
+# Replace the whole set on an object that already exists
+s3o s3api put-object-tagging --bucket app1-files --key report.pdf \
+    --tagging 'TagSet=[{Key=team,Value=infra},{Key=retain,Value=30d}]'
+
+# Read it back
+s3o s3api get-object-tagging --bucket app1-files --key report.pdf
+
+# Remove every tag
+s3o s3api delete-object-tagging --bucket app1-files --key report.pdf
+```
+
+Tags describe the object, so all of its replicas share one set. `put-object-tagging` replaces the whole set rather than merging into it, and overwriting the key without `--tagging` leaves the new object untagged. Up to 10 tags per object. A `get-object` or `head-object` reports how many tags the object carries in `x-amz-tagging-count`, so a client can skip fetching a set that is not there. See [Object Tagging](tagging.md).
+
 ### Sync a directory
 
 Upload an entire directory, only transferring new or changed files:
@@ -104,7 +130,24 @@ aws configure set s3.multipart_threshold 64MB --profile orchestrator
 aws configure set s3.multipart_chunksize 16MB --profile orchestrator
 ```
 
-No special configuration is needed — multipart uploads work transparently.
+No special configuration is needed - multipart uploads work transparently.
+
+An upload that is interrupted leaves its parts on the backend, consuming quota
+without a completed object to show for it. `ListMultipartUploads` is how you
+find those, and it works here:
+
+```bash
+# Show uploads that were started and never completed
+aws s3api list-multipart-uploads --bucket app1-files --profile orchestrator
+
+# Abandon one, releasing its parts
+aws s3api abort-multipart-upload --bucket app1-files \
+  --key large-file.bin --upload-id "<UploadId>" --profile orchestrator
+```
+
+Anything left behind is aborted automatically after 24 hours
+(`multipart_stale_timeout`), so this is for reclaiming space sooner rather than
+for preventing a leak.
 
 ## rclone
 
@@ -235,6 +278,36 @@ s3.copy_object(
 )
 ```
 
+### Tag an object
+
+```python
+# Tag on upload, query-string encoded
+s3.put_object(
+    Bucket="app1-files",
+    Key="report.pdf",
+    Body=b"...",
+    Tagging="team=infra&retain=30d",
+)
+
+# Replace the whole set on an object that already exists
+s3.put_object_tagging(
+    Bucket="app1-files",
+    Key="report.pdf",
+    Tagging={"TagSet": [
+        {"Key": "team", "Value": "infra"},
+        {"Key": "retain", "Value": "30d"},
+    ]},
+)
+
+response = s3.get_object_tagging(Bucket="app1-files", Key="report.pdf")
+for tag in response["TagSet"]:
+    print(f"{tag['Key']}={tag['Value']}")
+
+s3.delete_object_tagging(Bucket="app1-files", Key="report.pdf")
+```
+
+See [Object Tagging](tagging.md) for the limits and the replacement semantics.
+
 ## Go (AWS SDK v2)
 
 ### Setup
@@ -324,11 +397,54 @@ _, err := client.DeleteObject(context.Background(), &s3.DeleteObjectInput{
 })
 ```
 
+### Tag an object
+
+```go
+// Tag on upload, query-string encoded
+_, err := client.PutObject(context.Background(), &s3.PutObjectInput{
+    Bucket:  aws.String("app1-files"),
+    Key:     aws.String("report.pdf"),
+    Body:    strings.NewReader("..."),
+    Tagging: aws.String("team=infra&retain=30d"),
+})
+
+// Replace the whole set on an object that already exists
+_, err = client.PutObjectTagging(context.Background(), &s3.PutObjectTaggingInput{
+    Bucket: aws.String("app1-files"),
+    Key:    aws.String("report.pdf"),
+    Tagging: &types.Tagging{TagSet: []types.Tag{
+        {Key: aws.String("team"), Value: aws.String("infra")},
+        {Key: aws.String("retain"), Value: aws.String("30d")},
+    }},
+})
+
+result, err := client.GetObjectTagging(context.Background(), &s3.GetObjectTaggingInput{
+    Bucket: aws.String("app1-files"),
+    Key:    aws.String("report.pdf"),
+})
+for _, tag := range result.TagSet {
+    fmt.Printf("%s=%s\n", *tag.Key, *tag.Value)
+}
+```
+
+`types` is `github.com/aws/aws-sdk-go-v2/service/s3/types`. See [Object Tagging](tagging.md) for the limits and the replacement semantics.
+
+## ETags
+
+An object's ETag is the MD5 of the bytes you uploaded, in the same form S3 reports: the quoted hex digest for a single-part upload, and the MD5 of the concatenated part digests with a `-N` part-count suffix for a multipart one. Comparing it against the MD5 of your local file works, and comparing an object against itself over time works whichever replica answers the read.
+
+That holds with compression or encryption enabled. The bytes on a backend are then not your bytes, and the ETag that backend would report is a digest of the stored form; the orchestrator reports the object's own value instead.
+
+Two cases carry an ETag it did not compute:
+
+- Objects imported by reconcile - bytes found on a backend with no ledger row - report what the backend reports until something reads them, at which point that value is recorded for every copy so it stops changing across a failover.
+- Objects written before this version keep their backend value the same way. Compressed and encrypted ones get a computed ETag when the integrity scrubber next reads them, since only a plaintext read can produce one.
+
 ## Conditional Writes
 
 The orchestrator honors the `If-None-Match: *` header on `PutObject` and `CompleteMultipartUpload` to give clients opt-in conflict detection. When the header is set and an object already exists at the target key, the request fails with `412 Precondition Failed` and the upload bytes are not stored.
 
-The check is best-effort: a small race window exists between the existence check and the metadata commit, so two simultaneous writers each sending `If-None-Match: *` can both succeed in rare cases. This matches AWS S3's documented behavior — the precondition is a strong signal but not a hard guarantee under contention.
+The check is best-effort: a small race window exists between the existence check and the metadata commit, so two simultaneous writers each sending `If-None-Match: *` can both succeed in rare cases. This matches AWS S3's documented behavior - the precondition is a strong signal but not a hard guarantee under contention.
 
 Only the `*` form is honored on writes. A specific etag value in `If-None-Match` is ignored on PUT and the upload proceeds as a normal overwrite.
 
@@ -395,7 +511,7 @@ req, err := presignClient.PresignGetObject(context.Background(), &s3.GetObjectIn
 
 ### Using a presigned URL
 
-The presigned URL can be used with any HTTP client — no AWS credentials or SDK required:
+The presigned URL can be used with any HTTP client - no AWS credentials or SDK required:
 
 ```bash
 curl -o myfile.txt "THE_PRESIGNED_URL"
@@ -407,6 +523,12 @@ curl -o myfile.txt "THE_PRESIGNED_URL"
 - Maximum expiry is 7 days (604800 seconds). The server rejects URLs with a longer expiry.
 - Presigned URLs work for GET, PUT, DELETE, and HEAD operations.
 - For security recommendations (TLS, expiry values), see the [Security Hardening](security-hardening.md#presigned-url-security) guide.
+
+### From a browser
+
+A presigned URL used from a browser needs a CORS rule on the bucket. Browsers send an unsigned `OPTIONS` preflight before any cross-origin `PUT`, and a bucket with no rules refuses it, so the upload fails before the presigned request is ever sent. The failure surfaces in the browser console as a CORS error rather than as anything from the orchestrator.
+
+Add the origin your application is served from to the bucket's `cors` block (see [Configuration](configuration.md#browser-access-cors)), including `ETag` in `expose_headers` if the upload needs to read back the object's identifier. Server-side clients need none of this - a request without an `Origin` header is not cross-origin and is unaffected.
 
 ## Request Tracing
 
@@ -428,10 +550,12 @@ curl -H "X-Request-Id: my-trace-123" \
 
 The orchestrator implements a practical subset of the S3 API. A few things to be aware of:
 
-- **Same-bucket copies only** — `CopyObject` requires source and destination to be in the same bucket.
-- **No bucket management** — Buckets are configured server-side. `CreateBucket`, `DeleteBucket`, and `ListBuckets` are not supported.
-- **No ACLs or policies** — Access control is handled entirely through the credential-to-bucket mapping in the server config.
-- **No object versioning** — Each key holds exactly one object. Uploading to an existing key overwrites it. Concurrent PUTs to the same key are last-writer-wins, matching native S3 semantics. The orchestrator's per-key advisory lock keeps location metadata consistent across replicas, and bytes from the losing writer are enqueued for backend cleanup. Clients that need conflict detection should send `If-None-Match: *` (see [Conditional Writes](#conditional-writes)).
-- **Max object size** — Configurable server-side (default: 5 GB). For larger objects, use multipart upload (most clients do this automatically).
-- **Multipart upload timeout** — Incomplete multipart uploads are automatically cleaned up after 24 hours.
-- **Range reads** — `GET` requests with a `Range` header are supported and return `206 Partial Content`.
+- **Same-bucket copies only** - `CopyObject` and `UploadPartCopy` require source and destination to be in the same bucket. Both are supported, so a client copying a large object server-side copies it part by part rather than pulling the bytes down and pushing them back.
+- **Unimplemented operations answer 501** - S3 selects the operation from the query string, so a request for a subresource this server does not serve (`?lifecycle`, `?policy`, `?versions` and the rest) returns `501 NotImplemented` rather than an empty document that reads as "there are none".
+- **No bucket creation or deletion** - Buckets are configured server-side, so `CreateBucket` and `DeleteBucket` are not supported. `ListBuckets` is: it returns the one bucket the presented credential is authorized for, which is what lets a client that lists before it works pick the right target. `HeadBucket`, `GetBucketLocation` and `GetBucketVersioning` answer as well; versioning always reports disabled.
+- **No ACLs or policies** - Access control is handled entirely through the credential-to-bucket mapping in the server config.
+- **CORS is configured server-side** - `PutBucketCors` and `GetBucketCors` are not supported. Browser origins are declared in the bucket's `cors` block and reloaded with the rest of the config.
+- **No object versioning** - Each key holds exactly one object. Uploading to an existing key overwrites it. Concurrent PUTs to the same key are last-writer-wins, matching native S3 semantics. The orchestrator's per-key advisory lock keeps location metadata consistent across replicas, and bytes from the losing writer are enqueued for backend cleanup. Clients that need conflict detection should send `If-None-Match: *` (see [Conditional Writes](#conditional-writes)).
+- **Max object size** - Configurable server-side (default: 5 GB). For larger objects, use multipart upload (most clients do this automatically).
+- **Multipart upload timeout** - Incomplete multipart uploads are automatically cleaned up after 24 hours.
+- **Range reads** - `GET` requests with a `Range` header are supported and return `206 Partial Content`.

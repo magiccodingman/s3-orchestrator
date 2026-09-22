@@ -25,6 +25,10 @@ import (
 	"github.com/afreidah/s3-orchestrator/internal/store/core"
 )
 
+// -------------------------------------------------------------------------
+// INTERNALS
+// -------------------------------------------------------------------------
+
 // dirTestPrefix builds a per-test directory prefix free of LIKE special
 // characters (% _ \) so these replication-semantics tests stay focused on
 // roll-up behaviour; the LIKE-escaping path has its own coverage in
@@ -35,6 +39,10 @@ func dirTestPrefix(t *testing.T, label string) string {
 	return label + "-" + clean + "/"
 }
 
+// -------------------------------------------------------------------------
+// PUBLIC API
+// -------------------------------------------------------------------------
+
 // TestPgListDirectoryChildren_FileRowReplicated asserts that on PostgreSQL
 // a replicated file's row exposes every backend it lives on as a sorted
 // slice and reports the logical (single-replica) size.
@@ -44,14 +52,14 @@ func TestPgListDirectoryChildren_FileRowReplicated(t *testing.T) {
 	prefix := dirTestPrefix(t, "dirtest-replicated")
 	key := prefix + "file.txt"
 
-	if _, err := testStore.RecordObject(ctx, key, "minio-1", 100, nil); err != nil {
+	if _, _, err := testStore.RecordObject(ctx, &core.RecordObjectRequest{Key: key, Copies: []core.ObjectCopy{{Backend: "minio-1"}}, Size: 100}); err != nil {
 		t.Fatalf("RecordObject: %v", err)
 	}
 	if _, _, err := testStore.RecordReplica(ctx, key, "minio-2", "minio-1"); err != nil {
 		t.Fatalf("RecordReplica: %v", err)
 	}
 	t.Cleanup(func() {
-		_, _ = testStore.DeleteObject(context.Background(), key)
+		_, _, _ = testStore.DeleteObject(context.Background(), key)
 	})
 
 	result, err := testStore.ListDirectoryChildren(ctx, prefix, "", 100)
@@ -79,11 +87,11 @@ func TestPgListDirectoryChildren_FileRowSingle(t *testing.T) {
 	prefix := dirTestPrefix(t, "dirtest-single")
 	key := prefix + "file.txt"
 
-	if _, err := testStore.RecordObject(ctx, key, "minio-1", 50, nil); err != nil {
+	if _, _, err := testStore.RecordObject(ctx, &core.RecordObjectRequest{Key: key, Copies: []core.ObjectCopy{{Backend: "minio-1"}}, Size: 50}); err != nil {
 		t.Fatalf("RecordObject: %v", err)
 	}
 	t.Cleanup(func() {
-		_, _ = testStore.DeleteObject(context.Background(), key)
+		_, _, _ = testStore.DeleteObject(context.Background(), key)
 	})
 
 	result, err := testStore.ListDirectoryChildren(ctx, prefix, "", 100)
@@ -113,19 +121,19 @@ func TestPgListDirectoryChildren_DirRollupPhysicalBytes(t *testing.T) {
 	repKey := parent + "child/replicated.txt"
 	singleKey := parent + "child/single.txt"
 
-	if _, err := testStore.RecordObject(ctx, repKey, "minio-1", 100, nil); err != nil {
+	if _, _, err := testStore.RecordObject(ctx, &core.RecordObjectRequest{Key: repKey, Copies: []core.ObjectCopy{{Backend: "minio-1"}}, Size: 100}); err != nil {
 		t.Fatalf("RecordObject(replicated): %v", err)
 	}
 	if _, _, err := testStore.RecordReplica(ctx, repKey, "minio-2", "minio-1"); err != nil {
 		t.Fatalf("RecordReplica: %v", err)
 	}
-	if _, err := testStore.RecordObject(ctx, singleKey, "minio-1", 50, nil); err != nil {
+	if _, _, err := testStore.RecordObject(ctx, &core.RecordObjectRequest{Key: singleKey, Copies: []core.ObjectCopy{{Backend: "minio-1"}}, Size: 50}); err != nil {
 		t.Fatalf("RecordObject(single): %v", err)
 	}
 	t.Cleanup(func() {
 		bg := context.Background()
-		_, _ = testStore.DeleteObject(bg, repKey)
-		_, _ = testStore.DeleteObject(bg, singleKey)
+		_, _, _ = testStore.DeleteObject(bg, repKey)
+		_, _, _ = testStore.DeleteObject(bg, singleKey)
 	})
 
 	result, err := testStore.ListDirectoryChildren(ctx, parent, "", 100)
@@ -160,16 +168,16 @@ func TestPgListDirectoryChildren_UnderscorePrefix(t *testing.T) {
 	fileKey := prefix + "file.txt"
 	subKey := prefix + "sub/inner.txt"
 
-	if _, err := testStore.RecordObject(ctx, fileKey, "minio-1", 100, nil); err != nil {
+	if _, _, err := testStore.RecordObject(ctx, &core.RecordObjectRequest{Key: fileKey, Copies: []core.ObjectCopy{{Backend: "minio-1"}}, Size: 100}); err != nil {
 		t.Fatalf("RecordObject(file): %v", err)
 	}
-	if _, err := testStore.RecordObject(ctx, subKey, "minio-1", 50, nil); err != nil {
+	if _, _, err := testStore.RecordObject(ctx, &core.RecordObjectRequest{Key: subKey, Copies: []core.ObjectCopy{{Backend: "minio-1"}}, Size: 50}); err != nil {
 		t.Fatalf("RecordObject(sub): %v", err)
 	}
 	t.Cleanup(func() {
 		bg := context.Background()
-		_, _ = testStore.DeleteObject(bg, fileKey)
-		_, _ = testStore.DeleteObject(bg, subKey)
+		_, _, _ = testStore.DeleteObject(bg, fileKey)
+		_, _, _ = testStore.DeleteObject(bg, subKey)
 	})
 
 	result, err := testStore.ListDirectoryChildren(ctx, prefix, "", 100)

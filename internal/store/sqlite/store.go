@@ -10,10 +10,6 @@
 // emulation, and automatic schema migration on first start.
 // -------------------------------------------------------------------------------
 
-// Package sqlite implements every core store role plus the admin
-// roles using an embedded SQLite database via modernc.org/sqlite. WAL
-// mode handles concurrent reads, a process-local mutex emulates
-// advisory locks, and the schema migrates on first start.
 package sqlite
 
 import (
@@ -36,12 +32,21 @@ import (
 // rawDB is the same handle without the wrapper; transactional code
 // paths begin tx through cbBeginTx so the rollback defer can live at
 // the same call site as the begin.
+// The embedded core.TxOps supplies the methods whose whole body is a core
+// transaction over this store as Runner; the methods declared here are the
+// SQLite-specific queries.
 type Store struct {
+	core.TxOps
+
 	db    dbAPI
 	rawDB *sql.DB
 	cb    *breaker.CircuitBreaker
 	mu    sync.Mutex // advisory lock emulation for single-instance
 }
+
+// -------------------------------------------------------------------------
+// CONSTRUCTOR
+// -------------------------------------------------------------------------
 
 // NewStore opens a SQLite database at the configured path, applies pragmas
 // for WAL mode and foreign key enforcement, and runs migrations. When cb
@@ -76,6 +81,7 @@ func NewStore(ctx context.Context, dbCfg *config.DatabaseConfig, cb *breaker.Cir
 	}
 
 	s := &Store{db: wrapDB(db, cb), rawDB: db, cb: cb}
+	s.TxOps = core.NewTxOps(s)
 	if err := s.RunMigrations(ctx); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("run migrations: %w", err)
@@ -83,6 +89,10 @@ func NewStore(ctx context.Context, dbCfg *config.DatabaseConfig, cb *breaker.Cir
 
 	return s, nil
 }
+
+// -------------------------------------------------------------------------
+// LIFECYCLE
+// -------------------------------------------------------------------------
 
 // Close closes the underlying database connection.
 func (s *Store) Close() {
@@ -106,9 +116,6 @@ func (s *Store) WithTx(ctx context.Context, fn func(ctx context.Context, tx core
 	})
 }
 
-// Compile-time check that *Store satisfies core.Runner.
-var _ core.Runner = (*Store)(nil)
-
 // WithAdvisoryLock emulates PostgreSQL advisory locks using a process-local
 // mutex. For single-instance SQLite deployments, this is correct  -  there are
 // no competing instances. Returns (false, nil) if the lock is already held
@@ -121,6 +128,5 @@ func (s *Store) WithAdvisoryLock(ctx context.Context, _ int64, fn func(ctx conte
 	return true, fn(ctx)
 }
 
-// Compile-time check that *Store satisfies the wide metadata-store
-// contract every consumer depends on.
-var _ core.MetadataStore = (*Store)(nil)
+// Compile-time check that *Store implements every store role.
+var _ = core.AssertEngine[*Store]

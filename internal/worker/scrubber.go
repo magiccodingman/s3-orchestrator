@@ -11,37 +11,46 @@
 // Backfill reads objects that have no stored hash, computes the hash, and
 // stores it in the database so future scrub and read-time checks cover them.
 //
-// Both operations decrypt encrypted objects before hashing so the comparison
-// is always against the original plaintext. Each backend read is tracked
-// against the backend's usage quota (API calls + egress).
+// Both operations undo the stored form before hashing - decrypt, then
+// decompress - so the comparison is always against the bytes the client wrote.
+// That work lives in storedhash.go, shared with the replicator, and tracks each
+// backend read against the backend's usage quota (API calls + egress).
 // -------------------------------------------------------------------------------
 
 package worker
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
-	"io"
 	"log/slog"
+	"slices"
 
 	"github.com/afreidah/s3-orchestrator/internal/config"
 	"github.com/afreidah/s3-orchestrator/internal/encryption"
 	"github.com/afreidah/s3-orchestrator/internal/observe/audit"
+	"github.com/afreidah/s3-orchestrator/internal/observe/event"
 	"github.com/afreidah/s3-orchestrator/internal/observe/logfmt"
 	"github.com/afreidah/s3-orchestrator/internal/observe/telemetry"
 	"github.com/afreidah/s3-orchestrator/internal/progress"
+	"github.com/afreidah/s3-orchestrator/internal/proxy/etag"
 	"github.com/afreidah/s3-orchestrator/internal/store/core"
 	"github.com/afreidah/s3-orchestrator/internal/util/must"
 	"github.com/afreidah/s3-orchestrator/internal/util/syncutil"
 )
 
 // ScrubberStore is the narrow persistence surface the scrubber needs:
-// integrity row reads/writes. Declared locally so the worker does not
-// pull in the full MetadataStore.
+// integrity row reads/writes, removal of a location whose bytes failed
+// verification, and the copies of one key for an on-demand verification.
+// Declared locally so the worker does not pull in the full MetadataStore.
+//
+// The pass records an ETag computed from the plaintext for an object that has
+// none, which is the only source for a copy whose stored bytes are compressed
+// or encrypted.
 type ScrubberStore interface {
 	core.IntegrityStore
+	DeleteObjectLocation(ctx context.Context, key, backendName string) (int64, error)
+	GetAllObjectLocations(ctx context.Context, key string) ([]core.ObjectLocation, error)
+	RecordObjectIdentity(ctx context.Context, key string, id *core.ObjectIdentity) error
 }
 
 // Scrubber periodically verifies stored object integrity by reading objects
@@ -53,17 +62,20 @@ type Scrubber struct {
 	deps      ScrubberOps
 	placement Placement
 	store     ScrubberStore
-	encryptor *encryption.Encryptor
+	hasher    *storedHasher
 	cfg       syncutil.AtomicConfig[config.IntegrityConfig]
 }
 
-// ScrubberDeps groups the scrubber's constructor dependencies. Encryptor
-// is optional (nil when encryption is disabled).
+// ScrubberDeps groups the scrubber's constructor dependencies. Encryptor and
+// Codec are optional, and are what the stored form has to be undone through
+// before hashing; a copy recorded as encrypted or compressed cannot be verified
+// without the matching one.
 type ScrubberDeps struct {
 	Ops       ScrubberOps
 	Placement Placement
 	Store     ScrubberStore
 	Encryptor *encryption.Encryptor
+	Codec     StreamDecompressor
 }
 
 // NewScrubber creates a Scrubber with the given dependencies.
@@ -71,7 +83,13 @@ func NewScrubber(deps ScrubberDeps) *Scrubber {
 	must.NotNil("Ops", deps.Ops)
 	must.NotNil("Placement", deps.Placement)
 	must.NotNil("Store", deps.Store)
-	return &Scrubber{deps: deps.Ops, placement: deps.Placement, store: deps.Store, encryptor: deps.Encryptor, log: slog.Default().With(logfmt.Component("scrubber"))}
+	return &Scrubber{
+		deps:      deps.Ops,
+		placement: deps.Placement,
+		store:     deps.Store,
+		hasher:    newStoredHasher(deps.Ops, deps.Encryptor, deps.Codec, "scrubber"),
+		log:       slog.Default().With(logfmt.Component("scrubber")),
+	}
 }
 
 // SetConfig atomically stores the integrity configuration.
@@ -89,17 +107,127 @@ func (s *Scrubber) Config() *config.IntegrityConfig {
 // -------------------------------------------------------------------------
 
 // Scrub verifies a batch of objects with stored content hashes. Returns the
-// number of objects checked and the number of hash mismatches found.
-func (s *Scrubber) Scrub(ctx context.Context, batchSize int, observer progress.Observer) WorkSummary {
-	ctx = audit.WithRequestID(ctx, audit.NewID())
-	ctx, span := telemetry.StartSpan(ctx, "Scrub")
-	defer span.End()
+// CopyVerification is the outcome of verifying one copy of one key.
+//
+// Outcome distinguishes the three answers that matter: the bytes matched the
+// stored hash, they did not, or the copy could not be read at all. A copy with
+// no stored hash reports NotHashed rather than success, since there was nothing
+// to compare against and reporting it as verified would be a lie.
+type CopyVerification struct {
+	Backend string
+	Outcome CopyOutcome
+}
 
-	locs, err := s.store.GetRandomHashedObjects(ctx, batchSize)
+// CopyOutcome is what verifying one copy established. The zero value is
+// deliberately not a valid outcome, so an unset field cannot read as verified.
+type CopyOutcome int
+
+// Outcomes reported by ScrubKey.
+const (
+	CopyVerified CopyOutcome = iota + 1
+	CopyMismatch
+	CopyUnreadable
+	CopyNotHashed
+)
+
+// String names the outcome for logs and test failures. It is not the wire
+// value: how a verdict reads to an operator is the admin transport's business,
+// and it words each one there.
+func (o CopyOutcome) String() string {
+	switch o {
+	case CopyVerified:
+		return "verified"
+	case CopyMismatch:
+		return "mismatch"
+	case CopyUnreadable:
+		return "unreadable"
+	case CopyNotHashed:
+		return "not hashed"
+	default:
+		return "unknown"
+	}
+}
+
+// ScrubKey verifies every copy of one key immediately and reports each
+// separately.
+//
+// This is the question an operator has when something looks wrong - a restore
+// failed, a backend threw errors - and the sweep cannot answer it: ordered by
+// least-recently-verified, reaching a specific key can take days.
+//
+// It deliberately does not consult the usage-limit filter the sweep applies. An
+// operator asking about one object is not the same as a background sweep
+// spending an unattended budget, and refusing to answer because a backend is
+// near its egress cap would make the command useless exactly when it is most
+// needed.
+//
+// A mismatch is handled identically to one the sweep finds: the bytes are
+// discarded and the ledger row dropped, so the replicator rebuilds from a
+// healthy copy.
+func (s *Scrubber) ScrubKey(ctx context.Context, key string) ([]CopyVerification, error) {
+	return runOpsCycle(ctx, "ScrubKey", "scrub_key", func(ctx context.Context) ([]CopyVerification, error) {
+		locations, err := s.store.GetAllObjectLocations(ctx, key)
+		if err != nil {
+			return nil, fmt.Errorf("failed to look up copies of %s: %w", key, err)
+		}
+
+		results := make([]CopyVerification, 0, len(locations))
+		for i := range locations {
+			results = append(results, s.verifyCopy(ctx, &locations[i]))
+		}
+
+		audit.Log(ctx, "integrity.scrub_key",
+			slog.String("key", key),
+			slog.Int("copies", len(results)),
+		)
+		return results, nil
+	})
+}
+
+// verifyCopy maps one copy's verification onto the reported outcome. A copy
+// with no stored hash short-circuits: reading it would spend egress to compare
+// against nothing.
+func (s *Scrubber) verifyCopy(ctx context.Context, loc *core.ObjectLocation) CopyVerification {
+	if loc.ContentHash == "" {
+		return CopyVerification{Backend: loc.BackendName, Outcome: CopyNotHashed}
+	}
+
+	switch s.verifyOne(ctx, loc).Outcome {
+	case ItemSucceeded:
+		return CopyVerification{Backend: loc.BackendName, Outcome: CopyVerified}
+	case ItemFailed:
+		return CopyVerification{Backend: loc.BackendName, Outcome: CopyMismatch}
+	default:
+		return CopyVerification{Backend: loc.BackendName, Outcome: CopyUnreadable}
+	}
+}
+
+// number of objects checked and the number of hash mismatches found.
+func (s *Scrubber) Scrub(ctx context.Context, batchSize int, backend string, observer progress.Observer) WorkSummary {
+	ctx = audit.WithRequestID(ctx, audit.NewID())
+	return runTickCycle(ctx, "Scrub", "scrub", func(ctx context.Context) WorkSummary {
+		return s.scrub(ctx, batchSize, backend, observer)
+	})
+}
+
+// scrub is the body of Scrub after the span is open.
+func (s *Scrubber) scrub(ctx context.Context, batchSize int, backend string, observer progress.Observer) WorkSummary {
+	affordable, declined := s.affordableBackends()
+	affordable = restrictToBackend(affordable, backend)
+
+	locs, err := s.store.GetLeastRecentlyScrubbedObjects(ctx, batchSize, affordable)
 	if err != nil {
 		s.log.ErrorContext(ctx, "failed to fetch objects", "error", err)
 		return WorkSummary{}
 	}
+
+	deferred := s.countDeferred(ctx, declined)
+
+	// Published after the cycle so the gauges reflect the work just done.
+	// Deferred copies get their own gauge rather than being folded into the
+	// coverage age: the sweep cannot stamp them, so counting them there would
+	// pin the age to wall clock and no amount of scrubbing would lower it.
+	defer s.reportCoverage(ctx, affordable)
 
 	// Scrub stays sequential (Concurrency 1): each item reads and hashes a full
 	// object body, so a wider window can hammer the backends. Concurrency is a
@@ -109,9 +237,12 @@ func (s *Scrubber) Scrub(ctx context.Context, batchSize int, observer progress.O
 		Log:         s.log,
 		Concurrency: 1,
 		Observer:    observer,
-		Key:         func(l core.ObjectLocation) string { return l.ObjectKey },
+		// Copies are verified per (key, backend), so a replicated object is
+		// scrubbed once per backend. Naming the backend keeps those from
+		// reading as the same object listed twice.
+		Key: func(l core.ObjectLocation) string { return l.ObjectKey + " [" + l.BackendName + "]" },
 	}
-	return runner.Run(ctx, locs, func(ctx context.Context, loc core.ObjectLocation) ItemResult {
+	sum := runner.Run(ctx, locs, func(ctx context.Context, loc core.ObjectLocation) ItemResult {
 		res := s.verifyOne(ctx, &loc)
 		// "checked" = an object we actually verified (matched or mismatched); a
 		// verify error is skipped, not checked.
@@ -120,6 +251,82 @@ func (s *Scrubber) Scrub(ctx context.Context, batchSize int, observer progress.O
 		}
 		return res
 	})
+	sum.Deferred = deferred
+	return sum
+}
+
+// affordableBackends splits the fleet into the backends the scrubber can still
+// read from and the ones whose usage limits it would breach.
+//
+// The check asks only for headroom, not for a specific object's size, because
+// the split decides which backends a batch may be drawn from before any object
+// is known. verifyOne re-checks against the real size.
+func (s *Scrubber) affordableBackends() (affordable, declined []string) {
+	order := s.deps.BackendOrder()
+	affordable = s.deps.Usage().BackendsWithinLimits(order, getObjectOp, 0, 0)
+
+	if len(affordable) == len(order) {
+		return affordable, nil
+	}
+	keep := make(map[string]bool, len(affordable))
+	for _, name := range affordable {
+		keep[name] = true
+	}
+	for _, name := range order {
+		if !keep[name] {
+			declined = append(declined, name)
+		}
+	}
+	return affordable, declined
+}
+
+// restrictToBackend narrows an affordable set to the one backend a caller named,
+// or returns it whole when none was.
+//
+// A named backend the budget already declined stays out: the request asks to
+// scrub it, not to overspend on it, and the deferred count is what reports the
+// copies that went unread.
+func restrictToBackend(affordable []string, backend string) []string {
+	if backend == "" {
+		return affordable
+	}
+	if slices.Contains(affordable, backend) {
+		return []string{backend}
+	}
+	return nil
+}
+
+// countDeferred reports how many scrubbable copies sit on backends this cycle
+// declined to read. Counting the queue rather than the batch is the point: the
+// batch never contained them, so it cannot say how much was left undone.
+func (s *Scrubber) countDeferred(ctx context.Context, declined []string) int {
+	if len(declined) == 0 {
+		return 0
+	}
+	n, err := s.store.CountScrubCandidatesOnBackends(ctx, declined)
+	if err != nil {
+		s.log.WarnContext(ctx, "failed to count deferred scrub candidates", "error", err)
+		return 0
+	}
+	telemetry.UsageLimitRejectionsTotal.WithLabelValues("scrub", "read").Add(float64(n))
+	s.log.WarnContext(ctx, "scrub deferred copies on backends over their usage limit",
+		"backends", declined, "copies", n)
+	return int(n)
+}
+
+// reportCoverage publishes how far behind verification is, which is what says
+// whether the scrubber is keeping up with the fleet rather than merely running.
+// reachable scopes the age and the never-verified count to the copies this
+// cycle could have read; the rest are published as deferred.
+func (s *Scrubber) reportCoverage(ctx context.Context, reachable []string) {
+	stat, err := s.store.IntegrityCoverage(ctx, reachable)
+	if err != nil {
+		s.log.WarnContext(ctx, "failed to read scrub coverage", "error", err)
+		return
+	}
+	telemetry.IntegrityOldestUnverifiedSeconds.Set(stat.OldestUnverifiedAge.Seconds())
+	telemetry.IntegrityNeverVerifiedCopies.Set(float64(stat.NeverVerified))
+	telemetry.IntegrityDeferredCopies.Set(float64(stat.Deferred))
 }
 
 // verifyOne verifies one object's stored hash and classifies the result for the
@@ -127,11 +334,34 @@ func (s *Scrubber) Scrub(ctx context.Context, batchSize int, observer progress.O
 // skipped (not counted as checked). The returned Status feeds the progress
 // stream the BatchRunner brackets each item with.
 func (s *Scrubber) verifyOne(ctx context.Context, loc *core.ObjectLocation) ItemResult {
+	// The batch-level split only asked whether the backend had any headroom
+	// at all, before any object was known. A sweep reads every copy in the
+	// fleet, so the object's own size is admitted too, or a batch admitted on
+	// a sliver of remaining budget reads straight through it.
+	//
+	// Declined ahead of the scrub stamp below: a copy that was never read has
+	// not been verified, and recording it as scrubbed would send it to the
+	// back of the queue claiming an integrity check that never happened.
+	if !s.deps.Usage().WithinLimits(loc.BackendName, getObjectOp, loc.SizeBytes, 0) {
+		telemetry.IntegrityUsageDeclinedTotal.Inc()
+		s.log.WarnContext(ctx, "scrub declined by usage limits",
+			"key", loc.ObjectKey, "backend", loc.BackendName, "size", loc.SizeBytes)
+		return ItemResult{Outcome: ItemSkipped, Status: progress.StatusSkipped}
+	}
+
 	match, verifyErr := s.verifyObject(ctx, loc)
+
+	// Stamped even when the read failed: a copy that always fails would
+	// otherwise sit at the head of the queue and starve the rest of the sweep.
+	if err := s.store.MarkObjectScrubbed(ctx, loc.ObjectKey, loc.BackendName); err != nil {
+		s.log.WarnContext(ctx, "failed to record scrub timestamp",
+			"key", loc.ObjectKey, "backend", loc.BackendName, "error", err)
+	}
+
 	if verifyErr != nil {
 		s.log.WarnContext(ctx, "failed to verify object",
 			"key", loc.ObjectKey, "backend", loc.BackendName, "error", verifyErr)
-		return ItemResult{Outcome: ItemSkipped, Status: progress.StatusFailed}
+		return ItemResult{Outcome: ItemSkipped, Status: progress.StatusUnreadable}
 	}
 	if match {
 		return ItemResult{Outcome: ItemSucceeded, Status: progress.StatusOK}
@@ -148,20 +378,43 @@ func (s *Scrubber) verifyObject(ctx context.Context, loc *core.ObjectLocation) (
 		return false, err
 	}
 
-	if actual != loc.ContentHash {
+	if actual.SHA256 != loc.ContentHash {
 		be, _ := s.deps.GetBackend(loc.BackendName)
 		s.log.ErrorContext(ctx, "integrity check failed",
 			"key", loc.ObjectKey, "backend", loc.BackendName,
-			"expected_hash", loc.ContentHash, "actual_hash", actual)
+			"expected_hash", loc.ContentHash, "actual_hash", actual.SHA256)
 		telemetry.IntegrityErrorsTotal.WithLabelValues("scrub").Inc()
+		event.Publish(event.IntegrityCorruptionFound, loc.ObjectKey, map[string]any{
+			"key":           loc.ObjectKey,
+			"backend":       loc.BackendName,
+			"expected_hash": loc.ContentHash,
+			"actual_hash":   actual.SHA256,
+			"size_bytes":    loc.SizeBytes,
+		})
 		if be != nil {
 			s.placement.DeleteOrEnqueue(ctx, be, loc.BackendName, loc.ObjectKey,
 				"integrity_scrub_failed", loc.SizeBytes)
 		}
+		s.dropCorruptedLocation(ctx, loc)
 		return false, nil
 	}
 
 	return true, nil
+}
+
+// dropCorruptedLocation removes the ledger row for a discarded copy. Without
+// it the replicator still counts the copy and never rebuilds the object.
+func (s *Scrubber) dropCorruptedLocation(ctx context.Context, loc *core.ObjectLocation) {
+	_, err := s.store.DeleteObjectLocation(ctx, loc.ObjectKey, loc.BackendName)
+	if err != nil {
+		s.log.ErrorContext(ctx, "failed to drop location for corrupted copy",
+			"key", loc.ObjectKey, "backend", loc.BackendName, "error", err)
+		return
+	}
+	audit.Log(ctx, "integrity.copy_discarded",
+		slog.String("key", loc.ObjectKey),
+		slog.String("backend", loc.BackendName),
+	)
 }
 
 // -------------------------------------------------------------------------
@@ -174,12 +427,12 @@ func (s *Scrubber) verifyObject(ctx context.Context, loc *core.ObjectLocation) (
 // start step before each object is hashed and an end step after, carrying the
 // per-object outcome and duration. Returns the cycle summary and the next
 // offset for pagination (0 when done).
-func (s *Scrubber) Backfill(ctx context.Context, batchSize, offset int, observer progress.Observer) (WorkSummary, int) {
+func (s *Scrubber) Backfill(ctx context.Context, batchSize, offset int, backend string, observer progress.Observer) (WorkSummary, int) {
 	ctx = audit.WithRequestID(ctx, audit.NewID())
 	ctx, span := telemetry.StartSpan(ctx, "Backfill")
 	defer span.End()
 
-	locs, err := s.store.GetObjectsWithoutHash(ctx, batchSize, offset)
+	locs, err := s.store.GetObjectsWithoutHash(ctx, batchSize, offset, backend)
 	if err != nil {
 		s.log.ErrorContext(ctx, "failed to fetch objects", "error", err)
 		return WorkSummary{}, 0
@@ -216,57 +469,46 @@ func (s *Scrubber) Backfill(ctx context.Context, batchSize, offset int, observer
 // hashOne computes and stores the hash for one object, returning the outcome
 // for the batch tally and a status for the progress stream.
 func (s *Scrubber) hashOne(ctx context.Context, loc *core.ObjectLocation) ItemResult {
-	hash, hashErr := s.readAndHash(ctx, loc)
+	digests, hashErr := s.readAndHash(ctx, loc)
 	if hashErr != nil {
 		s.log.WarnContext(ctx, "failed to hash object",
 			"key", loc.ObjectKey, "backend", loc.BackendName, "error", hashErr)
 		return ItemResult{Outcome: ItemFailed, Status: progress.StatusFailed}
 	}
-	if err := s.store.UpdateContentHash(ctx, loc.ObjectKey, loc.BackendName, hash); err != nil {
+	if err := s.store.UpdateContentHash(ctx, loc.ObjectKey, loc.BackendName, digests.SHA256); err != nil {
 		s.log.WarnContext(ctx, "failed to store hash",
 			"key", loc.ObjectKey, "backend", loc.BackendName, "error", err)
 		return ItemResult{Outcome: ItemFailed, Status: progress.StatusFailed}
 	}
+	s.recordETag(ctx, loc, digests.MD5)
 	return ItemResult{Outcome: ItemSucceeded, Status: progress.StatusOK}
+}
+
+// recordETag gives an object with no recorded ETag the one this pass just
+// computed. It is the only way a compressed or encrypted object gets one
+// without a client write: the backend's own value describes the stored bytes,
+// so a read cannot adopt it, and this pass already has the plaintext in hand.
+//
+// The store fills only what is NULL, so an object that already has an ETag -
+// every object written since it started being recorded - keeps it.
+func (s *Scrubber) recordETag(ctx context.Context, loc *core.ObjectLocation, digest string) {
+	if digest == "" {
+		return
+	}
+	id := &core.ObjectIdentity{ETag: etag.Single(digest)}
+	if err := s.store.RecordObjectIdentity(ctx, loc.ObjectKey, id); err != nil {
+		s.log.WarnContext(ctx, "failed to record object etag",
+			"key", loc.ObjectKey, "backend", loc.BackendName, "error", err)
+	}
 }
 
 // -------------------------------------------------------------------------
 // SHARED  -  read object from backend, decrypt if needed, compute SHA-256
 // -------------------------------------------------------------------------
 
-// readAndHash reads an object from its backend, decrypts if encrypted, and
-// returns the SHA-256 hex digest of the plaintext. Records API call and
-// egress against the backend's usage quota.
-func (s *Scrubber) readAndHash(ctx context.Context, loc *core.ObjectLocation) (string, error) {
-	be, err := s.deps.GetBackend(loc.BackendName)
-	if err != nil {
-		return "", err
-	}
-
-	result, cancel, err := s.deps.GetWithTimeout(ctx, be, loc.ObjectKey, "")
-	if err != nil {
-		s.deps.Acct().APICall(loc.BackendName)
-		return "", fmt.Errorf("get object: %w", err)
-	}
-	defer cancel()
-	defer result.Body.Close()
-
-	s.deps.Acct().Egress(loc.BackendName, result.Size)
-
-	// Decrypt if the object is encrypted  -  hash is computed on plaintext
-	var reader io.Reader = result.Body
-	if loc.Encrypted && s.encryptor != nil {
-		decrypted, _, decErr := s.encryptor.DecryptStored(ctx, result.Body, loc.EncryptionKey, loc.KeyID, loc.PlaintextSize, nil)
-		if decErr != nil {
-			return "", fmt.Errorf("decrypt: %w", decErr)
-		}
-		reader = decrypted
-	}
-
-	// Compute SHA-256 of the (plaintext) body
-	h := sha256.New()
-	if _, err := io.Copy(h, reader); err != nil {
-		return "", fmt.Errorf("read body: %w", err)
-	}
-	return hex.EncodeToString(h.Sum(nil)), nil
+// readAndHash returns the digests of the bytes the client wrote for this copy.
+// They have to match what the replicator computes for the same copy, so the
+// work lives in storedHasher rather than here.
+func (s *Scrubber) readAndHash(ctx context.Context, loc *core.ObjectLocation) (storedDigests, error) {
+	return s.hasher.hashStored(ctx, loc)
 }

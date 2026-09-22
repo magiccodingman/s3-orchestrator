@@ -25,8 +25,8 @@ func (q *Queries) CountActiveMultipartUploadsByPrefix(ctx context.Context, prefi
 
 const createMultipartUpload = `-- name: CreateMultipartUpload :exec
 
-INSERT INTO multipart_uploads (upload_id, object_key, backend_name, content_type, metadata, encryption_key, key_id, created_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+INSERT INTO multipart_uploads (upload_id, object_key, backend_name, content_type, metadata, encryption_key, key_id, tagging, created_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
 `
 
 type CreateMultipartUploadParams struct {
@@ -37,6 +37,7 @@ type CreateMultipartUploadParams struct {
 	Metadata      []byte
 	EncryptionKey []byte
 	KeyID         *string
+	Tagging       *string
 }
 
 // -----------------------------------------------------------------------------
@@ -58,6 +59,7 @@ func (q *Queries) CreateMultipartUpload(ctx context.Context, arg CreateMultipart
 		arg.Metadata,
 		arg.EncryptionKey,
 		arg.KeyID,
+		arg.Tagging,
 	)
 	return err
 }
@@ -82,7 +84,7 @@ func (q *Queries) DeleteMultipartUploadsByBackend(ctx context.Context, backendNa
 }
 
 const getMultipartUpload = `-- name: GetMultipartUpload :one
-SELECT upload_id, object_key, backend_name, content_type, metadata, encryption_key, key_id, created_at
+SELECT upload_id, object_key, backend_name, content_type, metadata, encryption_key, key_id, tagging, created_at
 FROM multipart_uploads
 WHERE upload_id = $1
 `
@@ -95,9 +97,12 @@ type GetMultipartUploadRow struct {
 	Metadata      []byte
 	EncryptionKey []byte
 	KeyID         *string
+	Tagging       *string
 	CreatedAt     pgtype.Timestamptz
 }
 
+// tagging rides along because CompleteMultipartUpload applies the set the
+// create call carried; the other reads have no use for it and omit it.
 func (q *Queries) GetMultipartUpload(ctx context.Context, uploadID string) (GetMultipartUploadRow, error) {
 	row := q.db.QueryRow(ctx, getMultipartUpload, uploadID)
 	var i GetMultipartUploadRow
@@ -109,6 +114,7 @@ func (q *Queries) GetMultipartUpload(ctx context.Context, uploadID string) (GetM
 		&i.Metadata,
 		&i.EncryptionKey,
 		&i.KeyID,
+		&i.Tagging,
 		&i.CreatedAt,
 	)
 	return i, err
@@ -161,7 +167,7 @@ func (q *Queries) GetMultipartUploadsByBackend(ctx context.Context, backendName 
 }
 
 const getParts = `-- name: GetParts :many
-SELECT part_number, etag, size_bytes, encrypted, encryption_key, key_id, plaintext_size, created_at
+SELECT part_number, etag, plaintext_etag, size_bytes, encrypted, encryption_key, key_id, plaintext_size, created_at
 FROM multipart_parts
 WHERE upload_id = $1
 ORDER BY part_number
@@ -170,6 +176,7 @@ ORDER BY part_number
 type GetPartsRow struct {
 	PartNumber    int32
 	Etag          string
+	PlaintextEtag *string
 	SizeBytes     int64
 	Encrypted     bool
 	EncryptionKey []byte
@@ -190,6 +197,7 @@ func (q *Queries) GetParts(ctx context.Context, uploadID string) ([]GetPartsRow,
 		if err := rows.Scan(
 			&i.PartNumber,
 			&i.Etag,
+			&i.PlaintextEtag,
 			&i.SizeBytes,
 			&i.Encrypted,
 			&i.EncryptionKey,
@@ -299,16 +307,17 @@ func (q *Queries) ListMultipartUploadsByPrefix(ctx context.Context, arg ListMult
 }
 
 const upsertPart = `-- name: UpsertPart :exec
-INSERT INTO multipart_parts (upload_id, part_number, etag, size_bytes, encrypted, encryption_key, key_id, plaintext_size, created_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+INSERT INTO multipart_parts (upload_id, part_number, etag, plaintext_etag, size_bytes, encrypted, encryption_key, key_id, plaintext_size, created_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
 ON CONFLICT (upload_id, part_number) DO UPDATE SET
-    etag = $3, size_bytes = $4, encrypted = $5, encryption_key = $6, key_id = $7, plaintext_size = $8, created_at = NOW()
+    etag = $3, plaintext_etag = $4, size_bytes = $5, encrypted = $6, encryption_key = $7, key_id = $8, plaintext_size = $9, created_at = NOW()
 `
 
 type UpsertPartParams struct {
 	UploadID      string
 	PartNumber    int32
 	Etag          string
+	PlaintextEtag *string
 	SizeBytes     int64
 	Encrypted     bool
 	EncryptionKey []byte
@@ -321,6 +330,7 @@ func (q *Queries) UpsertPart(ctx context.Context, arg UpsertPartParams) error {
 		arg.UploadID,
 		arg.PartNumber,
 		arg.Etag,
+		arg.PlaintextEtag,
 		arg.SizeBytes,
 		arg.Encrypted,
 		arg.EncryptionKey,

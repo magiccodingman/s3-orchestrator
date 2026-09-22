@@ -21,8 +21,6 @@
 //   - templates.go      template loading + embedded static FS
 // -------------------------------------------------------------------------------
 
-// Package ui provides the built-in web dashboard for operational visibility,
-// serving HTML pages, JSON API endpoints, and static assets.
 package ui
 
 import (
@@ -33,24 +31,22 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/afreidah/s3-orchestrator/internal/config"
 	"github.com/afreidah/s3-orchestrator/internal/observe/logfmt"
 	"github.com/afreidah/s3-orchestrator/internal/observe/telemetry"
-	"github.com/afreidah/s3-orchestrator/internal/proxy"
+	"github.com/afreidah/s3-orchestrator/internal/ops"
 	"github.com/afreidah/s3-orchestrator/internal/proxy/dashboard"
-	"github.com/afreidah/s3-orchestrator/internal/proxy/object"
 	"github.com/afreidah/s3-orchestrator/internal/store/core"
-	"github.com/afreidah/s3-orchestrator/internal/transport/admin"
+	"github.com/afreidah/s3-orchestrator/internal/transport/auth"
 	"github.com/afreidah/s3-orchestrator/internal/transport/httputil"
 	"github.com/afreidah/s3-orchestrator/internal/util/must"
 	"github.com/afreidah/s3-orchestrator/internal/util/syncutil"
-	"github.com/afreidah/s3-orchestrator/internal/worker"
 )
 
-// sessionCookieName and related constants used by this package.
+// Session and CSRF cookie names, plus the header, path and message literals
+// the handlers share.
 const (
 	sessionCookieName = "s3orch_session"
 	csrfCookieName    = "s3orch_csrf"
@@ -64,80 +60,118 @@ const (
 	errKeyRequired       = "key is required"
 	errLoginRenderFailed = "failed to render login page"
 	opCleanExcess        = "clean-excess"
+	opRebalance          = "rebalance"
+	opLifecycle          = "lifecycle"
 )
 
-// BackendOps is the narrow surface of *proxy.BackendManager that the UI
-// dashboard depends on for operations not exposed via a named sub-manager.
-// *proxy.BackendManager satisfies it.
-type BackendOps interface {
-	GetDashboardData(ctx context.Context) (*dashboard.Data, error)
-	GetDirectoryChildren(ctx context.Context, prefix, startAfter string, maxKeys int) (*core.DirectoryListResult, error)
+// -------------------------------------------------------------------------
+// INTERFACES
+// -------------------------------------------------------------------------
+
+// BackendSyncer is the backend-sync surface the UI's admin actions pane
+// invokes. *reconcile.Manager satisfies it.
+type BackendSyncer interface {
 	SyncBackend(ctx context.Context, backendName, virtualBucket string, virtualBuckets []string) (int, int, error)
 }
 
-// Compile-time assertion: *proxy.BackendManager implements BackendOps.
-var _ BackendOps = (*proxy.BackendManager)(nil)
+// DashboardOps is the dashboard surface the UI reads: the aggregated snapshot
+// and the lazy directory expansion behind the object browser.
+// *dashboard.Aggregator satisfies it.
+type DashboardOps interface {
+	GetData(ctx context.Context) (*dashboard.Data, error)
+	GetDirectoryChildren(ctx context.Context, prefix, startAfter string, maxKeys int) (*core.DirectoryListResult, error)
+}
+
+// DeclaredBuckets is the virtual bucket set the UI resolves a browsed key
+// against, covering both the config file and the store.
+// *provisioning.Declared satisfies it.
+type DeclaredBuckets interface {
+	HasPrefix(key string) bool
+	Names() []string
+}
 
 // Deps holds the dependencies New requires.
 type Deps struct {
-	BackendOps    BackendOps
-	Objects       *object.Manager
-	Rebalancer    *worker.Rebalancer
-	OverRep       *worker.OverReplicationCleaner
-	AdminHandler  *admin.Handler
+	Dashboard     DashboardOps
+	Sync          BackendSyncer
+	Objects       *ops.Objects
+	Integrity     *ops.Integrity
+	Replication   *ops.Replication
+	Rebalance     *ops.Rebalance
+	Expiry        *ops.Lifecycle
+	Encryption    *ops.Encryption
+	Compression   *ops.Compression
 	DBHealthy     func() bool
+	Buckets       DeclaredBuckets
 	Cfg           *config.Config
 	LogBuffer     *telemetry.LogBuffer
 	LoginThrottle *httputil.LoginThrottle
+	Registry      func() *auth.BucketRegistry
 }
 
 // Handler serves the web UI dashboard.
 type Handler struct {
 	log            *slog.Logger
-	backendOps     BackendOps
-	objects        *object.Manager
-	rebalancer     *worker.Rebalancer
-	overRep        *worker.OverReplicationCleaner
-	adminHandler   *admin.Handler
+	dashboardOps   DashboardOps
+	syncOps        BackendSyncer
+	objects        *ops.Objects
+	integrity      *ops.Integrity
+	replication    *ops.Replication
+	rebalance      *ops.Rebalance
+	expiry         *ops.Lifecycle
+	encryption     *ops.Encryption
+	compression    *ops.Compression
 	dbHealthy      func() bool
+	buckets        DeclaredBuckets
 	cfg            syncutil.AtomicConfig[config.Config]
 	templates      *template.Template
 	logBuffer      *telemetry.LogBuffer
 	loginThrottle  *httputil.LoginThrottle
 	prefix         string
-	adminKey       string
-	adminSecret    string
 	sessionKey     []byte
 	forceSecure    bool
 	trustedProxies []*net.IPNet
+	registry       func() *auth.BucketRegistry
 	asyncOps       asyncOpTracker
 }
+
+// -------------------------------------------------------------------------
+// CONSTRUCTOR
+// -------------------------------------------------------------------------
 
 // New is the explicit-deps constructor. The DI layer constructs Deps and
 // passes it here; tests build Deps directly. Each field is the smallest
 // contract the handler uses, so wiring stays visible at the call site.
 func New(d *Deps) *Handler {
 	must.NotNil("d", d)
-	must.NotNil("d.BackendOps", d.BackendOps)
 	must.NotNil("d.Objects", d.Objects)
-	must.NotNil("d.AdminHandler", d.AdminHandler)
+	must.NotNil("d.Integrity", d.Integrity)
+	must.NotNil("d.Replication", d.Replication)
+	must.NotNil("d.Rebalance", d.Rebalance)
+	must.NotNil("d.Encryption", d.Encryption)
+	must.NotNil("d.Compression", d.Compression)
+	must.NotNil("d.Buckets", d.Buckets)
 	must.NotNil("d.Cfg", d.Cfg)
 	h := &Handler{
 		log:            slog.Default().With(logfmt.Component("ui")),
-		backendOps:     d.BackendOps,
+		dashboardOps:   d.Dashboard,
+		syncOps:        d.Sync,
 		objects:        d.Objects,
-		rebalancer:     d.Rebalancer,
-		overRep:        d.OverRep,
-		adminHandler:   d.AdminHandler,
+		integrity:      d.Integrity,
+		replication:    d.Replication,
+		rebalance:      d.Rebalance,
+		expiry:         d.Expiry,
+		encryption:     d.Encryption,
+		compression:    d.Compression,
 		dbHealthy:      d.DBHealthy,
+		buckets:        d.Buckets,
 		templates:      loadTemplates(),
 		logBuffer:      d.LogBuffer,
 		loginThrottle:  d.LoginThrottle,
-		adminKey:       d.Cfg.UI.AdminKey,
-		adminSecret:    d.Cfg.UI.AdminSecret,
 		sessionKey:     deriveSessionKey(&d.Cfg.UI),
 		forceSecure:    d.Cfg.UI.ForceSecureCookies,
 		trustedProxies: httputil.ParseTrustedProxies(d.Cfg.RateLimit.TrustedProxies),
+		registry:       d.Registry,
 	}
 	h.cfg.Store(d.Cfg)
 	return h
@@ -159,21 +193,21 @@ func (h *Handler) UpdateConfig(cfg *config.Config) {
 	h.cfg.Store(cfg)
 }
 
+// -------------------------------------------------------------------------
+// INTERNALS
+// -------------------------------------------------------------------------
+
 // clientIP extracts the real client IP from the request, respecting
 // X-Forwarded-For when the peer is a trusted proxy.
 func (h *Handler) clientIP(r *http.Request) string {
 	return httputil.ExtractClientIP(r, h.trustedProxies)
 }
 
-// validBucketPrefix checks whether the key starts with a configured virtual bucket name.
+// validBucketPrefix checks whether the key starts with a declared virtual
+// bucket name, counting both the config file and the store so a bucket created
+// through the provisioning API is browsable here.
 func (h *Handler) validBucketPrefix(key string) bool {
-	cfg := h.cfg.Load()
-	for _, b := range cfg.Buckets {
-		if strings.HasPrefix(key, b.Name+"/") {
-			return true
-		}
-	}
-	return false
+	return h.buckets.HasPrefix(key)
 }
 
 // validBackend checks whether the backend name exists in config.

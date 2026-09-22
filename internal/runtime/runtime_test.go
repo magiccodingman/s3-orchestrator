@@ -15,6 +15,7 @@ package runtime
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -27,8 +28,16 @@ import (
 	"testing"
 	"time"
 
+	"github.com/samber/do/v2"
+
 	"github.com/afreidah/s3-orchestrator/internal/config"
+	"github.com/afreidah/s3-orchestrator/internal/proxy/writepath"
+	"github.com/afreidah/s3-orchestrator/internal/reload"
 )
+
+// -------------------------------------------------------------------------
+// CONSTANTS
+// -------------------------------------------------------------------------
 
 const validTestConfigYAML = `
 server:
@@ -49,6 +58,10 @@ backends:
     access_key_id: ak
     secret_access_key: sk
 `
+
+// -------------------------------------------------------------------------
+// INTERNALS
+// -------------------------------------------------------------------------
 
 func writeYAML(t *testing.T, content string) string {
 	t.Helper()
@@ -102,6 +115,10 @@ func loadCfg(t *testing.T, yaml string) *config.Config {
 	}
 	return cfg
 }
+
+// -------------------------------------------------------------------------
+// PUBLIC API
+// -------------------------------------------------------------------------
 
 // TestStartObservability sets the default logger and returns a usable
 // shutdownTracer + LogBuffer.
@@ -245,4 +262,169 @@ func TestRunFullLifecycle(t *testing.T) {
 	if !strings.Contains(stdout.String(), `"msg":"shutdown initiated"`) || !strings.Contains(stdout.String(), cause.Error()) {
 		t.Errorf("expected shutdown log line with cause %q, got logs:\n%s", cause.Error(), stdout.String())
 	}
+}
+
+// TestToAdminReloadStatus_NilBeforeFirstReload asserts the converter reports
+// nil before any reload has run, which is the signal the admin handler turns
+// into its not-yet placeholder.
+func TestToAdminReloadStatus_NilBeforeFirstReload(t *testing.T) {
+	t.Parallel()
+	if got := toAdminReloadStatus(nil); got != nil {
+		t.Errorf("toAdminReloadStatus(nil) = %+v, want nil", got)
+	}
+}
+
+// TestToAdminReloadStatus_CopiesResult pins the conversion that keeps
+// internal/reload types off the admin API: every field maps across, hook
+// outcomes included, with generation carried as a pointer so a zero survives.
+func TestToAdminReloadStatus_CopiesResult(t *testing.T) {
+	t.Parallel()
+	started := time.Unix(1700000000, 0).UTC()
+	ended := started.Add(2 * time.Second)
+	res := &reload.Result{
+		Generation: 4,
+		Status:     reload.ReloadPartialApplied,
+		Outcomes: []reload.HookOutcome{
+			{Name: "log-level", Status: reload.HookApplied},
+			{Name: "backends", Status: reload.HookFailed, Error: "boom"},
+		},
+		RequiresRestart: []string{"server.listen_addr"},
+		LoadError:       "",
+		StartedAt:       started,
+		EndedAt:         ended,
+	}
+
+	got := toAdminReloadStatus(res)
+	if got == nil {
+		t.Fatal("toAdminReloadStatus returned nil for a populated result")
+	}
+	if got.Status != string(reload.ReloadPartialApplied) {
+		t.Errorf("status = %q, want %q", got.Status, reload.ReloadPartialApplied)
+	}
+	if got.Generation == nil || *got.Generation != 4 {
+		t.Errorf("generation = %v, want 4", got.Generation)
+	}
+	if len(got.Outcomes) != 2 {
+		t.Fatalf("outcomes = %d, want 2", len(got.Outcomes))
+	}
+	if got.Outcomes[1].Name != "backends" || got.Outcomes[1].Status != string(reload.HookFailed) ||
+		got.Outcomes[1].Error != "boom" {
+		t.Errorf("failed outcome = %+v, want backends/failed/boom", got.Outcomes[1])
+	}
+	if len(got.RequiresRestart) != 1 || got.RequiresRestart[0] != "server.listen_addr" {
+		t.Errorf("requires_restart = %v, want [server.listen_addr]", got.RequiresRestart)
+	}
+	if got.StartedAt == nil || !got.StartedAt.Equal(started) || got.EndedAt == nil || !got.EndedAt.Equal(ended) {
+		t.Errorf("timestamps = %v/%v, want %v/%v", got.StartedAt, got.EndedAt, started, ended)
+	}
+}
+
+// TestToAdminReloadStatus_ZeroGenerationSurvives guards the pointer field: a
+// validation-failed pass before any successful apply legitimately has
+// generation 0, and must still report the field rather than looking like the
+// not-yet placeholder.
+func TestToAdminReloadStatus_ZeroGenerationSurvives(t *testing.T) {
+	t.Parallel()
+	got := toAdminReloadStatus(&reload.Result{
+		Generation: 0,
+		Status:     reload.ReloadValidationFailed,
+	})
+	if got == nil || got.Generation == nil {
+		t.Fatalf("generation dropped for a zero-generation result: %+v", got)
+	}
+	if *got.Generation != 0 {
+		t.Errorf("generation = %d, want 0", *got.Generation)
+	}
+
+	body, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(body), `"generation":0`) {
+		t.Errorf("body = %s, want an explicit generation:0", body)
+	}
+}
+
+// TestShutdown_WaitsForCopiesStillUploading asserts the teardown waits for the
+// work a fan-out write leaves behind. Those copies belong to no request, so the
+// HTTP drain above them returns without them, and a shutdown that did not wait
+// would kill them mid-upload and leave their intents for the reaper to resolve
+// minutes later.
+func TestShutdown_WaitsForCopiesStillUploading(t *testing.T) {
+	port := freePort(t)
+	cfg := loadCfg(t, configWithPort(port))
+
+	var stdout bytes.Buffer
+	rt, err := New(Options{
+		ConfigPath: writeYAML(t, configWithPort(port)),
+		Mode:       "all",
+		Stdout:     &stdout,
+	}, cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ctx, cancel := context.WithCancelCause(context.Background())
+	errCh := make(chan error, 1)
+	go func() { errCh <- rt.Run(ctx) }()
+	waitReady(t, port, cancel)
+
+	// Stand in for a write whose second copy is still uploading: hold a slot,
+	// then hand it back once shutdown is already waiting on it.
+	detached, err := do.Invoke[*writepath.DetachedUploads](rt.inj)
+	if err != nil {
+		cancel(errors.New("resolve failed"))
+		t.Fatalf("resolve detached uploads: %v", err)
+	}
+	release, ok := detached.Begin()
+	if !ok {
+		cancel(errors.New("no slot"))
+		t.Fatal("could not take a slot on an idle instance")
+	}
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		release()
+	}()
+
+	cancel(errors.New("test-shutdown-cause"))
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("Run returned error: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not exit within 10 seconds")
+	}
+
+	if !strings.Contains(stdout.String(), "waiting for copies still uploading after their response") {
+		t.Errorf("shutdown did not wait for the copy still uploading, logs:\n%s", stdout.String())
+	}
+	if strings.Contains(stdout.String(), "shutdown deadline reached with copies still uploading") {
+		t.Error("shutdown reported a timeout for a copy that finished well inside it")
+	}
+	if got := detached.Depth(); got != 0 {
+		t.Errorf("depth = %d after shutdown, want 0", got)
+	}
+}
+
+// waitReady blocks until the instance reports ready, cancelling and failing the
+// test if it never does.
+func waitReady(t *testing.T, port int, cancel context.CancelCauseFunc) {
+	t.Helper()
+	addr := fmt.Sprintf("http://127.0.0.1:%d/health/ready", port)
+	var lastErr error
+	for range 50 {
+		req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, addr, nil)
+		resp, err := http.DefaultClient.Do(req) //nolint:gosec // G704: test server URL
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				return
+			}
+		}
+		lastErr = err
+		time.Sleep(50 * time.Millisecond)
+	}
+	cancel(errors.New("never ready"))
+	t.Fatalf("server never became ready: %v", lastErr)
 }

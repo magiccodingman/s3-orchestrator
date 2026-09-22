@@ -24,6 +24,7 @@ import (
 	"github.com/afreidah/s3-orchestrator/internal/observe/audit"
 	"github.com/afreidah/s3-orchestrator/internal/observe/logfmt"
 	"github.com/afreidah/s3-orchestrator/internal/observe/telemetry"
+	"github.com/afreidah/s3-orchestrator/internal/s3op"
 	"github.com/afreidah/s3-orchestrator/internal/store/core"
 	"github.com/afreidah/s3-orchestrator/internal/util/must"
 )
@@ -32,20 +33,13 @@ import (
 // TYPES
 // -------------------------------------------------------------------------
 
-// PendingReaperStore is the narrow persistence surface the pending reaper
-// needs. Declared locally so the worker does not pull in the full
-// MetadataStore.
-type PendingReaperStore interface {
-	core.PendingStore
-}
-
 // PendingReaper resolves abandoned PUT intents by inspecting the destination
 // backend. The min-age window protects in-flight PUTs whose commit has not
 // yet had a chance to clear the intent on the synchronous path.
 type PendingReaper struct {
 	deps        CleanupOps
 	placement   Placement
-	store       PendingReaperStore
+	store       core.PendingStore
 	log         *slog.Logger
 	concurrency int
 	minAge      time.Duration
@@ -58,7 +52,7 @@ type PendingReaper struct {
 type PendingReaperDeps struct {
 	Ops         CleanupOps
 	Placement   Placement
-	Store       PendingReaperStore
+	Store       core.PendingStore
 	Concurrency int
 	MinAge      time.Duration
 	BatchSize   int
@@ -99,11 +93,11 @@ func NewPendingReaper(deps PendingReaperDeps) *PendingReaper {
 // reports. Returns the number of intents that completed (committed or
 // dropped) and the number that failed (left for the next tick).
 func (r *PendingReaper) ProcessPendingQueue(ctx context.Context) WorkSummary {
-	ctx, span := telemetry.StartSpan(ctx, "ProcessPendingQueue",
-		telemetry.AttrOperation.String("pending_queue"),
-	)
-	defer span.End()
+	return runTickCycle(ctx, "ProcessPendingQueue", "pending_queue", r.processPendingQueue)
+}
 
+// processPendingQueue is the body of ProcessPendingQueue after the span is open.
+func (r *PendingReaper) processPendingQueue(ctx context.Context) WorkSummary {
 	cutoff := time.Now().Add(-r.minAge)
 	intents, err := r.store.GetStalePending(ctx, cutoff, r.batchSize)
 	if err != nil {
@@ -179,15 +173,13 @@ func (r *PendingReaper) resolveOneIntent(ctx context.Context, p *core.PendingObj
 // from the reaper's point of view.
 type probeOutcome int
 
-// probeFound and related constants used by this package.
+// The HEAD outcomes a probe can report. An error is inconclusive rather than
+// negative: the bytes may well be there, so the intent is left for a later tick
+// instead of being resolved on a guess.
 const (
-	// probeFound means HEAD returned 200; bytes are present on the backend.
-	probeFound probeOutcome = iota
-	// probeNotFound means HEAD returned 404; bytes were never written.
-	probeNotFound
-	// probeError means HEAD returned a non-404 error; the result is
-	// inconclusive and the intent must be left for a later tick.
-	probeError
+	probeFound    probeOutcome = iota // 200: the bytes are on the backend
+	probeNotFound                     // 404: they were never written
+	probeError                        // anything else: inconclusive
 )
 
 // probeBackend HEADs the destination backend and classifies the result.
@@ -195,7 +187,7 @@ const (
 // outcome so usage accounting remains accurate during reaper sweeps.
 func (r *PendingReaper) probeBackend(ctx context.Context, be backend.ObjectBackend, p *core.PendingObject) probeOutcome {
 	_, err := r.deps.HeadWithTimeout(ctx, be, p.ObjectKey)
-	r.deps.Acct().APICall(p.BackendName)
+	r.deps.Acct().APICall(s3op.HeadObject, p.BackendName)
 
 	switch {
 	case err == nil:
@@ -238,7 +230,7 @@ func (r *PendingReaper) dropIntent(ctx context.Context, p *core.PendingObject, r
 // handlers. Each handler updates metrics, audit logs, and the resolved/
 // failed counters as appropriate.
 func (r *PendingReaper) handlePromotion(ctx context.Context, p *core.PendingObject) ItemOutcome {
-	result, displaced, err := r.store.PromotePending(ctx, p)
+	result, displaced, _, err := r.store.PromotePending(ctx, p)
 	if err != nil {
 		r.log.ErrorContext(ctx, "promote pending intent",
 			"intent_id", p.IntentID, "error", err, logfmt.Outcome(logfmt.OutcomeError))
@@ -246,10 +238,21 @@ func (r *PendingReaper) handlePromotion(ctx context.Context, p *core.PendingObje
 	}
 	switch result {
 	case core.PendingPromoteCommitted:
+		// The promotion charged the bytes and cleared the intent in one
+		// transaction, moving them from what the backend has in flight to what
+		// it stores without either total ever missing them.
 		r.onPromoteCommitted(ctx, p, displaced)
 		return ItemSucceeded
 	case core.PendingPromoteSuperseded:
 		r.onPromoteSuperseded(ctx, p)
+		return ItemSucceeded
+	case core.PendingPromoteCompanionKept:
+		r.onCompanionResolved(ctx, p, "companion_kept", nil)
+		return ItemSucceeded
+	case core.PendingPromoteCompanionDiscarded:
+		// Nothing recorded these bytes and nothing can vouch for them, so they
+		// go and the replication worker rebuilds the copy from one we trust.
+		r.onCompanionResolved(ctx, p, "companion_discarded", displaced)
 		return ItemSucceeded
 	case core.PendingPromoteAmbiguous:
 		r.onPromoteAmbiguous(ctx, p)
@@ -272,14 +275,38 @@ func (r *PendingReaper) onPromoteCommitted(ctx context.Context, p *core.PendingO
 		slog.String("intent_id", p.IntentID),
 		slog.Int("displaced_copies", len(displaced)),
 	)
+	r.removeDisplaced(ctx, p.ObjectKey, displaced)
+}
+
+// onCompanionResolved records an extra-copy intent the reaper settled without
+// recording a copy, and removes whatever bytes the store said to remove.
+func (r *PendingReaper) onCompanionResolved(ctx context.Context, p *core.PendingObject, outcome string, displaced []core.DeletedCopy) {
+	telemetry.PendingIntentsResolvedTotal.WithLabelValues(outcome).Inc()
+	audit.Log(ctx, "pending_reaper."+outcome,
+		slog.String("key", p.ObjectKey),
+		slog.String("backend", p.BackendName),
+		slog.String("intent_id", p.IntentID),
+	)
+	r.removeDisplaced(ctx, p.ObjectKey, displaced)
+}
+
+// removeDisplaced deletes bytes the resolution left without a row, falling back
+// to the cleanup queue when the backend refuses. A copy whose backend is no
+// longer registered is left alone: the fleet cannot orphan bytes on a backend it
+// does not know about.
+func (r *PendingReaper) removeDisplaced(ctx context.Context, key string, displaced []core.DeletedCopy) {
 	for _, dc := range displaced {
 		dcBackend, err := r.deps.GetBackend(dc.BackendName)
 		if err != nil {
 			r.log.WarnContext(ctx, "displaced copy backend not registered",
-				"backend", dc.BackendName, "key", p.ObjectKey)
+				"backend", dc.BackendName, "key", key)
 			continue
 		}
-		r.placement.DeleteOrEnqueue(ctx, dcBackend, dc.BackendName, p.ObjectKey, "overwrite_displaced", dc.SizeBytes)
+		reason := dc.Reason
+		if reason == "" {
+			reason = "overwrite_displaced"
+		}
+		r.placement.DeleteOrEnqueue(ctx, dcBackend, dc.BackendName, key, reason, dc.SizeBytes)
 	}
 }
 

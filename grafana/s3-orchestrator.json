@@ -73,54 +73,10 @@
     },
     {
       "type": "stat",
-      "id": 3,
-      "title": "Total Requests",
-      "gridPos": {
-        "x": 4,
-        "y": 1,
-        "w": 5,
-        "h": 4
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "targets": [
-        {
-          "expr": "sum(s3o_manager_requests_total)",
-          "legendFormat": "Total"
-        }
-      ],
-      "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "textMode": "value",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ]
-        }
-      },
-      "fieldConfig": {
-        "defaults": {
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "blue",
-                "value": null
-              }
-            ]
-          }
-        }
-      }
-    },
-    {
-      "type": "stat",
       "id": 4,
       "title": "Request Rate",
       "gridPos": {
-        "x": 9,
+        "x": 4,
         "y": 1,
         "w": 5,
         "h": 4
@@ -165,7 +121,7 @@
       "id": 5,
       "title": "Error Rate",
       "gridPos": {
-        "x": 14,
+        "x": 9,
         "y": 1,
         "w": 5,
         "h": 4
@@ -219,7 +175,7 @@
       "id": 6,
       "title": "Inflight Requests",
       "gridPos": {
-        "x": 19,
+        "x": 14,
         "y": 1,
         "w": 5,
         "h": 4
@@ -555,12 +511,92 @@
       }
     },
     {
+      "type": "timeseries",
+      "id": 135,
+      "title": "Write Claims Declined (backend full)",
+      "description": "Writes a backend refused for want of room. The headroom test is the insert that claims the space, against live rows, so this is the authoritative signal that a backend is full - not an in-memory estimate. A write declined here moved to the next candidate; when every candidate declines, the request fails with 507. Sustained non-zero on one backend means it needs capacity or a drain.",
+      "gridPos": {
+        "x": 0,
+        "y": 12,
+        "w": 12,
+        "h": 6
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum by (backend) (rate(s3o_quota_claims_declined_total[5m]))",
+          "legendFormat": "{{backend}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "fillOpacity": 10
+          }
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "id": 136,
+      "title": "Quota Drift Corrections",
+      "description": "Byte-total corrections applied by usage reconciliation. The counter now moves inside the same transaction that writes the object rows it summarizes, so it cannot drift from the ledger: this is expected to stay at zero for the life of the process. Any increase means a mutation path is storing bytes without charging them, and the reconcile is papering over it - investigate rather than ignore.",
+      "gridPos": {
+        "x": 12,
+        "y": 12,
+        "w": 12,
+        "h": 6
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(s3o_quota_reconcile_corrections_total[24h]))",
+          "legendFormat": "corrections (24h)"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "value",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "0",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
       "type": "row",
       "id": 12,
       "title": "Request Performance",
       "gridPos": {
         "x": 0,
-        "y": 12,
+        "y": 18,
         "w": 24,
         "h": 1
       },
@@ -572,7 +608,7 @@
       "title": "Request Rate by Method",
       "gridPos": {
         "x": 0,
-        "y": 13,
+        "y": 19,
         "w": 8,
         "h": 8
       },
@@ -619,7 +655,7 @@
       "title": "Request Duration (p50 / p95 / p99)",
       "gridPos": {
         "x": 8,
-        "y": 13,
+        "y": 19,
         "w": 8,
         "h": 8
       },
@@ -671,7 +707,7 @@
       "title": "Request / Response Size",
       "gridPos": {
         "x": 16,
-        "y": 13,
+        "y": 19,
         "w": 8,
         "h": 8
       },
@@ -716,7 +752,7 @@
       "title": "HTTP Requests by Status Code",
       "gridPos": {
         "x": 0,
-        "y": 21,
+        "y": 27,
         "w": 8,
         "h": 8
       },
@@ -758,12 +794,69 @@
       }
     },
     {
+      "type": "timeseries",
+      "id": 117,
+      "title": "Handler Panics Recovered",
+      "gridPos": {
+        "x": 0,
+        "y": 35,
+        "w": 24,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum by (route) (rate(s3o_http_panic_recovered_total[5m]))",
+          "legendFormat": "{{route}}"
+        }
+      ],
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.01
+              }
+            ]
+          }
+        }
+      },
+      "description": "A handler panicked and the recovery middleware returned 500. Any non-zero value is an alert; pivot via the matching http.PanicRecovered audit entry."
+    },
+    {
       "type": "row",
       "id": 16,
       "title": "Backend Operations",
       "gridPos": {
         "x": 0,
-        "y": 29,
+        "y": 43,
         "w": 24,
         "h": 1
       },
@@ -775,7 +868,7 @@
       "title": "Backend Request Rate",
       "gridPos": {
         "x": 0,
-        "y": 30,
+        "y": 44,
         "w": 8,
         "h": 8
       },
@@ -819,7 +912,7 @@
       "title": "Backend Duration (p95)",
       "gridPos": {
         "x": 8,
-        "y": 30,
+        "y": 44,
         "w": 8,
         "h": 8
       },
@@ -863,7 +956,7 @@
       "title": "Active Multipart Uploads",
       "gridPos": {
         "x": 16,
-        "y": 30,
+        "y": 44,
         "w": 8,
         "h": 8
       },
@@ -951,7 +1044,7 @@
       "title": "Manager Operations",
       "gridPos": {
         "x": 0,
-        "y": 38,
+        "y": 52,
         "w": 24,
         "h": 1
       },
@@ -959,55 +1052,11 @@
     },
     {
       "type": "timeseries",
-      "id": 21,
-      "title": "Manager Request Rate",
-      "gridPos": {
-        "x": 0,
-        "y": 39,
-        "w": 12,
-        "h": 8
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "targets": [
-        {
-          "expr": "sum by (operation, status) (rate(s3o_manager_requests_total[5m]))",
-          "legendFormat": "{{operation}} ({{status}})"
-        }
-      ],
-      "options": {
-        "tooltip": {
-          "mode": "multi"
-        },
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "mean",
-            "max"
-          ]
-        }
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "reqps",
-          "custom": {
-            "lineWidth": 2,
-            "fillOpacity": 10,
-            "showPoints": "never"
-          }
-        }
-      }
-    },
-    {
-      "type": "timeseries",
       "id": 22,
       "title": "Manager Duration (p95)",
       "gridPos": {
-        "x": 12,
-        "y": 39,
+        "x": 0,
+        "y": 53,
         "w": 12,
         "h": 8
       },
@@ -1051,7 +1100,7 @@
       "title": "Circuit Breaker & Degraded Mode",
       "gridPos": {
         "x": 0,
-        "y": 47,
+        "y": 61,
         "w": 24,
         "h": 1
       },
@@ -1063,7 +1112,7 @@
       "title": "Circuit Breaker State",
       "gridPos": {
         "x": 0,
-        "y": 48,
+        "y": 62,
         "w": 8,
         "h": 8
       },
@@ -1156,7 +1205,7 @@
       "title": "CB Transitions",
       "gridPos": {
         "x": 8,
-        "y": 48,
+        "y": 62,
         "w": 8,
         "h": 8
       },
@@ -1195,7 +1244,7 @@
       "title": "Degraded Mode Ops",
       "gridPos": {
         "x": 16,
-        "y": 48,
+        "y": 62,
         "w": 8,
         "h": 8
       },
@@ -1242,7 +1291,7 @@
       "title": "Replication",
       "gridPos": {
         "x": 0,
-        "y": 56,
+        "y": 70,
         "w": 24,
         "h": 1
       },
@@ -1254,7 +1303,7 @@
       "title": "Replication Pending",
       "gridPos": {
         "x": 0,
-        "y": 57,
+        "y": 71,
         "w": 5,
         "h": 6
       },
@@ -1307,7 +1356,7 @@
       "title": "Copies Created",
       "gridPos": {
         "x": 5,
-        "y": 57,
+        "y": 71,
         "w": 5,
         "h": 6
       },
@@ -1347,7 +1396,7 @@
       "title": "Replication Errors",
       "gridPos": {
         "x": 10,
-        "y": 57,
+        "y": 71,
         "w": 5,
         "h": 6
       },
@@ -1386,7 +1435,7 @@
       "title": "Replication Duration (p95)",
       "gridPos": {
         "x": 15,
-        "y": 57,
+        "y": 71,
         "w": 5,
         "h": 6
       },
@@ -1426,7 +1475,7 @@
       "title": "Replication Runs",
       "gridPos": {
         "x": 20,
-        "y": 57,
+        "y": 71,
         "w": 4,
         "h": 6
       },
@@ -1465,7 +1514,7 @@
       "title": "Health-Triggered Replica Copies",
       "gridPos": {
         "x": 0,
-        "y": 63,
+        "y": 77,
         "w": 8,
         "h": 6
       },
@@ -1500,12 +1549,174 @@
       }
     },
     {
+      "type": "timeseries",
+      "id": 137,
+      "title": "Copies Placed by the Write",
+      "description": "Further copies a write placed itself rather than leaving to the replicator, by what became of each. committed is the copy landing and being recorded. untrusted is a newer write taking the key while the copy was still uploading, so it was discarded and replication rebuilds it - each one costs a rebuild. failed is the backend refusing it. Zero across all three with the fan-out on means no write is placing extra copies at all.",
+      "gridPos": {
+        "x": 8,
+        "y": 77,
+        "w": 8,
+        "h": 6
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum by (outcome) (rate(s3o_replication_write_copies_total[5m]))",
+          "legendFormat": "{{outcome}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 20,
+            "showPoints": "never"
+          },
+          "unit": "cps"
+        }
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "id": 138,
+      "title": "Copies Committed per Write",
+      "description": "Mean copies a fan-out write ended up committing, counting the one that answered the client. This is the number that says whether the feature is working: sitting at replication.factor means writes reach it unaided, and drifting toward 1 means they are degrading to a single copy while the replicator quietly picks the difference back up. The panels either side say why.",
+      "gridPos": {
+        "x": 16,
+        "y": 77,
+        "w": 8,
+        "h": 6
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "rate(s3o_replication_write_copies_committed_sum[5m]) / rate(s3o_replication_write_copies_committed_count[5m])",
+          "legendFormat": "copies per write"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 20,
+            "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "id": 139,
+      "title": "Detached Uploads In Flight",
+      "description": "Writes whose further copies are still uploading after their client was answered. A healthy fleet sits at roughly the write rate times how long one copy takes - a handful. A rising floor is the signal a backend is slow rather than broken: nothing fails and nothing retries, the work just accumulates until the ceiling (write_path.parallel_copies.max_in_flight) turns the fan-out off.",
+      "gridPos": {
+        "x": 0,
+        "y": 83,
+        "w": 8,
+        "h": 6
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "s3o_detached_uploads_depth",
+          "legendFormat": "in flight"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 20,
+            "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "id": 140,
+      "title": "Fan-Out Skipped (no slot)",
+      "description": "Writes that placed a single copy because the in-flight ceiling was full, leaving the rest to the replicator. Every one costs exactly what the fan-out exists to avoid - a read of the object plus the source backend's egress - so a sustained rate means either max_in_flight is too low for the write rate or a backend is falling behind. The depth panel to the left says which.",
+      "gridPos": {
+        "x": 8,
+        "y": 83,
+        "w": 8,
+        "h": 6
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "rate(s3o_replication_write_fanout_skipped_total[5m])",
+          "legendFormat": "skipped/s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 20,
+            "showPoints": "never"
+          },
+          "unit": "cps"
+        }
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
       "type": "row",
       "id": 32,
       "title": "Usage Tracking",
       "gridPos": {
         "x": 0,
-        "y": 77,
+        "y": 89,
         "w": 24,
         "h": 1
       },
@@ -1517,8 +1728,8 @@
       "title": "Monthly API Requests",
       "gridPos": {
         "x": 0,
-        "y": 78,
-        "w": 8,
+        "y": 90,
+        "w": 6,
         "h": 6
       },
       "datasource": {
@@ -1600,9 +1811,9 @@
       "id": 34,
       "title": "Monthly Egress",
       "gridPos": {
-        "x": 8,
-        "y": 78,
-        "w": 8,
+        "x": 6,
+        "y": 90,
+        "w": 6,
         "h": 6
       },
       "datasource": {
@@ -1684,9 +1895,9 @@
       "id": 35,
       "title": "Monthly Ingress",
       "gridPos": {
-        "x": 16,
-        "y": 78,
-        "w": 8,
+        "x": 12,
+        "y": 90,
+        "w": 6,
         "h": 6
       },
       "datasource": {
@@ -1764,12 +1975,109 @@
       }
     },
     {
+      "type": "table",
+      "id": 129,
+      "title": "Request Pool Usage (% of limit)",
+      "description": "Per-pool share of the monthly request budget. Providers meter operations in classes with separate allowances, so this is the figure a backend is refused on - Monthly API Requests counts every call, including ones no budget charges. Unlimited pools are omitted.",
+      "gridPos": {
+        "x": 18,
+        "y": 90,
+        "w": 6,
+        "h": 6
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "100 * (s3o_usage_pool_requests / (s3o_usage_pool_limit > 0))",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "options": {
+        "showHeader": true,
+        "sortBy": [
+          {
+            "displayName": "Used",
+            "desc": true
+          }
+        ]
+      },
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true
+            },
+            "renameByName": {
+              "Value": "Used"
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Used"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percent"
+              },
+              {
+                "id": "custom.displayMode",
+                "value": "color-text"
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "thresholds"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "yellow",
+                      "value": 75
+                    },
+                    {
+                      "color": "orange",
+                      "value": 90
+                    },
+                    {
+                      "color": "red",
+                      "value": 100
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
       "type": "row",
       "id": 36,
       "title": "Rate Limiting & Rejections",
       "gridPos": {
         "x": 0,
-        "y": 84,
+        "y": 96,
         "w": 24,
         "h": 1
       },
@@ -1781,7 +2089,7 @@
       "title": "Usage Limit Rejections",
       "gridPos": {
         "x": 0,
-        "y": 85,
+        "y": 97,
         "w": 8,
         "h": 8
       },
@@ -1824,7 +2132,7 @@
       "title": "Rate Limit Rejections",
       "gridPos": {
         "x": 8,
-        "y": 85,
+        "y": 97,
         "w": 8,
         "h": 8
       },
@@ -1863,7 +2171,7 @@
       "title": "Admission Rejections",
       "gridPos": {
         "x": 16,
-        "y": 85,
+        "y": 97,
         "w": 8,
         "h": 8
       },
@@ -1902,8 +2210,8 @@
       "title": "Load Shedding",
       "gridPos": {
         "x": 0,
-        "y": 93,
-        "w": 8,
+        "y": 105,
+        "w": 6,
         "h": 8
       },
       "datasource": {
@@ -1940,9 +2248,9 @@
       "id": 66,
       "title": "Early Upload Rejections",
       "gridPos": {
-        "x": 8,
-        "y": 93,
-        "w": 8,
+        "x": 6,
+        "y": 105,
+        "w": 6,
         "h": 8
       },
       "datasource": {
@@ -1979,9 +2287,9 @@
       "id": 67,
       "title": "Write Failovers",
       "gridPos": {
-        "x": 16,
-        "y": 93,
-        "w": 8,
+        "x": 12,
+        "y": 105,
+        "w": 6,
         "h": 8
       },
       "datasource": {
@@ -2014,12 +2322,52 @@
       }
     },
     {
+      "type": "timeseries",
+      "id": 130,
+      "title": "CORS Preflights",
+      "description": "Browser preflights by outcome. Rejections climbing with no allowed series means the bucket's CORS rules do not cover the origin the application is served from, and every browser upload from it is failing.",
+      "gridPos": {
+        "x": 18,
+        "y": 105,
+        "w": 6,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "increase(s3o_cors_preflight_total[5m])",
+          "legendFormat": "{{result}}"
+        }
+      ],
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        }
+      }
+    },
+    {
       "type": "row",
       "id": 40,
       "title": "Rebalancer",
       "gridPos": {
         "x": 0,
-        "y": 101,
+        "y": 113,
         "w": 24,
         "h": 1
       },
@@ -2031,7 +2379,7 @@
       "title": "Rebalance Pending",
       "gridPos": {
         "x": 0,
-        "y": 102,
+        "y": 114,
         "w": 4,
         "h": 8
       },
@@ -2084,7 +2432,7 @@
       "title": "Rebalance Runs",
       "gridPos": {
         "x": 4,
-        "y": 102,
+        "y": 114,
         "w": 5,
         "h": 8
       },
@@ -2127,7 +2475,7 @@
       "title": "Objects / Bytes Moved",
       "gridPos": {
         "x": 9,
-        "y": 102,
+        "y": 114,
         "w": 5,
         "h": 8
       },
@@ -2189,7 +2537,7 @@
       "title": "Rebalance Duration (p95)",
       "gridPos": {
         "x": 14,
-        "y": 102,
+        "y": 114,
         "w": 5,
         "h": 8
       },
@@ -2229,7 +2577,7 @@
       "title": "Rebalance Skipped",
       "gridPos": {
         "x": 19,
-        "y": 102,
+        "y": 114,
         "w": 5,
         "h": 8
       },
@@ -2268,7 +2616,7 @@
       "title": "Drain & Lifecycle",
       "gridPos": {
         "x": 0,
-        "y": 110,
+        "y": 122,
         "w": 24,
         "h": 1
       },
@@ -2280,7 +2628,7 @@
       "title": "Drain Active",
       "gridPos": {
         "x": 0,
-        "y": 111,
+        "y": 123,
         "w": 6,
         "h": 6
       },
@@ -2350,7 +2698,7 @@
       "title": "Drain Objects / Bytes",
       "gridPos": {
         "x": 6,
-        "y": 111,
+        "y": 123,
         "w": 6,
         "h": 6
       },
@@ -2394,7 +2742,7 @@
       "title": "Lifecycle Deleted / Failed",
       "gridPos": {
         "x": 12,
-        "y": 111,
+        "y": 123,
         "w": 6,
         "h": 6
       },
@@ -2437,7 +2785,7 @@
       "title": "Lifecycle Runs",
       "gridPos": {
         "x": 18,
-        "y": 111,
+        "y": 123,
         "w": 6,
         "h": 6
       },
@@ -2476,7 +2824,7 @@
       "title": "Cleanup Queue & Audit",
       "gridPos": {
         "x": 0,
-        "y": 117,
+        "y": 129,
         "w": 24,
         "h": 1
       },
@@ -2488,7 +2836,7 @@
       "title": "Cleanup Queue Depth",
       "gridPos": {
         "x": 0,
-        "y": 118,
+        "y": 130,
         "w": 6,
         "h": 8
       },
@@ -2541,7 +2889,7 @@
       "title": "Cleanup Throughput",
       "gridPos": {
         "x": 6,
-        "y": 118,
+        "y": 130,
         "w": 6,
         "h": 8
       },
@@ -2592,7 +2940,7 @@
       "title": "Orphan Bytes per Backend",
       "gridPos": {
         "x": 12,
-        "y": 118,
+        "y": 130,
         "w": 6,
         "h": 8
       },
@@ -2653,7 +3001,7 @@
       "title": "Audit Events",
       "gridPos": {
         "x": 18,
-        "y": 118,
+        "y": 130,
         "w": 6,
         "h": 8
       },
@@ -2696,7 +3044,7 @@
       "title": "Encryption",
       "gridPos": {
         "x": 0,
-        "y": 126,
+        "y": 138,
         "w": 24,
         "h": 1
       },
@@ -2708,7 +3056,7 @@
       "title": "Encryption Operations",
       "gridPos": {
         "x": 0,
-        "y": 127,
+        "y": 139,
         "w": 8,
         "h": 8
       },
@@ -2751,7 +3099,7 @@
       "title": "Encryption Errors",
       "gridPos": {
         "x": 8,
-        "y": 127,
+        "y": 139,
         "w": 8,
         "h": 8
       },
@@ -2794,7 +3142,7 @@
       "title": "Encrypt Existing / Key Rotation",
       "gridPos": {
         "x": 16,
-        "y": 127,
+        "y": 139,
         "w": 8,
         "h": 8
       },
@@ -2841,7 +3189,7 @@
       "title": "Unknown KeyID Fallbacks",
       "gridPos": {
         "x": 0,
-        "y": 135,
+        "y": 147,
         "w": 8,
         "h": 6
       },
@@ -2885,12 +3233,69 @@
       }
     },
     {
+      "type": "timeseries",
+      "id": 116,
+      "title": "Encryption Flag Mismatches",
+      "gridPos": {
+        "x": 0,
+        "y": 153,
+        "w": 24,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum by (component) (rate(s3o_encryption_flag_mismatch_total[5m]))",
+          "legendFormat": "{{component}}"
+        }
+      ],
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.01
+              }
+            ]
+          }
+        }
+      },
+      "description": "An object's stored bytes disagree with its recorded encryption flag, so that copy cannot be read or hashed. Any non-zero value is an alert."
+    },
+    {
       "type": "row",
       "id": 78,
       "title": "Object Data Cache",
       "gridPos": {
         "x": 0,
-        "y": 142,
+        "y": 161,
         "w": 24,
         "h": 1
       },
@@ -2902,7 +3307,7 @@
       "title": "Cache Hit / Miss Rate",
       "gridPos": {
         "x": 0,
-        "y": 143,
+        "y": 162,
         "w": 8,
         "h": 8
       },
@@ -2949,7 +3354,7 @@
       "title": "Cache Hit Ratio",
       "gridPos": {
         "x": 8,
-        "y": 143,
+        "y": 162,
         "w": 4,
         "h": 8
       },
@@ -2993,7 +3398,7 @@
       "title": "Cache Size",
       "gridPos": {
         "x": 12,
-        "y": 143,
+        "y": 162,
         "w": 6,
         "h": 8
       },
@@ -3059,7 +3464,7 @@
       "title": "Cache Evictions",
       "gridPos": {
         "x": 18,
-        "y": 143,
+        "y": 162,
         "w": 6,
         "h": 8
       },
@@ -3102,7 +3507,7 @@
       "title": "Integrity Verification",
       "gridPos": {
         "x": 0,
-        "y": 151,
+        "y": 170,
         "w": 24,
         "h": 1
       },
@@ -3114,7 +3519,7 @@
       "title": "Integrity Checks",
       "gridPos": {
         "x": 0,
-        "y": 152,
+        "y": 171,
         "w": 12,
         "h": 8
       },
@@ -3157,7 +3562,7 @@
       "title": "Integrity Errors",
       "gridPos": {
         "x": 12,
-        "y": 152,
+        "y": 171,
         "w": 12,
         "h": 8
       },
@@ -3208,12 +3613,184 @@
       }
     },
     {
+      "type": "timeseries",
+      "id": 113,
+      "title": "Verification Coverage (oldest unverified)",
+      "gridPos": {
+        "x": 0,
+        "y": 179,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "s3o_integrity_oldest_unverified_seconds",
+          "legendFormat": "oldest unverified"
+        }
+      ],
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 604800
+              }
+            ]
+          },
+          "unit": "s"
+        }
+      },
+      "description": "How long ago the least recently verified copy was checked. Should sit flat around the period implied by scrubber_interval and scrubber_batch_size; a steadily climbing line means the sweep cannot keep pace with the fleet."
+    },
+    {
+      "type": "timeseries",
+      "id": 114,
+      "title": "Copies Never Verified",
+      "gridPos": {
+        "x": 12,
+        "y": 179,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "s3o_integrity_never_verified_copies",
+          "legendFormat": "never verified"
+        },
+        {
+          "expr": "s3o_integrity_deferred_copies",
+          "legendFormat": "unreachable (backend over limit)"
+        }
+      ],
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        }
+      },
+      "description": "Copies with a content hash the scrubber has not reached yet. Stays non-zero on a fleet being written to, since new copies queue behind older data by design. Alert on a climbing value, not on it being above zero."
+    },
+    {
+      "type": "timeseries",
+      "id": 115,
+      "title": "Unreadable Imports",
+      "gridPos": {
+        "x": 0,
+        "y": 187,
+        "w": 24,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(s3o_import_classified_total{decision=\"unreadable\"}[5m]))",
+          "legendFormat": "unreadable"
+        }
+      ],
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.01
+              }
+            ]
+          }
+        }
+      },
+      "description": "Reconcile or sync found an encrypted object whose key is gone. Unrecoverable: restore from elsewhere or delete it. Any non-zero rate wants a human."
+    },
+    {
       "type": "row",
       "id": 61,
       "title": "Redis",
       "gridPos": {
         "x": 0,
-        "y": 160,
+        "y": 195,
         "w": 24,
         "h": 1
       },
@@ -3225,7 +3802,7 @@
       "title": "Redis Fallback Active",
       "gridPos": {
         "x": 0,
-        "y": 161,
+        "y": 196,
         "w": 4,
         "h": 6
       },
@@ -3290,7 +3867,7 @@
       "title": "Redis Operations",
       "gridPos": {
         "x": 4,
-        "y": 161,
+        "y": 196,
         "w": 20,
         "h": 6
       },
@@ -3334,7 +3911,7 @@
       "title": "Over-Replication Cleanup",
       "gridPos": {
         "x": 0,
-        "y": 167,
+        "y": 202,
         "w": 24,
         "h": 1
       },
@@ -3346,7 +3923,7 @@
       "title": "Over-Replicated Objects",
       "gridPos": {
         "x": 0,
-        "y": 168,
+        "y": 203,
         "w": 4,
         "h": 6
       },
@@ -3407,7 +3984,7 @@
       "title": "Excess Copies Removed",
       "gridPos": {
         "x": 4,
-        "y": 168,
+        "y": 203,
         "w": 7,
         "h": 6
       },
@@ -3455,7 +4032,7 @@
       "title": "Cleanup Errors",
       "gridPos": {
         "x": 11,
-        "y": 168,
+        "y": 203,
         "w": 7,
         "h": 6
       },
@@ -3503,7 +4080,7 @@
       "title": "Cleanup Duration (p95)",
       "gridPos": {
         "x": 18,
-        "y": 168,
+        "y": 203,
         "w": 6,
         "h": 6
       },
@@ -3547,11 +4124,11 @@
     },
     {
       "type": "row",
-      "id": 73,
+      "id": 131,
       "title": "Pending PUT Intents",
       "gridPos": {
         "x": 0,
-        "y": 174,
+        "y": 209,
         "w": 24,
         "h": 1
       },
@@ -3559,12 +4136,12 @@
     },
     {
       "type": "stat",
-      "id": 74,
+      "id": 132,
       "title": "Pending Intents Depth",
-      "description": "Unresolved PUT intents waiting for the reaper. Steady-state should be 0; persistent non-zero indicates the reaper is not draining (DB outage, backend HEAD failures, or operator-review-required ambiguous rows).",
+      "description": "Unresolved PUT intents. An intent holds its bytes against the backend's headroom for as long as it lives, so a stuck one is space no write can use, not just a commit awaiting repair. Steady-state should be 0; persistent non-zero indicates the reaper is not draining (DB outage, backend HEAD failures, or operator-review-required ambiguous rows).",
       "gridPos": {
         "x": 0,
-        "y": 175,
+        "y": 210,
         "w": 6,
         "h": 8
       },
@@ -3613,12 +4190,12 @@
     },
     {
       "type": "timeseries",
-      "id": 75,
+      "id": 133,
       "title": "Pending Intent Throughput",
       "description": "Rate of intents enqueued by the write path versus resolved by status. Steady state has enqueued and committed close to equal; promoted/dropped events indicate the reaper is repairing failed commits.",
       "gridPos": {
         "x": 6,
-        "y": 175,
+        "y": 210,
         "w": 12,
         "h": 8
       },
@@ -3661,12 +4238,12 @@
     },
     {
       "type": "stat",
-      "id": 76,
+      "id": 134,
       "title": "Ambiguous Intents (lifetime)",
       "description": "Lifetime count of pending intents the reaper refused to promote because the destination already held a row for the same key. These rows stay in the database for operator review; any non-zero value warrants investigation.",
       "gridPos": {
         "x": 18,
-        "y": 175,
+        "y": 210,
         "w": 6,
         "h": 8
       },
@@ -3715,7 +4292,7 @@
       "title": "Authentication",
       "gridPos": {
         "x": 0,
-        "y": 183,
+        "y": 218,
         "w": 24,
         "h": 1
       },
@@ -3728,7 +4305,7 @@
       "description": "Rate of streaming-SigV4 PUTs received, by AWS streaming variant.",
       "gridPos": {
         "x": 0,
-        "y": 184,
+        "y": 219,
         "w": 12,
         "h": 8
       },
@@ -3772,7 +4349,7 @@
       "description": "Rate of streaming-SigV4 PUTs rejected mid-stream, by reason. Any non-zero rate is either a misconfigured client or a tampered request.",
       "gridPos": {
         "x": 12,
-        "y": 184,
+        "y": 219,
         "w": 12,
         "h": 8
       },
@@ -3816,7 +4393,7 @@
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 193,
+        "y": 227,
         "w": 24,
         "h": 1
       }
@@ -3827,7 +4404,7 @@
       "title": "Worker tick rate by service & result",
       "gridPos": {
         "x": 0,
-        "y": 194,
+        "y": 228,
         "w": 12,
         "h": 8
       },
@@ -3848,7 +4425,7 @@
       "title": "Consecutive failures per worker (gauge)",
       "gridPos": {
         "x": 12,
-        "y": 194,
+        "y": 228,
         "w": 12,
         "h": 8
       },
@@ -3869,7 +4446,7 @@
       "title": "Seconds since last successful tick",
       "gridPos": {
         "x": 0,
-        "y": 202,
+        "y": 236,
         "w": 12,
         "h": 8
       },
@@ -3890,7 +4467,7 @@
       "title": "Worker admission rejections",
       "gridPos": {
         "x": 12,
-        "y": 202,
+        "y": 236,
         "w": 12,
         "h": 8
       },
@@ -3912,7 +4489,7 @@
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 210,
+        "y": 244,
         "w": 24,
         "h": 1
       }
@@ -3923,7 +4500,7 @@
       "title": "Notification queue depth",
       "gridPos": {
         "x": 0,
-        "y": 211,
+        "y": 245,
         "w": 6,
         "h": 4
       },
@@ -3943,7 +4520,7 @@
       "title": "Notifications sent / failed / dropped",
       "gridPos": {
         "x": 6,
-        "y": 211,
+        "y": 245,
         "w": 18,
         "h": 8
       },
@@ -3972,7 +4549,7 @@
       "title": "Notification delivery duration (p95)",
       "gridPos": {
         "x": 0,
-        "y": 219,
+        "y": 253,
         "w": 12,
         "h": 8
       },
@@ -3993,7 +4570,7 @@
       "title": "Notification store errors",
       "gridPos": {
         "x": 12,
-        "y": 219,
+        "y": 253,
         "w": 12,
         "h": 8
       },
@@ -4015,7 +4592,7 @@
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 227,
+        "y": 261,
         "w": 24,
         "h": 1
       }
@@ -4026,7 +4603,7 @@
       "title": "Cleanup DLQ depth",
       "gridPos": {
         "x": 0,
-        "y": 228,
+        "y": 262,
         "w": 6,
         "h": 4
       },
@@ -4046,7 +4623,7 @@
       "title": "Rows graduated to DLQ by backend",
       "gridPos": {
         "x": 6,
-        "y": 228,
+        "y": 262,
         "w": 18,
         "h": 8
       },
@@ -4067,7 +4644,7 @@
       "title": "Cleanup enqueue failures (untracked-orphan risk)",
       "gridPos": {
         "x": 0,
-        "y": 236,
+        "y": 270,
         "w": 24,
         "h": 8
       },
@@ -4085,11 +4662,11 @@
     {
       "type": "row",
       "id": 100,
-      "title": "Coverage Backfill",
+      "title": "Edge Cases & Admin Ops",
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 244,
+        "y": 278,
         "w": 24,
         "h": 1
       }
@@ -4097,10 +4674,10 @@
     {
       "type": "timeseries",
       "id": 101,
-      "title": "Drain race aborts (#653)",
+      "title": "Drain race aborts",
       "gridPos": {
         "x": 0,
-        "y": 245,
+        "y": 279,
         "w": 12,
         "h": 8
       },
@@ -4120,8 +4697,8 @@
       "id": 103,
       "title": "Circuit breaker internal errors",
       "gridPos": {
-        "x": 0,
-        "y": 253,
+        "x": 12,
+        "y": 279,
         "w": 12,
         "h": 8
       },
@@ -4141,8 +4718,8 @@
       "id": 104,
       "title": "Admission client cancellations",
       "gridPos": {
-        "x": 12,
-        "y": 253,
+        "x": 0,
+        "y": 287,
         "w": 12,
         "h": 8
       },
@@ -4162,8 +4739,8 @@
       "id": 105,
       "title": "Decrypt-existing admin op",
       "gridPos": {
-        "x": 0,
-        "y": 261,
+        "x": 12,
+        "y": 287,
         "w": 12,
         "h": 8
       },
@@ -4183,8 +4760,8 @@
       "id": 106,
       "title": "Cache admin invalidations & flushes",
       "gridPos": {
-        "x": 12,
-        "y": 261,
+        "x": 0,
+        "y": 295,
         "w": 12,
         "h": 8
       },
@@ -4208,8 +4785,8 @@
       "id": 107,
       "title": "Over-replication cleaner runs",
       "gridPos": {
-        "x": 0,
-        "y": 269,
+        "x": 12,
+        "y": 295,
         "w": 12,
         "h": 8
       },
@@ -4225,33 +4802,12 @@
       ]
     },
     {
-      "type": "stat",
-      "id": 108,
-      "title": "Objects tracked (total)",
-      "gridPos": {
-        "x": 12,
-        "y": 269,
-        "w": 12,
-        "h": 4
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "targets": [
-        {
-          "expr": "sum(s3o_objects_count)",
-          "legendFormat": "objects"
-        }
-      ]
-    },
-    {
       "type": "row",
       "id": 109,
       "title": "Degraded-Mode Hardening",
       "gridPos": {
         "x": 0,
-        "y": 273,
+        "y": 303,
         "w": 24,
         "h": 1
       },
@@ -4264,7 +4820,7 @@
       "description": "1 when the DB circuit breaker is open or half-open; reads broadcast across backends.",
       "gridPos": {
         "x": 0,
-        "y": 274,
+        "y": 304,
         "w": 6,
         "h": 4
       },
@@ -4280,20 +4836,40 @@
       ],
       "options": {
         "reduceOptions": {
-          "calcs": ["lastNotNull"]
+          "calcs": [
+            "lastNotNull"
+          ]
         },
         "colorMode": "background"
       },
       "fieldConfig": {
         "defaults": {
           "mappings": [
-            { "type": "value", "options": { "0": { "text": "normal", "color": "green" }, "1": { "text": "DEGRADED", "color": "red" } } }
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "normal",
+                  "color": "green"
+                },
+                "1": {
+                  "text": "DEGRADED",
+                  "color": "red"
+                }
+              }
+            }
           ],
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "green", "value": null },
-              { "color": "red", "value": 1 }
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
             ]
           }
         }
@@ -4306,7 +4882,7 @@
       "description": "Wall-clock p50/p95/p99 of degraded-mode broadcast reads, by terminal outcome.",
       "gridPos": {
         "x": 6,
-        "y": 274,
+        "y": 304,
         "w": 18,
         "h": 8
       },
@@ -4346,7 +4922,7 @@
       "description": "Rate of broadcasts where backends disagreed: some returned 404 while others failed with non-404 errors. Persistent non-zero values suggest provider divergence or a transient backend storm hidden under not_found.",
       "gridPos": {
         "x": 0,
-        "y": 282,
+        "y": 312,
         "w": 24,
         "h": 6
       },
@@ -4362,6 +4938,557 @@
       ],
       "fieldConfig": {
         "defaults": {
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "id": 118,
+      "title": "Broadcast Drain Timeouts",
+      "gridPos": {
+        "x": 0,
+        "y": 318,
+        "w": 24,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(s3o_degraded_broadcast_drain_timeout_total[5m]))",
+          "legendFormat": "drain timeouts"
+        }
+      ],
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.01
+              }
+            ]
+          }
+        }
+      },
+      "description": "Loser-drain goroutines that gave up at the bounded timeout because a cancelled probe never returned. Non-zero means a backend is stranding goroutines under degraded fan-out."
+    },
+    {
+      "type": "row",
+      "id": 119,
+      "title": "Compression",
+      "gridPos": {
+        "x": 0,
+        "y": 326,
+        "w": 24,
+        "h": 1
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "stat",
+      "id": 120,
+      "title": "Compression ratio (stored/logical)",
+      "gridPos": {
+        "x": 0,
+        "y": 327,
+        "w": 6,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(s3o_compression_stored_bytes_total[30m])) / sum(rate(s3o_compression_logical_bytes_total[30m]))"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 3
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "id": 121,
+      "title": "Bytes saved (30m)",
+      "gridPos": {
+        "x": 6,
+        "y": 327,
+        "w": 6,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(s3o_compression_logical_bytes_total[30m])) - sum(increase(s3o_compression_stored_bytes_total[30m]))"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "id": 122,
+      "title": "Read amplification (fetched/served)",
+      "gridPos": {
+        "x": 12,
+        "y": 327,
+        "w": 6,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(s3o_compression_fetched_bytes_total[30m])) / sum(rate(s3o_compression_served_bytes_total[30m]))"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 2
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "id": 123,
+      "title": "Codec errors (30m)",
+      "gridPos": {
+        "x": 18,
+        "y": 327,
+        "w": 6,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(s3o_compression_errors_total[30m]))"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {}
+      }
+    },
+    {
+      "type": "timeseries",
+      "id": 124,
+      "title": "Compressed write volume",
+      "gridPos": {
+        "x": 0,
+        "y": 331,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(s3o_compression_logical_bytes_total[5m]))",
+          "legendFormat": "logical in"
+        },
+        {
+          "expr": "sum(rate(s3o_compression_stored_bytes_total[5m]))",
+          "legendFormat": "stored out"
+        }
+      ],
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          },
+          "unit": "Bps"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "id": 125,
+      "title": "Per-object compression ratio",
+      "gridPos": {
+        "x": 12,
+        "y": 331,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(s3o_compression_ratio_bucket[5m])))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.9, sum by (le) (rate(s3o_compression_ratio_bucket[5m])))",
+          "legendFormat": "p90"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(s3o_compression_ratio_bucket[5m])))",
+          "legendFormat": "p99"
+        }
+      ],
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "id": 126,
+      "title": "Objects stored verbatim, by reason",
+      "gridPos": {
+        "x": 0,
+        "y": 339,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum by (reason) (rate(s3o_compression_skipped_total[5m]))",
+          "legendFormat": "{{reason}}"
+        }
+      ],
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "id": 127,
+      "title": "Codec errors by operation",
+      "gridPos": {
+        "x": 12,
+        "y": 339,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum by (operation) (rate(s3o_compression_errors_total[5m]))",
+          "legendFormat": "{{operation}}"
+        }
+      ],
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "id": 128,
+      "title": "Bulk pass progress",
+      "gridPos": {
+        "x": 0,
+        "y": 347,
+        "w": 24,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum by (status) (rate(s3o_compress_existing_objects_total[5m]))",
+          "legendFormat": "compress {{status}}"
+        },
+        {
+          "expr": "sum by (status) (rate(s3o_decompress_existing_objects_total[5m]))",
+          "legendFormat": "decompress {{status}}"
+        }
+      ],
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        }
+      }
+    },
+    {
+      "type": "row",
+      "id": 141,
+      "title": "Fleet",
+      "gridPos": {
+        "x": 0,
+        "y": 355,
+        "w": 24,
+        "h": 1
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "stat",
+      "id": 142,
+      "title": "Instances Up",
+      "description": "Scrape targets answering. Every background pass is advisory-locked, so a second instance duplicates no work; what it buys is surviving the loss of the first.",
+      "gridPos": {
+        "x": 0,
+        "y": 356,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "count(up{job=\"s3-orchestrator\"} == 1)",
+          "legendFormat": "instances"
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "green",
+                "value": 2
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Request rate by instance",
+      "id": 143,
+      "description": "Whether the load balancer is spreading requests. Two instances taking an even share is the point; one taking all of them is redundancy that has never been exercised.",
+      "gridPos": {
+        "x": 4,
+        "y": 356,
+        "w": 10,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum by (instance) (rate(s3o_manager_requests_total[5m]))",
+          "legendFormat": "{{instance}}"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Worker ticks skipped (lock held elsewhere)",
+      "id": 144,
+      "description": "A tick another instance was already inside. Steady skips are the advisory locks doing their job; zero across every service while two instances run means one is not ticking at all.",
+      "gridPos": {
+        "x": 14,
+        "y": 356,
+        "w": 10,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum by (service) (rate(s3o_worker_ticks_total{result=\"skipped\"}[15m]))",
+          "legendFormat": "{{service}}"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
           "custom": {
             "lineWidth": 2,
             "fillOpacity": 10,

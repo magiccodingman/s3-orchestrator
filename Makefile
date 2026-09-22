@@ -10,6 +10,9 @@
 REGISTRY   ?= $(or $(DOCKER_REGISTRY),registry.example.com)
 IMAGE      := s3-orchestrator
 VERSION    ?= $(shell cat .version)
+# Debian versions carry no leading v, and goreleaser's snapshot template reads
+# this rather than deriving a version from the newest git tag.
+DEB_VERSION := $(patsubst v%,%,$(VERSION))
 
 FULL_TAG   := $(REGISTRY)/$(IMAGE):$(VERSION)
 PLATFORMS  := linux/amd64,linux/arm64
@@ -96,6 +99,28 @@ push: builder ## Build and push multi-arch images to registry
 generate: ## Generate sqlc query code and interface mocks
 	go tool sqlc generate
 	go generate ./...
+	@$(MAKE) --no-print-directory strip-mock-package-docs
+
+# mockgen writes "Package X is a generated GoMock package." above every package
+# clause. In a package whose mocks are not _test.go files that comment is a real
+# package comment, and go/doc concatenates it onto the one in doc.go. Strip it
+# from the non-test mocks so doc.go stays the only package comment.
+strip-mock-package-docs:
+	@for f in $$(git ls-files '*.go' | grep -v '_test\.go$$' | xargs grep -l 'is a generated GoMock package\.'); do \
+		perl -0pi -e 's{\n// Package \w+ is a generated GoMock package\.\n(package )}{\n$$1}' $$f; \
+		echo "  stripped mockgen package comment: $$f"; \
+	done
+
+# cloc counts what is written here, not what is vendored into the tree. It does
+# not read .gitignore, so --vcs=git is what restricts it to tracked files and
+# keeps an installed node_modules out of the total; without it the worker's
+# dependencies read as hundreds of thousands of lines of TypeScript.
+#
+# The theme and the rendered site are tracked but are not this project's code:
+# they carry vendored mermaid, MathJax and swagger-ui bundles, which is the same
+# exclusion sonar-project.properties already makes for web/**.
+cloc: ## Count the lines this project actually holds, excluding vendored code
+	cloc . --vcs=git --exclude-dir=node_modules,themes,public
 
 test: ## Run Go tests with coverage
 	go test -race -cover ./...
@@ -111,12 +136,79 @@ check: ## Run fast local checks for contributor iteration
 	$(MAKE) vet
 	$(MAKE) doc-stub-check
 
+# Keep in sync with the version pinned in .github/workflows/ci.yml.
+GOLANGCI_VERSION ?= v2.13.0
+GOLANGCI := go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_VERSION)
+
+# Which modernizers exist is decided by this pin; which ones apply is decided
+# by the go directive in go.mod, so only this has to be bumped by hand.
+GOPLS_VERSION ?= v0.22.0
+
+# loadtest and the Terraform provider are separate Go modules, so the root ./...
+# never reaches them and they would go unlinted entirely. Every module has to be
+# named explicitly.
+GO_MODULE_DIRS := . loadtest terraform/terraform-provider-s3-orchestrator
+
 lint: ## Run Go linter
-	go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 run ./...
+	@for dir in $(GO_MODULE_DIRS); do \
+		echo "==> lint $$dir"; \
+		(cd $$dir && $(GOLANGCI) run ./...) || exit 1; \
+	done
+
+fmt: ## Apply the formatting lint enforces (gofmt + goimports)
+	@for dir in $(GO_MODULE_DIRS); do \
+		echo "==> fmt $$dir"; \
+		(cd $$dir && $(GOLANGCI) fmt ./...) || exit 1; \
+	done
 
 modernize: ## Report gopls modernization/hygiene hints (skips generated files)
-	GOFLAGS=-tags=integration go run golang.org/x/tools/gopls@v0.22.0 check -severity=hint \
+	GOFLAGS=-tags=integration go run golang.org/x/tools/gopls@$(GOPLS_VERSION) check -severity=hint \
 		$$(git ls-files '*.go' | xargs grep -L 'DO NOT EDIT')
+
+openapi: ## Regenerate docs/openapi.yaml from the admin route table
+	go test ./internal/transport/admin/ -run TestOpenAPISpec_MatchesRouteTable -update
+
+# The oasdiff pin lives here alone; CI invokes this target rather than
+# repeating the version, so the two cannot drift apart.
+OASDIFF_VERSION ?= v1.26.1
+OASDIFF_BASE    ?= origin/main
+OASDIFF_FORMAT  ?= text
+
+openapi-breaking: ## Report admin API contract breaks against OASDIFF_BASE
+	@git show $(OASDIFF_BASE):docs/openapi.yaml > /tmp/openapi-base.yaml
+	@go run github.com/oasdiff/oasdiff@$(OASDIFF_VERSION) breaking \
+		/tmp/openapi-base.yaml docs/openapi.yaml -f $(OASDIFF_FORMAT)
+
+# The registry renders the provider's documentation from Markdown committed in
+# its docs/ directory, so it is generated and checked in rather than built at
+# publish time. Content comes from the schema's descriptions and the examples
+# directory, which is why both are worth writing well.
+#
+# The name is passed explicitly: it is otherwise taken from the directory, which
+# says s3-orchestrator where every resource type says s3orchestrator.
+provider-docs: ## Regenerate the Terraform provider's registry documentation
+	cd terraform/terraform-provider-s3-orchestrator && go tool tfplugindocs generate --provider-name s3orchestrator
+
+# The registry only reads repositories named after the provider, which this one
+# is not, so the provider directory is mirrored to one that is. git subtree
+# rewrites it as that repository's whole history, and the tag pushed afterwards
+# is what the mirror's release workflow builds from.
+#
+# The tag is created through the API rather than pushed, because a local tag
+# names a commit in this repository and the mirror has no such commit.
+#
+# Documentation is regenerated first and the target stops if that changed
+# anything: the registry renders the committed docs/, so publishing a tag whose
+# documentation was never regenerated ships pages describing the last release.
+PROVIDER_PREFIX := terraform/terraform-provider-s3-orchestrator
+PROVIDER_REPO   ?= afreidah/terraform-provider-s3-orchestrator
+PROVIDER_REMOTE ?= mirror
+
+provider-publish: provider-docs ## Mirror the provider subtree and tag it, which releases it to the registry
+	@git diff --quiet -- $(PROVIDER_PREFIX)/docs || { echo "provider docs were stale; commit the regenerated docs/ first"; exit 1; }
+	@git remote get-url $(PROVIDER_REMOTE) >/dev/null 2>&1 || git remote add $(PROVIDER_REMOTE) git@github.com:$(PROVIDER_REPO).git
+	git subtree push --prefix=$(PROVIDER_PREFIX) $(PROVIDER_REMOTE) main
+	gh api repos/$(PROVIDER_REPO)/git/refs -f ref=refs/tags/$(VERSION) -f sha=$$(git ls-remote $(PROVIDER_REMOTE) refs/heads/main | cut -f1)
 
 doc-stub-check: ## Fail if tautological '// Foo foo.' doc-comment stubs reappear
 	bash scripts/check-doc-stubs.sh
@@ -204,11 +296,17 @@ bench-auth: ## Run auth hot-path benchmarks (SigV4, signing key cache, token aut
 bench-crypto: ## Run encryption throughput benchmarks (encrypt, decrypt, round-trip)
 	go test -bench=Benchmark -benchmem -count=$(BENCH_COUNT) -benchtime=$(BENCH_TIME) -run='^$$' -timeout=10m ./internal/encryption/
 
+bench-compression: ## Run compression throughput benchmarks (encode, decode, incompressible vs compressible)
+	go test -bench=Benchmark -benchmem -count=$(BENCH_COUNT) -benchtime=$(BENCH_TIME) -run='^$$' -timeout=10m ./internal/compression/
+
 bench-cache: ## Run cache and buffer pool benchmarks (LocationCache, TTLCache, bufpool)
-	go test -bench=Benchmark -benchmem -count=$(BENCH_COUNT) -benchtime=$(BENCH_TIME) -run='^$$' -timeout=10m ./internal/proxy/ ./internal/util/syncutil/ ./internal/util/bufpool/
+	go test -bench=Benchmark -benchmem -count=$(BENCH_COUNT) -benchtime=$(BENCH_TIME) -run='^$$' -timeout=10m ./internal/proxy/object/ ./internal/util/syncutil/ ./internal/util/bufpool/
 
 bench-usage: ## Run usage tracking benchmarks (WithinLimits, Record)
 	go test -bench=Benchmark -benchmem -count=$(BENCH_COUNT) -benchtime=$(BENCH_TIME) -run='^$$' -timeout=10m ./internal/counter/
+
+bench-quota: ## Run striped quota benchmarks (requires Docker — stripe fan-out, claim admit/decline)
+	go test -bench=Benchmark -benchmem -count=$(BENCH_COUNT) -benchtime=$(BENCH_TIME) -run='^$$' -timeout=30m -tags integration ./internal/store/postgres/
 
 bench-integration: ## Run integration benchmarks (requires Docker — PutObject, ListObjects, Rebalance)
 	go test -bench=Benchmark -benchmem -count=$(BENCH_COUNT) -benchtime=$(BENCH_TIME) -run='^$$' -timeout=30m -tags integration ./internal/integration/
@@ -237,7 +335,9 @@ fuzz: ## Run fuzz tests (override: FUZZ_TIME=5m make fuzz)
 	go test -fuzz=FuzzExtractClientIP -fuzztime=$(FUZZ_TIME) ./internal/transport/s3api/
 	go test -fuzz=FuzzValidMetadataToken -fuzztime=$(FUZZ_TIME) ./internal/transport/s3api/
 	go test -fuzz=FuzzLoginThrottle_RemoteAddr -fuzztime=$(FUZZ_TIME) ./internal/transport/httputil/
-	go test -fuzz=FuzzParsePlaintextRange -fuzztime=$(FUZZ_TIME) ./internal/proxy/
+	go test -fuzz=FuzzPatternMatches -fuzztime=$(FUZZ_TIME) ./internal/transport/cors/
+	go test -fuzz=FuzzParseHeaderList -fuzztime=$(FUZZ_TIME) ./internal/transport/cors/
+	go test -fuzz=FuzzParsePlaintextRange -fuzztime=$(FUZZ_TIME) ./internal/proxy/object/
 	go test -fuzz=FuzzParseQueryInt -fuzztime=$(FUZZ_TIME) ./internal/transport/s3api/
 	go test -fuzz=FuzzParseHeader -fuzztime=$(FUZZ_TIME) ./internal/encryption/
 	go test -fuzz=FuzzCiphertextRange -fuzztime=$(FUZZ_TIME) ./internal/encryption/
@@ -293,6 +393,15 @@ COMPOSE_FILE := docker-compose.test.yml
 integration-test: ## Run integration tests (testcontainers — no docker-compose needed)
 	go test -race -v -tags integration -count=1 ./internal/integration/ ./internal/store/postgres/
 
+# The image is built here rather than by the tests because the Dockerfile uses
+# BuildKit's platform arguments, which the Docker client library testcontainers
+# builds through does not provide. Set S3O_TEST_IMAGE to run one already built.
+ACCEPTANCE_IMAGE := $(IMAGE):acceptance
+
+provider-test: ## Run Terraform provider acceptance tests (testcontainers)
+	docker build -t $(ACCEPTANCE_IMAGE) .
+	cd terraform/terraform-provider-s3-orchestrator && TF_ACC=1 S3O_TEST_IMAGE=$(ACCEPTANCE_IMAGE) go test -v -count=1 -timeout 20m ./internal/provider/
+
 dev-deps: ## Start dev environment services (MinIO + PostgreSQL + Redis + observability)
 	docker compose -f $(COMPOSE_FILE) up -d --wait
 
@@ -321,8 +430,17 @@ tools: ## Install build and packaging dependencies
 prep-changelog: ## Compress changelog for Debian packaging
 	@gzip -9 -n -c packaging/changelog > packaging/changelog.gz
 
+# SBOMs describe the release archives, which a snapshot does not publish, and
+# generating them needs syft on the builder. Skipped here; the tagged release
+# still produces them.
 deb: prep-changelog ## Build .deb packages via GoReleaser snapshot
-	goreleaser release --snapshot --clean --skip=publish,sign
+	DEB_VERSION=$(DEB_VERSION) goreleaser release --snapshot --clean --skip=publish,sign,sbom
+
+# Versions from the tag rather than the snapshot template, for publishing a
+# release. --skip=publish is explicit here because, unlike snapshot mode,
+# a real release would otherwise try to create a GitHub release of its own.
+deb-release: prep-changelog ## Build .deb packages for the checked-out tag
+	goreleaser release --clean --skip=publish,sign
 
 deb-lint: deb ## Run lintian on the .deb packages
 	@for f in dist/*.deb; do echo "--- $$f ---"; lintian --tag-display-limit 0 "$$f"; done
@@ -403,7 +521,7 @@ release: ## Tag and push to trigger a GitHub Release (reads .version)
 	git push origin $(VERSION)
 
 release-local: prep-changelog ## Dry-run GoReleaser locally (no publish)
-	goreleaser release --snapshot --clean --skip=sign
+	DEB_VERSION=$(DEB_VERSION) goreleaser release --snapshot --clean --skip=sign
 
 ##@ Load Testing
 
@@ -458,6 +576,18 @@ loadtest-listobjects: loadtest-build ## Run ListObjectsV2 load test against a pr
 		-list-prefix $(LOADTEST_LIST_PREFIX) -list-max-keys $(LOADTEST_LIST_MAX_KEYS) \
 		$(LOADTEST_OUTPUT_FLAG)
 
+loadtest-tagging: loadtest-build ## Run PutObjectTagging/GetObjectTagging/DeleteObjectTagging load test against a pre-seeded set (use LOADTEST_SEED)
+	./loadtest/s3-loadtest \
+		-endpoint $(LOADTEST_ENDPOINT) -bucket $(LOADTEST_BUCKET) \
+		-op tagging -rate $(LOADTEST_RATE) -duration $(LOADTEST_DURATION) \
+		$(LOADTEST_SIZE_FLAG) -seed $(LOADTEST_SEED) -workers $(LOADTEST_WORKERS) $(LOADTEST_OUTPUT_FLAG)
+
+loadtest-put-tagged: loadtest-build ## Run PUT with x-amz-tagging; diff against loadtest-put at the same rate and size for the inline-tagging cost
+	./loadtest/s3-loadtest \
+		-endpoint $(LOADTEST_ENDPOINT) -bucket $(LOADTEST_BUCKET) \
+		-op puttagged -rate $(LOADTEST_RATE) -duration $(LOADTEST_DURATION) \
+		$(LOADTEST_SIZE_FLAG) -workers $(LOADTEST_WORKERS) $(LOADTEST_OUTPUT_FLAG)
+
 loadtest-cache: loadtest-build ## Run cache stress test (seeds more data than cache capacity to exercise eviction)
 	./loadtest/s3-loadtest \
 		-endpoint $(LOADTEST_ENDPOINT) -bucket $(LOADTEST_BUCKET) \
@@ -475,13 +605,13 @@ loadtest-burst-read: ## Run k6 read burst test (requires k6, use PEAK_VUS, SEED_
 		--env S3_ENDPOINT=$(LOADTEST_ENDPOINT) --env S3_BUCKET=$(LOADTEST_BUCKET)
 
 PERF_PROFILE ?= smoke
-# Admin token for the cache-flush (cold-read) scenario. Defaults to the local
-# demo's token; set PERF_ADMIN_TOKEN=... when targeting another deployment.
-# Passed inline so it wins over any stale S3O_ADMIN_TOKEN in the shell.
-PERF_ADMIN_TOKEN ?= admin
 
-perf: loadtest-build ## Run the full perf-envelope suite (PROFILE=smoke|baseline|saturation; PERF_ADMIN_TOKEN for cold-read flush)
-	@S3O_ADMIN_TOKEN=$(PERF_ADMIN_TOKEN) ./loadtest/run-suite.sh $(PERF_PROFILE)
+# The cold-read scenario signs its cache-flush call with the admin keypair the
+# demo wrote alongside the perf credential. Targeting another deployment means
+# exporting S3O_ACCESS_KEY_ID and S3O_SECRET_ACCESS_KEY; without them that one
+# scenario is skipped and the rest of the suite still runs.
+perf: loadtest-build ## Run the full perf-envelope suite (PERF_PROFILE=smoke|baseline|saturation)
+	@./loadtest/run-suite.sh $(PERF_PROFILE)
 
 LOADTEST_MPU_CONCURRENCY ?= 10
 LOADTEST_MPU_PART_COUNT  ?= 5
@@ -535,6 +665,10 @@ web-tools: ## Install Hugo and gomarkdoc for local website development
 # package list. The page filename is the package's basename; nested
 # packages produce non-colliding bases (e.g. transport/admin -> admin.md,
 # cli/adminctl -> adminctl.md).
+#
+# Each page carries the package synopsis as its description. gomarkdoc output
+# yields no summary the theme can fall back on, so without it every generated
+# page ships an empty meta description and search engines see one duplicate.
 web-godoc: ## Generate Go API reference markdown for the website
 	@mkdir -p web/content/godoc
 	@go list -f '{{.ImportPath}}' ./internal/... \
@@ -543,8 +677,9 @@ web-godoc: ## Generate Go API reference markdown for the website
 		| sort \
 		| while read pkg; do \
 			name=$$(basename $$pkg); \
+			doc=$$(go list -f '{{.Doc}}' ./internal/$$pkg | sed 's/"/\\"/g'); \
 			echo "  godoc: internal/$$pkg -> $$name.md"; \
-			printf -- '---\ntitle: "%s"\n---\n\n' "$$name" > web/content/godoc/$$name.md; \
+			printf -- '---\ntitle: "%s"\ndescription: "%s"\n---\n\n' "$$name" "$$doc" > web/content/godoc/$$name.md; \
 			gomarkdoc ./internal/$$pkg >> web/content/godoc/$$name.md; \
 			sed -i '/^# '"$$name"'$$/d' web/content/godoc/$$name.md; \
 		done
@@ -570,6 +705,74 @@ web-push: web-submodules builder ## Build and push multi-arch website image to r
 	  --output type=image,push=true \
 	  .
 
+##@ Edge Proxy
+
+# -------------------------------------------------------------------------
+# EDGE PROXY WORKER
+# -------------------------------------------------------------------------
+
+# The Cloudflare worker is the one TypeScript component in a Go repository. It
+# carries its own npm toolchain under deploy/cloudflare-worker rather than
+# adding a Node dependency to any Go target, so a contributor who never touches
+# the worker never installs it.
+WORKER_DIR := deploy/cloudflare-worker
+
+worker-install: ## Install the edge proxy worker's npm dependencies
+	cd $(WORKER_DIR) && npm ci --ignore-scripts
+
+worker-typecheck: ## Typecheck the edge proxy worker
+	cd $(WORKER_DIR) && npm run typecheck
+
+worker-test: ## Run the edge proxy worker test suite
+	cd $(WORKER_DIR) && npm test
+
+worker-coverage: ## Run the edge proxy worker suite with coverage thresholds enforced
+	cd $(WORKER_DIR) && npm run coverage
+
+worker-check: worker-typecheck worker-coverage ## Run every edge proxy worker check
+
+worker-deploy: ## Publish the edge proxy worker (requires wrangler login and secrets)
+	cd $(WORKER_DIR) && npx wrangler deploy
+
+# Cloudflare runs JavaScript, so the worker's TypeScript has to be bundled into
+# a single module before anything can upload it. `wrangler deploy` does that
+# implicitly; Terraform cannot, because cloudflare_workers_script takes finished
+# script text. These targets produce that artifact and put it where Terraform
+# can read it back.
+# The key is scoped to this project, because the bucket it lands in is not: a
+# prefix like "cloudflare-worker" alone would collide with anything else that
+# ever publishes a worker there.
+WORKER_BUNDLE := $(WORKER_DIR)/dist/worker.js
+WORKER_KEY    := s3-orchestrator/cloudflare-worker/$(VERSION)/worker.js
+S3O_ENDPOINT  ?= http://s3-orchestrator.service.consul:9000
+S3O_BUCKET    ?= artifacts
+
+worker-build: worker-install ## Bundle the edge proxy worker into a single ESM script
+	cd $(WORKER_DIR) && npm run build
+
+# The key carries the version and is never "latest", so munchbox pins what it
+# reads and a rebuild cannot change deployed infrastructure on an unrelated
+# apply. Content type is load-bearing: Terraform's S3 object data source only
+# exposes a body it considers textual.
+worker-publish: worker-build ## Upload the bundled worker to the artifact bucket
+	aws --endpoint-url $(S3O_ENDPOINT) s3 cp $(WORKER_BUNDLE) \
+		s3://$(S3O_BUCKET)/$(WORKER_KEY) --content-type text/plain
+	@echo "published s3://$(S3O_BUCKET)/$(WORKER_KEY)"
+
+# The dashboard is the same shape of artifact as the worker: built here, read
+# back by whatever deploys it, and pinned by version so a republish cannot
+# change a running deployment on an unrelated apply. text/plain for the same
+# reason the worker uses it.
+GRAFANA_DASHBOARD := grafana/s3-orchestrator.json
+GRAFANA_KEY       := s3-orchestrator/grafana/$(VERSION)/s3-orchestrator.json
+
+grafana-publish: ## Upload the grafana dashboard to the artifact bucket
+	aws --endpoint-url $(S3O_ENDPOINT) s3 cp $(GRAFANA_DASHBOARD) \
+		s3://$(S3O_BUCKET)/$(GRAFANA_KEY) --content-type text/plain
+	@echo "published s3://$(S3O_BUCKET)/$(GRAFANA_KEY)"
+
+artifacts-publish: worker-publish grafana-publish ## Publish every artifact a deployment reads back
+
 ##@ Cleanup
 
 # -------------------------------------------------------------------------
@@ -577,8 +780,12 @@ web-push: web-submodules builder ## Build and push multi-arch website image to r
 # -------------------------------------------------------------------------
 
 clean: ## Remove build artifacts, demo environments, containers, and volumes
-	# --- Stop Nomad job and agent ---
-	NOMAD_ADDR=http://127.0.0.1:4646 nomad job stop -purge s3-orchestrator 2>/dev/null || true
+	# --- Stop Nomad job and agent (localhost dev agent only; clear any prod
+	#     NOMAD_*/CONSUL_* from the shell so this can never hit a real cluster) ---
+	env -u NOMAD_TOKEN -u NOMAD_CACERT -u NOMAD_CLIENT_CERT -u NOMAD_CLIENT_KEY -u NOMAD_TLS_SERVER_NAME -u NOMAD_NAMESPACE -u NOMAD_REGION \
+		-u CONSUL_HTTP_TOKEN -u CONSUL_CACERT -u CONSUL_CLIENT_CERT -u CONSUL_CLIENT_KEY -u CONSUL_TLS_SERVER_NAME \
+		NOMAD_ADDR=http://127.0.0.1:4646 CONSUL_HTTP_ADDR=http://127.0.0.1:8500 \
+		nomad job stop -purge s3-orchestrator 2>/dev/null || true
 	pkill -f '[n]omad agent -dev' 2>/dev/null || true
 	rm -f /tmp/nomad-demo.pid
 	# --- Delete k3d cluster ---
@@ -597,5 +804,5 @@ clean: ## Remove build artifacts, demo environments, containers, and volumes
 	docker rmi $(FULL_TAG) 2>/dev/null || true
 	docker rmi s3-orchestrator:local 2>/dev/null || true
 
-.PHONY: help builder build install uninstall docker push generate test vet lint govulncheck coverage integration-coverage sonar-scan sonar-pr bench bench-compare run docs migration integration-test dev-deps dev-clean tools prep-changelog deb deb-lint deb-all publish-deb changelog release release-local loadtest-build loadtest-put loadtest-get loadtest-mixed loadtest-listobjects loadtest-multipart loadtest-burst loadtest-burst-read loadtest-k6 perf kubernetes-demo nomad-demo web-tools web-godoc web-submodules web-serve web-build web-docker web-push clean
+.PHONY: openapi openapi-breaking help builder build install uninstall docker push generate test vet lint cloc govulncheck coverage integration-coverage sonar-scan sonar-pr bench bench-compare run docs migration integration-test provider-test provider-docs provider-publish dev-deps dev-clean tools prep-changelog deb deb-release deb-lint publish-deb changelog release release-local loadtest-build loadtest-put loadtest-get loadtest-mixed loadtest-listobjects loadtest-multipart loadtest-burst loadtest-burst-read loadtest-k6 perf kubernetes-demo nomad-demo web-tools web-godoc web-submodules web-serve web-build web-docker web-push worker-install worker-typecheck worker-test worker-coverage worker-check worker-deploy worker-build worker-publish grafana-publish artifacts-publish clean
 .DEFAULT_GOAL := help

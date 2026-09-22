@@ -1,4 +1,5 @@
 ---
+description: "Interactive diagram of a PutObject request through backend selection, encryption, failover, and the metadata recording steps."
 title: "Write Path"
 linkTitle: "Write Path"
 weight: 2
@@ -59,8 +60,15 @@ Detailed flow of a PutObject request through backend selection, encryption, fail
     '',
     '    BUFFER --> HASH{Integrity<br>Enabled?}:::decision',
     '    HASH -->|yes| COMPUTE[Compute SHA-256<br>Content Hash]:::process',
-    '    HASH -->|no| SELECT',
-    '    COMPUTE --> SELECT',
+    '    HASH -->|no| COMP',
+    '    COMPUTE --> COMP',
+    '',
+    '    COMP{Compression<br>Enabled?}:::decision',
+    '    COMP -->|yes, size >= min_size| COMPRESS[Encode Chunked zstd<br>Seek Table]:::process',
+    '    COMP -->|no| SELECT',
+    '    COMPRESS --> RATIO{Shrank Past<br>min_ratio?}:::decision',
+    '    RATIO -->|yes, keep encoding| SELECT',
+    '    RATIO -->|no, discard encoding| SELECT',
     '',
     '    SELECT{Select<br>Backend}:::decision',
     '    SELECT -->|spread| LEAST[Least Utilized<br>Backend]:::storage',
@@ -106,8 +114,28 @@ Detailed flow of a PutObject request through backend selection, encryption, fail
   ].join('\n');
 
   mermaid.initialize({
-    startOnLoad: false, theme: 'dark',
-    flowchart: { nodeSpacing: 14, rankSpacing: 22, curve: 'basis', padding: 5, diagramPadding: 8, useMaxWidth: true }
+    startOnLoad: false,
+    theme: 'base',
+    themeVariables: {
+      darkMode: true,
+      background: '#191c23',
+      fontFamily: 'Inter, ui-sans-serif, system-ui, sans-serif',
+      fontSize: '15px',
+      primaryColor: '#26332f',
+      primaryTextColor: '#f8fafc',
+      primaryBorderColor: '#2a9d73',
+      secondaryColor: '#3a2e20',
+      secondaryTextColor: '#e8dfd0',
+      secondaryBorderColor: '#c4a35a',
+      tertiaryColor: '#20262d',
+      tertiaryTextColor: '#e8dfd0',
+      tertiaryBorderColor: '#4aaa8a',
+      lineColor: '#7f8b86',
+      edgeLabelBackground: '#191c23',
+      clusterBkg: '#1d2229',
+      clusterBorder: '#39443f'
+    },
+    flowchart: { nodeSpacing: 32, rankSpacing: 46, curve: 'linear', padding: 12, diagramPadding: 16, useMaxWidth: true, htmlLabels: true }
   });
 
   mermaid.render('write-mermaid-svg', diagramSrc).then(function(result) {
@@ -119,7 +147,7 @@ Detailed flow of a PutObject request through backend selection, encryption, fail
     PUT: {
       title: 'PutObject Request',
       badge: 'entry', badgeText: 'entry point',
-      body: '<p>Incoming PUT request after passing through admission control, rate limiting, and SigV4 authentication (header or presigned URL).</p><p>At this point <code>Content-Length</code> and <code>MaxObjectSize</code> have already been validated by the HTTP handler. User metadata (<code>x-amz-meta-*</code>) has been extracted and validated (max 2KB total).</p>'
+      body: '<p>Incoming PUT request after passing through admission control, rate limiting, and SigV4 authentication (header or presigned URL).</p><p>At this point <code>Content-Length</code> and <code>MaxObjectSize</code> have already been validated by the HTTP handler. User metadata (<code>x-amz-meta-*</code>) has been extracted and validated (max 2KB total).</p><p>Any <code>x-amz-tagging</code> header is parsed and validated here as well, before the body is read. The header is query-string encoded (<code>k1=v1&amp;k2=v2</code>), and an unusable set is refused up front so a rejected write spends no ingress and leaves no orphan to collect. See <a href="../tagging/">tagging</a>.</p>'
     },
     PREFLIGHT: {
       title: 'CanAcceptWrite Pre-flight',
@@ -134,12 +162,12 @@ Detailed flow of a PutObject request through backend selection, encryption, fail
     FILTER: {
       title: 'Filter Eligible Backends',
       badge: 'filter', badgeText: 'three-stage filter',
-      body: '<p>Three nested filters applied in order: <code>excludeUnhealthy(excludeDraining(BackendsWithinLimits(order, 1, 0, size)))</code></p><p>Starts with the full backend order list and progressively narrows to only backends that can accept this write.</p>'
+      body: '<p>Three nested filters applied in order: <code>excludeUnhealthy(excludeDraining(BackendsWithinLimits(order, []Operation{PutObject}, 0, size)))</code></p><p>Starts with the full backend order list and progressively narrows to only backends that can accept this write.</p><p>For a <b>compressed</b> write this runs after the body is encoded, on the size that will actually land, because that size is not known until then and filtering on the logical size would turn away a write that fits. An uncompressed write keeps this ordering and still rejects before buffering anything, so a full cluster does not spend a tempfile per rejection.</p>'
     },
     USAGE: {
       title: 'Usage Limits Check',
       badge: 'filter', badgeText: 'quota filter',
-      body: '<p><code>BackendsWithinLimits(order, apiCalls=1, egress=0, ingress=size)</code></p><p>Checks three dimensions per backend against monthly rolling limits:</p><p>1. <b>API requests</b>: baseline + current + 1 &le; limit<br>2. <b>Egress bytes</b>: baseline + current + 0 &le; limit<br>3. <b>Ingress bytes</b>: baseline + current + size &le; limit</p><p>Also skips backends where the object size exceeds <code>max_object_size</code> (0 = unlimited). Prevents repeated 413 errors from providers with per-object size restrictions.</p><p>Effective usage = DB baseline (cached) + in-memory deltas (from counter backend). Orphan bytes from cleanup queue are factored into quota calculations.</p>'
+      body: '<p><code>BackendsWithinLimits(order, []Operation{PutObject}, egress=0, ingress=physicalSize)</code></p><p>Checks each backend against its monthly rolling limits:</p><p>1. <b>Request pools</b>: for every pool containing <code>PutObject</code>, baseline + current + 1 &le; that pool&#39;s limit. Providers meter operation classes separately, so a backend out of upload budget is filtered out here while its read allowance stays untouched<br>2. <b>Egress bytes</b>: baseline + current + 0 &le; limit<br>3. <b>Ingress bytes</b>: baseline + current + physicalSize &le; limit</p><p>The size admitted is what will occupy the backend, not what the client announced. Encryption grows an object by a header plus a tag per chunk, which is a fixed function of the size and so is known before a byte moves. Compression is not: an encoder only reports its output size once it has run, which is why a compressed write is admitted after encoding rather than before.</p><p>Also skips backends where the object size exceeds <code>max_object_size</code> (0 = unlimited). Prevents repeated 413 errors from providers with per-object size restrictions.</p><p>Effective usage = DB baseline (cached) + in-memory deltas (from counter backend). Orphan bytes from cleanup queue are factored into quota calculations.</p>'
     },
     DRAIN: {
       title: 'Exclude Draining',
@@ -159,7 +187,7 @@ Detailed flow of a PutObject request through backend selection, encryption, fail
     BUFFER: {
       title: 'Buffer Request Body',
       badge: 'process', badgeText: 'buffering',
-      body: '<p>Reads the entire request body into memory using <code>bufpool.Copy()</code> with pooled 32KB buffers from <code>sync.Pool</code>.</p><p>Necessary because <code>io.Reader</code> is single-use &mdash; if the upload fails and we need to retry on another backend, we need to replay the body. Each retry creates a fresh <code>bytes.NewReader(bodyBytes)</code>.</p><p>If encryption is enabled, each retry also re-encrypts with a fresh random DEK and nonce, producing different ciphertext.</p>'
+      body: '<p><code>materialize.New(body, size, hasher)</code> buffers the request body into a seekable form: memory below 32 MiB, a self-unlinking tempfile above it, so heap does not scale with object size.</p><p>Necessary because <code>io.Reader</code> is single-use &mdash; if the upload fails and we need to retry on another backend, we need to replay the body. <code>Reader()</code> serves a fresh reader positioned at offset 0 on every call, and those readers are independent of one another, so a write placing several copies at once has one per upload.</p><p>When integrity verification is enabled the SHA-256 is computed during this same pass, so the body is never re-scanned after buffering.</p><p>Encryption then runs <b>once</b>, into a body of its own, and the plaintext is released. Every upload of this object replays that one ciphertext: encrypting per attempt would draw a fresh base nonce each time, and copies of a key that differ byte for byte are something nothing downstream can detect, because each row is self-describing and reads and scrubs fine on its own.</p>'
     },
     HASH: {
       title: 'Integrity Enabled?',
@@ -174,7 +202,7 @@ Detailed flow of a PutObject request through backend selection, encryption, fail
     SELECT: {
       title: 'Select Backend',
       badge: 'decision', badgeText: 'routing strategy',
-      body: '<p>Chooses which backend to write to from the eligible list. Strategy is configured globally:</p><p><b>spread</b>: <code>GetLeastUtilizedBackend()</code> &mdash; picks the backend with the lowest utilization ratio (used/quota). Equalizes storage across all backends.</p><p><b>pack</b>: <code>GetBackendWithSpace()</code> &mdash; returns the first backend in order with sufficient free space. Consolidates storage, keeping later backends empty.</p>'
+      body: '<p>Orders the eligible backends and claims the first that accepts the write. Ranking and admission are separate steps, and only the second one decides anything.</p><p><b>Ranking</b> reads an in-memory snapshot of what each backend holds, reloaded on the usage service tick. <b>spread</b> puts the least utilized first; <b>pack</b> keeps the configured order so writes fill one backend before moving on. A stale ranking costs an uneven spread that the next reload corrects, so it is allowed to be approximate.</p><p><b>Admission</b> is the insert that writes the intent (<code>InsertPendingIfFits</code>): one statement that claims the bytes only if the backend\'s live rows still have room. A backend that declines is skipped and the next candidate tried; when none accept, the write fails with 507. Because the test reads rows rather than memory, every instance is judged against the same totals.</p>'
     },
     LEAST: {
       title: 'Least Utilized Backend',
@@ -186,6 +214,21 @@ Detailed flow of a PutObject request through backend selection, encryption, fail
       badge: 'storage', badgeText: 'DB query',
       body: '<p>PostgreSQL query: returns the first backend in the configured order that has at least <code>size</code> bytes of free quota.</p><p>Favors filling backends in order, which is useful for setups where you want to exhaust cheap/local storage before spilling to cloud backends.</p>'
     },
+    COMP: {
+      title: 'Compression Enabled?',
+      badge: 'decision', badgeText: 'branch',
+      body: '<p>Checks <code>compression.enabled: true</code> and that the object is at least <code>min_size</code>. A seek table and per-frame headers cost more than a small object saves, so the floor avoids paying for no return.</p><p>Objects already stored compressed stay readable whether or not this is on, so the codec is built either way.</p>'
+    },
+    RATIO: {
+      title: 'Shrank Past min_ratio?',
+      badge: 'decision', badgeText: 'branch',
+      body: '<p>Compares the finished encoding against the original. An object that did not shrink to <code>min_ratio</code> of its original size is stored as the client sent it and the encoded copy is dropped, so the row carries no algorithm and no later read of it pays a decode.</p><p>This is what <code>min_size</code> cannot catch: media, archives and already-compressed content fail on entropy rather than size. Random data compresses to a ratio of exactly 1.000.</p><p>The decision is made on the finished encoding rather than a sample, because entropy is not uniform across an object and a sample is wrong in the direction that costs bytes for the life of the object. Encoding an object that turns out to be incompressible is the encoder\'s cheapest case: it detects unshrinkable blocks and stores them raw.</p>'
+    },
+    COMPRESS: {
+      title: 'Encode Chunked zstd',
+      badge: 'process', badgeText: 'compression',
+      body: '<p>Encodes the buffered body into a second materialized body as one independently decodable zstd frame per <code>chunk_size</code> of input, with a seek table in a trailing skippable frame.</p><p>Runs once, ahead of the failover loop: an attempt replays already-encoded bytes and rebuilds only the encryption layer. Ordering is compress then encrypt, because ciphertext does not compress.</p><p>Both bodies are held until the upload settles, since the encoded copy has to replay on every attempt.</p><p>Records <code>compression_algorithm</code>, <code>compression_level</code>, <code>compression_format_version</code> and <code>logical_size</code> on the object row. <code>logical_size</code> is the only place the client-visible size survives, since <code>size_bytes</code> counts what landed on the backend.</p><p><a href="../compression/">Compression flow diagram &rarr;</a></p>'
+    },
     ENC: {
       title: 'Encryption Enabled?',
       badge: 'decision', badgeText: 'branch',
@@ -194,12 +237,14 @@ Detailed flow of a PutObject request through backend selection, encryption, fail
     ENCRYPT: {
       title: 'Generate DEK, Wrap + Encrypt',
       badge: 'process', badgeText: 'encryption',
-      body: '<p>Envelope encryption pipeline:</p><p>1. Generate random 32-byte DEK (Data Encryption Key)<br>2. Wrap DEK with master key via <code>provider.WrapDEK(ctx, dek)</code> (Vault Transit or KMS)<br>3. Tee plaintext through MD5 hash (for ETag)<br>4. Stream encrypt with AES-256-GCM in chunks (default 1MB)</p><p>Produces <code>EncryptionMeta</code>: packed <code>baseNonce || wrappedDEK</code>, <code>keyID</code>, and <code>plaintextSize</code> stored in DB alongside the object record.</p><p class="ac-metric">Metric: s3o_encryption_ops_total{operation="encrypt"}</p>'
+      body: '<p>Envelope encryption pipeline:</p><p>1. Generate random 32-byte DEK (Data Encryption Key)<br>2. Wrap DEK with master key via <code>provider.WrapDEK(ctx, dek)</code> (Vault Transit or KMS)<br>3. Tee plaintext through MD5 hash (for ETag)<br>4. Stream encrypt with AES-256-GCM in chunks (default 64 KiB)</p><p>Produces <code>EncryptionMeta</code>: packed <code>baseNonce || wrappedDEK</code>, <code>keyID</code>, and <code>plaintextSize</code> stored in DB alongside the object record.</p><p class="ac-metric">Metric: s3o_encryption_operations_total{operation="encrypt"}</p>'
     },
     UPLOAD: {
       title: 'Upload to Backend',
       badge: 'process', badgeText: 'upload',
-      body: '<p>Calls <code>backend.PutObject(ctx, key, body, size, contentType, metadata)</code> with an optional per-backend timeout (<code>backend_timeout</code> config).</p><p>The body is either plaintext (no encryption) or the ciphertext stream (encryption enabled). Size is ciphertext size when encrypted.</p>'
+      body: '<p>Calls <code>backend.PutObject(ctx, key, body, size, contentType, metadata)</code> with an optional per-backend timeout (<code>backend_timeout</code> config).</p><p>The body is either plaintext (no encryption) or the ciphertext stream (encryption enabled). Size is ciphertext size when encrypted.</p>' +
+        '<p>With <code>write_path.parallel_copies</code> on, this step is where the write splits: it claims the top N eligible backends, each with an intent of its own, and uploads to all of them at once from the one materialized payload. The client is answered as soon as the first copy commits, since waiting for the slowest backend would put it on the critical path of every write; the rest run on a context outliving the request and commit themselves as they land. What does not land is a shortfall the replicator fills, which is what it does for every copy when the gate is off.</p>' +
+        '<p>Off by default. The replicator makes a copy by reading the object back off a backend that holds it, so placing it here removes a full GET and that backend\'s egress - at the cost of sending those bytes at write time rather than spread across replicator cycles.</p>'
     },
     CB: {
       title: 'Circuit Breaker',
@@ -209,7 +254,7 @@ Detailed flow of a PutObject request through backend selection, encryption, fail
     S3: {
       title: 'S3 Backend PutObject',
       badge: 'storage', badgeText: 'S3 API call',
-      body: '<p>AWS SDK v2 <code>s3.PutObject()</code> call to the backend endpoint. Builds <code>PutObjectInput</code> with bucket, key, body, content-length, content-type, and user metadata.</p><p>Supports <code>unsignedPayload</code> mode for backends that accept unsigned streaming uploads (avoids buffering for SigV4 signing). Returns ETag on success.</p><p class="ac-metric">Metrics: s3o_backend_requests_total, s3o_backend_latency_seconds</p>'
+      body: '<p>AWS SDK v2 <code>s3.PutObject()</code> call to the backend endpoint. Builds <code>PutObjectInput</code> with bucket, key, body, content-length, content-type, and user metadata.</p><p>Supports <code>unsignedPayload</code> mode for backends that accept unsigned streaming uploads (avoids buffering for SigV4 signing). Returns ETag on success.</p><p class="ac-metric">Metrics: s3o_backend_requests_total, s3o_backend_duration_seconds</p>'
     },
     FAIL: {
       title: 'Upload Failed?',
@@ -229,7 +274,7 @@ Detailed flow of a PutObject request through backend selection, encryption, fail
     RECORD: {
       title: 'RecordObjectAndPromoteIntent (atomic commit)',
       badge: 'storage', badgeText: 'DB transaction',
-      body: '<p>Atomic database transaction (<code>RecordObjectAndPromoteIntent</code>) that flips the pending intent to a committed object_locations row:</p><p>1. <code>LockObjectKeyForWrite</code> &mdash; advisory lock for concurrent write safety<br>2. <code>GetExistingCopiesForUpdate</code> &mdash; SELECT FOR UPDATE on current copies<br>3. <code>DeleteObjectCopies</code> &mdash; remove all existing copies<br>4. <code>DecrementQuota</code> for each deleted copy<br>5. <code>InsertObjectLocation</code> &mdash; new record with encryption metadata<br>6. <code>IncrementQuota</code> for the new backend<br>7. <code>DeletePendingIntent</code> &mdash; clear the intent row</p><p>Returns list of <b>displaced copies</b> on other backends that need cleanup.</p><p>If this transaction fails, <code>RecoverFromRecordFailure</code> deletes the orphaned backend bytes and the intent stays for the <code>PendingReaper</code> to resolve.</p>'
+      body: '<p>Atomic database transaction (<code>RecordObjectAndPromoteIntent</code>) that flips the pending intent to a committed object_locations row:</p><p>1. <code>LockObjectKeyForWrite</code> &mdash; advisory lock for concurrent write safety<br>2. <code>GetExistingCopiesForUpdate</code> &mdash; SELECT FOR UPDATE on current copies<br>3. <code>DeleteObjectCopies</code> &mdash; remove all existing copies<br>4. <code>InsertObjectLocation</code> &mdash; new record with encryption metadata<br>5. <code>AdjustQuotaStripe</code> &mdash; the freed and charged bytes together, on the stripe this key selects<br>6. <code>ClearTagsForKey</code>, then insert the tag set this request carried<br>7. <code>DeletePendingIntent</code> &mdash; clear the intent row</p><p>Step 5 is inside the transaction on purpose: the byte counter commits and rolls back with the rows it summarizes, so it cannot drift from them. Step 7 in the same transaction is what moves the write\'s bytes from what the backend has in flight to what it stores, without either total ever missing them.</p><p>Step 7 is why an untagged overwrite leaves the object untagged: tags follow the object, not the key, and the set is replaced inside the same transaction and under the same lock as the object itself, so there is no window where the new object carries the old object\'s tags.</p><p>Returns list of <b>displaced copies</b> on other backends that need cleanup.</p><p>If this transaction fails, <code>RecoverFromRecordFailure</code> deletes the orphaned backend bytes and the intent stays for the <code>PendingReaper</code> to resolve.</p><p>A write placing several copies commits the first to land and carries the rest as <code>Placing</code>. That does two things: their intents survive step 7&#39;s by-key clear, which is what each late copy later reads as proof that nothing newer has taken the key, and their backends are held back from step 3&#39;s displacement. Without the second, an overwrite would delete the previous copy from a backend this write is still uploading to &mdash; taking the new copy&#39;s bytes with it and leaving a row describing an object that is gone, which no read reveals because it fails over to the copy that survived.</p>'
     },
     INTENT: {
       title: 'InsertPendingIntent',
@@ -264,7 +309,7 @@ Detailed flow of a PutObject request through backend selection, encryption, fail
     METRICS: {
       title: 'Record Usage & Metrics',
       badge: 'process', badgeText: 'telemetry',
-      body: '<p><code>Record(backendName, apiCalls=1, egress=0, ingress=size)</code> increments the monthly usage counters in the counter backend (local atomics or Redis).</p><p>Records operation duration histogram via <code>MetricsCollector</code>. If failover occurred, increments <code>WriteFailoverTotal</code> for each failed backend paired with the successful backend.</p><p>Audit event: <code>storage.PutObject</code> with key, backend name, plaintext size.</p>'
+      body: '<p><code>Record(backendName, PutObject, egress=0, ingress=uploadSize)</code> increments the monthly usage counters in the counter backend (local atomics or Redis). The charge carries the operation, so it lands on the backend&#39;s request total and on every budget pool that contains <code>PutObject</code>.</p><p>The ingress charged is the size the attempt actually sent, carried back from the upload rather than recomputed: the encoded bytes for a compressed object, the envelope for an encrypted one, and the ciphertext of the encoding when both are on. It is the same figure the ledger row commits, so the storage and bandwidth counters describe the object identically.</p><p>Records operation duration histogram via <code>MetricsCollector</code>. If failover occurred, increments <code>WriteFailoverTotal</code> for each failed backend paired with the successful backend.</p><p>Audit event: <code>storage.PutObject</code> with key, backend name, stored size.</p>'
     },
     OK: {
       title: 'Return ETag / 200 OK',
@@ -288,10 +333,25 @@ Detailed flow of a PutObject request through backend selection, encryption, fail
     if (tooltip.style.display === 'block' && !pinned) positionTooltip();
   });
   function positionTooltip() {
-    var pad = 12, x = mouseX + pad, y = mouseY + pad;
-    if (x + tooltip.offsetWidth > window.innerWidth - pad) x = mouseX - tooltip.offsetWidth - pad;
-    if (y + tooltip.offsetHeight > window.innerHeight - pad) y = mouseY - tooltip.offsetHeight - pad;
-    tooltip.style.left = x + 'px'; tooltip.style.top = y + 'px';
+    var pad = 12;
+    var w = tooltip.offsetWidth, h = tooltip.offsetHeight;
+    var vw = window.innerWidth, vh = window.innerHeight;
+
+    var x = mouseX + pad;
+    if (x + w > vw - pad) x = mouseX - w - pad;
+    x = Math.max(pad, Math.min(x, vw - w - pad));
+
+    // Prefer below the cursor, and flip above only when above genuinely has
+    // more room. Clamping afterwards is what keeps a tall panel on screen: an
+    // unclamped flip puts its top edge above the viewport, and a panel taller
+    // than the viewport pins to the top and scrolls instead.
+    var below = vh - mouseY - pad * 2;
+    var above = mouseY - pad * 2;
+    var y = (h <= below || below >= above) ? mouseY + pad : mouseY - h - pad;
+    y = Math.max(pad, Math.min(y, vh - h - pad));
+
+    tooltip.style.left = x + 'px';
+    tooltip.style.top = y + 'px';
   }
   function showInfo(id) {
     var info = nodeInfo[id];

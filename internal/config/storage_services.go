@@ -16,7 +16,10 @@
 package config
 
 import (
+	"cmp"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 )
 
@@ -28,7 +31,7 @@ import (
 // Disabled by default to avoid unexpected API calls and egress charges.
 type RebalanceConfig struct {
 	Enabled     bool          `yaml:"enabled"`
-	Strategy    string        `yaml:"strategy"`    // "pack" or "spread"
+	Strategy    string        `yaml:"strategy"` // "pack" or "spread"
 	Interval    time.Duration `yaml:"interval"`
 	BatchSize   int           `yaml:"batch_size"`
 	Threshold   float64       `yaml:"threshold"`   // min utilization spread to trigger
@@ -42,8 +45,8 @@ type ReplicationConfig struct {
 	Factor             int           `yaml:"factor"`
 	WorkerInterval     time.Duration `yaml:"worker_interval"`
 	BatchSize          int           `yaml:"batch_size"`
-	Concurrency        int           `yaml:"concurrency"`          // Parallel object replications (default: 5)
-	UnhealthyThreshold time.Duration `yaml:"unhealthy_threshold"`  // Grace period before replacing copies on circuit-broken backends (default: 10m)
+	Concurrency        int           `yaml:"concurrency"`         // Parallel object replications (default: 5)
+	UnhealthyThreshold time.Duration `yaml:"unhealthy_threshold"` // Grace period before replacing copies on circuit-broken backends (default: 10m)
 }
 
 // CleanupQueueConfig holds settings for the background orphan cleanup worker
@@ -68,23 +71,72 @@ type CleanupQueueConfig struct {
 // which trades data-loss safety for one fewer round-trip per PUT.
 type WritePathConfig struct {
 	PendingPattern PendingPatternConfig `yaml:"pending_pattern"`
+	Multipart      MultipartConfig      `yaml:"multipart"`
+	ParallelCopies ParallelCopiesConfig `yaml:"parallel_copies"`
 }
 
-// PendingPatternConfig configures the pending-row pattern used by the
-// write path to avoid losing the prior copy of an overwritten key when
-// the metadata commit fails.
+// ParallelCopiesConfig places an object's copies during the write instead of
+// leaving every one after the first to the replicator, which reads the object
+// back off a backend and pays that backend's egress to make each of them. The
+// bytes are already in hand at PUT time, so an extra copy costs one more upload
+// and no read.
+//
+// Off by default, and the tradeoff is shape rather than total: it lowers the
+// work a copy costs but spends it at write time instead of spreading it over
+// replicator cycles, which can cost PUT throughput on a constrained uplink.
+//
+// Count is how many copies a write places, defaulting to replication.factor and
+// never allowed to exceed it - copies past the factor are deleted by the
+// over-replication cleaner about as fast as writes create them. A factor of 1
+// leaves this inert whatever it is set to.
+//
+// MaxInFlight caps the writes whose copies are still uploading after their
+// client was answered. It is a ceiling for a backend that has gone slow rather
+// than a queue: a write that finds it full places one copy and leaves the rest
+// to the replicator, which costs the read-back this feature exists to avoid, so
+// it defaults to server.max_concurrent_writes - the admission capacity the
+// operator already sized - and a healthy fleet never approaches it.
+type ParallelCopiesConfig struct {
+	Enabled     bool `yaml:"enabled"`
+	Count       int  `yaml:"count"`
+	MaxInFlight int  `yaml:"max_in_flight"`
+}
+
+// DefaultDetachedUploadCeiling is the in-flight ceiling for a deployment that
+// caps neither concurrent writes nor concurrent requests, so there is no
+// admission capacity to derive one from. High enough that a fleet keeping up
+// never reaches it, low enough to bound what one slow backend can accumulate.
+const DefaultDetachedUploadCeiling = 512
+
+// MultipartConfig gates the S3 protocol invariants enforced at multipart
+// completion. Part-number range, ordering, duplicate and ETag checks are
+// always enforced; only the minimum non-final part size is optional, because a
+// deployment whose writers split more finely than S3 allows needs it off.
+//
+// EnforceMinPartSize is a pointer so the loader can tell "absent" (default
+// true) from an explicit false.
+type MultipartConfig struct {
+	EnforceMinPartSize *bool `yaml:"enforce_min_part_size"` // every part but the last must be >= 5 MiB
+}
+
+// IsMinPartSizeEnforced returns true unless the operator has explicitly
+// disabled the check. The pointer-typed field lets the YAML loader
+// distinguish "absent" (default true) from "explicitly false".
+func (m *MultipartConfig) IsMinPartSizeEnforced() bool {
+	return m.EnforceMinPartSize == nil || *m.EnforceMinPartSize
+}
+
+// PendingPatternConfig tunes the reaper that resolves abandoned PUT intents.
+//
+// The pattern itself cannot be turned off. Every write claims its bytes by
+// inserting an intent, and that row is what admission subtracts from a
+// backend's headroom while the upload runs, so a deployment without intents
+// would have nothing to judge writes against. Only the reaper's cadence is an
+// operator concern.
 type PendingPatternConfig struct {
-	Enabled    *bool         `yaml:"enabled"`     // Default: true. Set to false to disable.
 	ReaperTick time.Duration `yaml:"reaper_tick"` // How often the reaper resolves abandoned intents (default: 1m)
 	MinAge     time.Duration `yaml:"min_age"`     // Don't reap intents younger than this  -  guards in-flight PUTs (default: 5m)
 	BatchSize  int           `yaml:"batch_size"`  // Max intents resolved per tick (default: 50)
-}
-
-// IsEnabled returns true unless the operator has explicitly disabled the
-// pending pattern. The pointer-typed Enabled field lets the YAML loader
-// distinguish "absent" (default true) from "explicitly false".
-func (p *PendingPatternConfig) IsEnabled() bool {
-	return p.Enabled == nil || *p.Enabled
 }
 
 // ReconcileConfig controls the background orphan reconciler that periodically
@@ -96,17 +148,42 @@ type ReconcileConfig struct {
 }
 
 // LifecycleConfig holds rules for automatic object expiration. Objects matching
-// a rule's prefix that are older than expiration_days are deleted by a background
+// a rule's filter that are older than expiration_days are deleted by a background
 // worker. Empty rules list disables lifecycle processing.
 type LifecycleConfig struct {
 	Rules     []LifecycleRule `yaml:"rules"`
 	BatchSize int             `yaml:"batch_size"` // objects per DB query (default 100)
 }
 
-// LifecycleRule defines a single object expiration rule.
+// LifecycleRule defines a single object expiration rule. Prefix and Tags are
+// both filters and every one set must match, so a rule carrying each selects
+// their intersection. At least one is required: a rule with neither would
+// expire the whole namespace. Expressing "or" is a matter of writing a second
+// rule, since rules are evaluated independently.
 type LifecycleRule struct {
-	Prefix         string `yaml:"prefix"`
-	ExpirationDays int    `yaml:"expiration_days"`
+	Prefix         string            `yaml:"prefix"`
+	Tags           map[string]string `yaml:"tags"`
+	ExpirationDays int               `yaml:"expiration_days"`
+}
+
+// filterID renders a rule's filter as a canonical string so two rules that
+// select the same objects compare equal regardless of map iteration order.
+func (r *LifecycleRule) filterID() string {
+	keys := make([]string, 0, len(r.Tags))
+	for k := range r.Tags {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	var b strings.Builder
+	b.WriteString(r.Prefix)
+	for _, k := range keys {
+		b.WriteString("\x00")
+		b.WriteString(k)
+		b.WriteString("=")
+		b.WriteString(r.Tags[k])
+	}
+	return b.String()
 }
 
 // -------------------------------------------------------------------------
@@ -119,19 +196,10 @@ func (c *LifecycleConfig) setDefaultsAndValidate() []error {
 		return nil
 	}
 
-	var errs []error
 	if c.BatchSize <= 0 {
 		c.BatchSize = 100
 	}
-	for i, rule := range c.Rules {
-		if rule.Prefix == "" {
-			errs = append(errs, fmt.Errorf("lifecycle.rules[%d]: %w", i, ErrLifecyclePrefixRequired))
-		}
-		if rule.ExpirationDays <= 0 {
-			errs = append(errs, fmt.Errorf("lifecycle.rules[%d]: %w", i, ErrInvalidExpiration))
-		}
-	}
-	return errs
+	return nil
 }
 
 // setDefaultsAndValidate sets defaults and validate.
@@ -170,9 +238,7 @@ func (r *RebalanceConfig) setDefaultsAndValidate() []error {
 // setDefaultsAndValidate sets defaults and validate.
 func (r *ReplicationConfig) setDefaultsAndValidate(backendCount int) []error {
 	var errs []error
-	if r.Factor == 0 {
-		r.Factor = 1
-	}
+	r.Factor = cmp.Or(r.Factor, 1)
 	if r.Factor < 1 {
 		errs = append(errs, ErrReplicationFactorMin)
 	}
@@ -188,15 +254,9 @@ func (r *ReplicationConfig) setDefaultsAndValidate(backendCount int) []error {
 // (Factor > 1); leaves everything at zero otherwise so operators don't
 // see "configured" values when they never turned replication on.
 func (r *ReplicationConfig) applyReplicationDefaults() {
-	if r.WorkerInterval == 0 {
-		r.WorkerInterval = 5 * time.Minute
-	}
-	if r.BatchSize == 0 {
-		r.BatchSize = 50
-	}
-	if r.UnhealthyThreshold == 0 {
-		r.UnhealthyThreshold = 10 * time.Minute
-	}
+	r.WorkerInterval = cmp.Or(r.WorkerInterval, 5*time.Minute)
+	r.BatchSize = cmp.Or(r.BatchSize, 50)
+	r.UnhealthyThreshold = cmp.Or(r.UnhealthyThreshold, 10*time.Minute)
 	if r.Concurrency <= 0 {
 		r.Concurrency = 5
 	}
@@ -220,27 +280,34 @@ func (r *ReplicationConfig) validateReplicationLimits(backendCount int) []error 
 }
 
 // validateLifecycleRules enforces that every configured rule has a
-// non-empty prefix and a positive expiration_days. Returns the set of
-// problems so a misconfigured rule cannot silently disable lifecycle
-// expiration.
+// filter and a positive expiration_days. Returns the set of problems so a
+// misconfigured rule cannot silently disable lifecycle expiration.
+//
+// Duplicates are judged on the whole filter rather than the prefix alone,
+// because two rules sharing a prefix but differing by tag select different
+// objects and are a legitimate pair.
 func validateLifecycleRules(rules []LifecycleRule) []error {
 	var errs []error
 
-	prefixes := make(map[string]bool)
+	seen := make(map[string]bool)
 	for i := range rules {
 		r := &rules[i]
-		prefix := fmt.Sprintf("lifecycle.rules[%d]", i)
+		label := fmt.Sprintf("lifecycle.rules[%d]", i)
 
-		if r.Prefix == "" {
-			errs = append(errs, fmt.Errorf("%s: %w", prefix, ErrLifecyclePrefixRequired))
+		if r.Prefix == "" && len(r.Tags) == 0 {
+			errs = append(errs, fmt.Errorf("%s: %w", label, ErrLifecycleFilterRequired))
 		}
 		if r.ExpirationDays <= 0 {
-			errs = append(errs, fmt.Errorf("%s: %w", prefix, ErrInvalidExpiration))
+			errs = append(errs, fmt.Errorf("%s: %w", label, ErrInvalidExpiration))
 		}
-		if prefixes[r.Prefix] {
-			errs = append(errs, fmt.Errorf("%s: %w: %q", prefix, ErrDuplicatePrefix, r.Prefix))
+		if _, empty := r.Tags[""]; empty {
+			errs = append(errs, fmt.Errorf("%s: %w", label, ErrLifecycleEmptyTagKey))
 		}
-		prefixes[r.Prefix] = true
+		id := r.filterID()
+		if seen[id] {
+			errs = append(errs, fmt.Errorf("%s: %w: %q", label, ErrDuplicateFilter, id))
+		}
+		seen[id] = true
 	}
 
 	return errs

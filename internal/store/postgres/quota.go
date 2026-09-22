@@ -5,7 +5,7 @@
 //
 // Implements the Postgres engine bindings for the backend_quotas table:
 // per-backend bytes_used, bytes_limit, and orphan_bytes tracking. Carries
-// the read-side eligibility queries the BackendManager uses for write
+// the read-side eligibility queries the write path uses for backend
 // routing (GetBackendWithSpace, GetLeastUtilizedBackend) and the per-tx
 // increment / decrement primitives core/ uses to keep quota in lockstep
 // with object_locations changes. Increment is guarded so the UPDATE
@@ -17,15 +17,16 @@ package postgres
 
 import (
 	"context"
-	"errors"
 	"fmt"
-
-	"github.com/jackc/pgx/v5"
 
 	"github.com/afreidah/s3-orchestrator/internal/config"
 	"github.com/afreidah/s3-orchestrator/internal/store/core"
 	db "github.com/afreidah/s3-orchestrator/internal/store/postgres/sqlc"
 )
+
+// -------------------------------------------------------------------------
+// CONFIGURATION
+// -------------------------------------------------------------------------
 
 // SyncQuotaLimits ensures the backend_quotas table has entries for all configured
 // backends with their quota limits. Creates new entries or updates existing limits.
@@ -45,41 +46,9 @@ func (s *Store) SyncQuotaLimits(ctx context.Context, backends []config.BackendCo
 	})
 }
 
-// GetBackendWithSpace finds a backend with enough quota for the given size.
-// Returns the backend name or ErrNoSpaceAvailable if none have enough space.
-func (s *Store) GetBackendWithSpace(ctx context.Context, size int64, backendOrder []string) (string, error) {
-	for _, name := range backendOrder {
-		available, err := s.queries.GetBackendAvailableSpace(ctx, name)
-		if errors.Is(err, pgx.ErrNoRows) {
-			continue
-		}
-		if err != nil {
-			return "", fmt.Errorf("failed to check quota for %s: %w", name, err)
-		}
-
-		if available >= size {
-			return name, nil
-		}
-	}
-
-	return "", core.ErrNoSpaceAvailable
-}
-
-// GetLeastUtilizedBackend finds the backend with the lowest utilization ratio
-// that has enough space for the given size. Used by the "spread" routing strategy.
-func (s *Store) GetLeastUtilizedBackend(ctx context.Context, size int64, eligible []string) (string, error) {
-	row, err := s.queries.GetLeastUtilizedBackend(ctx, db.GetLeastUtilizedBackendParams{
-		BackendNames: eligible,
-		MinSize:      size,
-	})
-	if errors.Is(err, pgx.ErrNoRows) {
-		return "", core.ErrNoSpaceAvailable
-	}
-	if err != nil {
-		return "", fmt.Errorf("failed to find least utilized backend: %w", err)
-	}
-	return row.BackendName, nil
-}
+// -------------------------------------------------------------------------
+// STATISTICS
+// -------------------------------------------------------------------------
 
 // GetQuotaStats returns quota statistics for all backends.
 func (s *Store) GetQuotaStats(ctx context.Context) (map[string]core.QuotaStat, error) {
@@ -102,11 +71,26 @@ func (s *Store) GetQuotaStats(ctx context.Context) (map[string]core.QuotaStat, e
 	return stats, nil
 }
 
-// ReconcileUsage recomputes bytes_used from the object_locations ledger.
-// Delegates to core.ReconcileUsage, which runs the diff-and-correct inside
-// a single transaction so both engines share one implementation.
-func (s *Store) ReconcileUsage(ctx context.Context) (map[string]int64, error) {
-	return core.ReconcileUsage(ctx, s)
+// ListBackendQuotaUsage returns each backend's ceiling and the byte totals a
+// write is judged against, for the quota tracker's baseline refresh.
+func (s *Store) ListBackendQuotaUsage(ctx context.Context) ([]core.BackendQuotaUsage, error) {
+	rows, err := s.queries.ListBackendQuotaUsage(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query backend quota usage: %w", err)
+	}
+
+	usage := make([]core.BackendQuotaUsage, 0, len(rows))
+	for _, row := range rows {
+		usage = append(usage, core.BackendQuotaUsage{
+			BackendName:   row.BackendName,
+			BytesLimit:    row.BytesLimit,
+			BytesUsed:     row.BytesUsed,
+			OrphanBytes:   row.OrphanBytes,
+			InflightBytes: row.InflightBytes,
+		})
+	}
+
+	return usage, nil
 }
 
 // GetObjectCounts returns the number of objects stored on each backend.

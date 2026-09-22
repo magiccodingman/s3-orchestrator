@@ -25,8 +25,15 @@ import (
 // INTENT LIFECYCLE
 // -------------------------------------------------------------------------
 
-// InsertPending records an in-flight PUT intent.
-func (s *Store) InsertPending(ctx context.Context, p *core.PendingObject) error {
+// InsertPendingIfFits claims the bytes and records the intent in one statement,
+// so admission and the durable record of it cannot disagree. Reports false when
+// the backend had no room, which is the caller's cue to try the next candidate.
+//
+// The headroom is read inside the statement rather than from a snapshot: every
+// instance's committed bytes, orphans, and writes in progress are rows here, so
+// two instances admitting at once are judged against the same totals. A
+// bytes_limit of zero is unlimited, matching every other reader of the column.
+func (s *Store) InsertPendingIfFits(ctx context.Context, p *core.PendingObject) (bool, error) {
 	keyID := nullableString(p.KeyID)
 	plaintextSize := nullableInt64(p.PlaintextSize)
 	contentHash := nullableString(p.ContentHash)
@@ -34,17 +41,55 @@ func (s *Store) InsertPending(ctx context.Context, p *core.PendingObject) error 
 	if p.Encrypted {
 		encrypted = 1
 	}
-	if _, err := s.db.ExecContext(ctx,
+	res, err := s.db.ExecContext(ctx,
+		// created_at is set here rather than left to the column default: the
+		// default renders milliseconds while every other write renders
+		// nanoseconds, and the reaper's min-age check compares the two as text.
 		`INSERT INTO pending_objects
 		   (intent_id, object_key, backend_name, size_bytes,
-		    encrypted, encryption_key, key_id, plaintext_size, content_hash)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		    encrypted, encryption_key, key_id, plaintext_size, content_hash,
+		    compression_algorithm, compression_level, compression_format_version, logical_size,
+		    etag, content_type, user_metadata,
+		    created_at, role)
+		 SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+		 FROM backend_quotas q
+		 LEFT JOIN (
+		     SELECT backend_name, SUM(bytes_used) AS bytes_used
+		     FROM backend_quota_stripes GROUP BY backend_name
+		 ) s ON s.backend_name = q.backend_name
+		 LEFT JOIN (
+		     SELECT mu.backend_name, SUM(mp.size_bytes) AS inflight
+		     FROM multipart_uploads mu
+		     JOIN multipart_parts mp ON mp.upload_id = mu.upload_id
+		     GROUP BY mu.backend_name
+		 ) m ON m.backend_name = q.backend_name
+		 LEFT JOIN (
+		     SELECT backend_name, SUM(size_bytes) AS inflight
+		     FROM pending_objects GROUP BY backend_name
+		 ) pi ON pi.backend_name = q.backend_name
+		 WHERE q.backend_name = ?
+		   AND (q.bytes_limit = 0
+		        OR q.bytes_limit
+		           - MAX(0, COALESCE(s.bytes_used, 0))
+		           - q.orphan_bytes
+		           - COALESCE(m.inflight, 0)
+		           - COALESCE(pi.inflight, 0) >= ?)`,
 		p.IntentID, p.ObjectKey, p.BackendName, p.SizeBytes,
 		encrypted, p.EncryptionKey, keyID, plaintextSize, contentHash,
-	); err != nil {
-		return fmt.Errorf("insert pending object: %w", err)
+		nullableString(p.CompressionAlgorithm), nullableString(p.CompressionLevel),
+		nullableInt64(int64(p.CompressionFormatVersion)), nullableInt64(p.LogicalSize),
+		identityETag(p.Identity), identityContentType(p.Identity), identityMetadataJSON(p.Identity),
+		now(), string(p.RoleOrDefault()),
+		p.BackendName, p.SizeBytes,
+	)
+	if err != nil {
+		return false, fmt.Errorf("insert pending object: %w", err)
 	}
-	return nil
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("check pending insert: %w", err)
+	}
+	return n > 0, nil
 }
 
 // DeletePending removes a pending intent.
@@ -60,11 +105,13 @@ func (s *Store) DeletePending(ctx context.Context, intentID string) error {
 // GetStalePending returns pending intents at or older than olderThan,
 // oldest first, capped at limit.
 func (s *Store) GetStalePending(ctx context.Context, olderThan time.Time, limit int) ([]core.PendingObject, error) {
-	cutoff := olderThan.UTC().Format(time.RFC3339Nano)
+	cutoff := formatTime(olderThan)
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT intent_id, object_key, backend_name, size_bytes,
 		        encrypted, encryption_key, key_id, plaintext_size,
-		        content_hash, created_at
+		        content_hash, compression_algorithm, compression_level,
+		        compression_format_version, logical_size, created_at,
+		        etag, content_type, user_metadata, role
 		   FROM pending_objects
 		  WHERE created_at <= ?
 		  ORDER BY created_at ASC
@@ -74,38 +121,47 @@ func (s *Store) GetStalePending(ctx context.Context, olderThan time.Time, limit 
 	if err != nil {
 		return nil, fmt.Errorf("get stale pending objects: %w", err)
 	}
-	defer rows.Close()
-
-	var out []core.PendingObject
-	for rows.Next() {
+	return collectRows(rows, "pending rows", func(rows *sql.Rows) (core.PendingObject, error) {
 		var (
 			p             core.PendingObject
 			encrypted     int
 			keyID         sql.NullString
 			plaintextSize sql.NullInt64
 			contentHash   sql.NullString
+			compAlgorithm sql.NullString
+			compLevel     sql.NullString
+			compVersion   sql.NullInt64
+			logicalSize   sql.NullInt64
 			createdAt     string
 			encKey        []byte
+			etag          sql.NullString
+			contentType   sql.NullString
+			userMetadata  sql.NullString
+			role          string
 		)
 		if err := rows.Scan(&p.IntentID, &p.ObjectKey, &p.BackendName, &p.SizeBytes,
-			&encrypted, &encKey, &keyID, &plaintextSize, &contentHash, &createdAt,
+			&encrypted, &encKey, &keyID, &plaintextSize, &contentHash,
+			&compAlgorithm, &compLevel, &compVersion, &logicalSize, &createdAt,
+			&etag, &contentType, &userMetadata, &role,
 		); err != nil {
-			return nil, fmt.Errorf("scan pending row: %w", err)
+			return core.PendingObject{}, fmt.Errorf("scan pending row: %w", err)
 		}
+		p.Role = core.PendingRole(role)
+		p.Identity = identityFromColumns(etag, contentType, userMetadata)
 		p.Encrypted = encrypted != 0
 		p.EncryptionKey = encKey
 		p.KeyID = nullStringValue(keyID)
 		p.PlaintextSize = nullInt64Value(plaintextSize)
 		p.ContentHash = nullStringValue(contentHash)
+		p.CompressionAlgorithm = nullStringValue(compAlgorithm)
+		p.CompressionLevel = nullStringValue(compLevel)
+		p.CompressionFormatVersion = int(nullInt64Value(compVersion))
+		p.LogicalSize = nullInt64Value(logicalSize)
 		if t, err := time.Parse(time.RFC3339Nano, createdAt); err == nil {
 			p.CreatedAt = t
 		}
-		out = append(out, p)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate pending rows: %w", err)
-	}
-	return out, nil
+		return p, nil
+	})
 }
 
 // -------------------------------------------------------------------------
@@ -114,11 +170,7 @@ func (s *Store) GetStalePending(ctx context.Context, olderThan time.Time, limit 
 
 // PendingDepth returns the total number of pending intents.
 func (s *Store) PendingDepth(ctx context.Context) (int64, error) {
-	var depth int64
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pending_objects`).Scan(&depth); err != nil {
-		return 0, fmt.Errorf("count pending objects: %w", err)
-	}
-	return depth, nil
+	return s.countRows(ctx, "pending objects", `SELECT COUNT(*) FROM pending_objects`)
 }
 
 // DeletePendingByBackend removes every intent for a backend. Used during
@@ -132,23 +184,3 @@ func (s *Store) DeletePendingByBackend(ctx context.Context, backendName string) 
 	}
 	return nil
 }
-
-// PromotePending resolves a pending intent transactionally. SQLite serializes
-// writers so no row-level lock is needed. The destination is inspected:
-//
-//   - If any object_locations row for the key was created after this intent
-//     was inserted, the intent is provably stale and is dropped (Superseded):
-//     the authoritative state is the newer row, and the intent's bytes are
-//     either overwritten or stranded orphans.
-//   - Otherwise the intent is promoted: any prior copies are cleared, the
-//     new row is inserted, quotas are adjusted, and the pending row is
-//     deleted in the same transaction.
-//   - If the pending row is already gone, the call is a benign no-op.
-//
-// PromotePending delegates to core.PromotePending which composes the
-// engine-agnostic claim, supersession check, commit, and same-tx
-// delete of the pending row against the SQLite TxAdapter.
-func (s *Store) PromotePending(ctx context.Context, p *core.PendingObject) (core.PendingPromoteResult, []core.DeletedCopy, error) {
-	return core.PromotePending(ctx, s, p)
-}
-

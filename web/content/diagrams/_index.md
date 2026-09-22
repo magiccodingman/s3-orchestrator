@@ -1,4 +1,5 @@
 ---
+description: "Interactive diagrams of the request paths, storage layer, background workers, and database schema, with per-component implementation notes."
 title: "s3-orchestrator diagrams"
 linkTitle: "Diagrams"
 chapter: true
@@ -23,18 +24,25 @@ weight: 35
       <p>Detailed request lifecycle through admission control, authentication, routing, and circuit breakers.</p>
     </div>
   </a>
+  <a class="landing-card" href="access-control/">
+    <i class="fas fa-user-shield landing-card-icon" style="color: #34b882;"></i>
+    <div>
+      <strong>Access Control Flow</strong>
+      <p>How a credential resolves to a user, and how that user's grants authorize the S3 API, the admin API and the dashboard alike.</p>
+    </div>
+  </a>
   <a class="landing-card" href="write-path/">
     <i class="fas fa-upload landing-card-icon" style="color: #3fb950;"></i>
     <div>
       <strong>Write Path</strong>
-      <p>PutObject flow through backend selection, encryption, failover, and metadata recording.</p>
+      <p>PutObject flow through backend selection, compression, encryption, failover, and metadata recording.</p>
     </div>
   </a>
   <a class="landing-card" href="read-path/">
     <i class="fas fa-download landing-card-icon" style="color: #bc8cff;"></i>
     <div>
       <strong>Read Path</strong>
-      <p>GetObject flow through location lookup, failover, broadcast reads, decryption, and streaming.</p>
+      <p>GetObject flow through location lookup, failover, broadcast reads, decryption, frame decoding, and streaming.</p>
     </div>
   </a>
   <a class="landing-card" href="circuit-breaker/">
@@ -49,6 +57,27 @@ weight: 35
     <div>
       <strong>Encryption Flow</strong>
       <p>Envelope encryption pipeline: DEK generation, key wrapping, chunk-based AES-256-GCM, and range decryption.</p>
+    </div>
+  </a>
+  <a class="landing-card" href="compression/">
+    <i class="fas fa-file-zipper landing-card-icon" style="color: #f0883e;"></i>
+    <div>
+      <strong>Compression</strong>
+      <p>Chunked zstd pipeline: size and ratio floors, seek table, frame-level ranged reads, and composition with encryption.</p>
+    </div>
+  </a>
+  <a class="landing-card" href="tagging/">
+    <i class="fas fa-tags landing-card-icon" style="color: #58a6ff;"></i>
+    <div>
+      <strong>Object Tagging</strong>
+      <p>The four ways a tag set is written, validation and the per-key lock, one set per object key, and what clears it.</p>
+    </div>
+  </a>
+  <a class="landing-card" href="usage-quotas/">
+    <i class="fas fa-gauge-high landing-card-icon" style="color: #c4a35a;"></i>
+    <div>
+      <strong>Usage Quotas</strong>
+      <p>Per-operation request budgets: pooled admission, unmetered operations, ungated deletes, and where the counters live.</p>
     </div>
   </a>
   <a class="landing-card" href="background-services/">

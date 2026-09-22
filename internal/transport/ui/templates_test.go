@@ -15,6 +15,10 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
+// -------------------------------------------------------------------------
+// CONSTRUCTOR
+// -------------------------------------------------------------------------
+
 // newTestCounterVec returns a fresh CounterVec backed by an isolated
 // registry so the counterVecTotal test does not interact with the
 // global telemetry counters. The vec is unregistered - the helper only
@@ -25,6 +29,10 @@ func newTestCounterVec() *prometheus.CounterVec {
 		Help: "isolated counter for counterVecTotal tests",
 	}, []string{"operation"})
 }
+
+// -------------------------------------------------------------------------
+// PUBLIC API
+// -------------------------------------------------------------------------
 
 // TestCounterVecTotal exercises the snapshot helper that surfaces
 // integrity check / error totals on the dashboard. Uses an isolated
@@ -44,33 +52,6 @@ func TestCounterVecTotal(t *testing.T) {
 
 	if got := counterVecTotal(vec); got != 3 {
 		t.Errorf("populated vec total = %v, want 3 (2 read + 1 scrub)", got)
-	}
-}
-
-// TestFormatBytes verifies the format bytes contract.
-// Asserts that formatBytes() = , want.
-func TestFormatBytes(t *testing.T) {
-	t.Parallel()
-	tests := []struct {
-		input int64
-		want  string
-	}{
-		{0, "0 B"},
-		{1, "1 B"},
-		{512, "512 B"},
-		{1023, "1023 B"},
-		{1024, "1.0 KiB"},
-		{1536, "1.5 KiB"},
-		{1048576, "1.0 MiB"},
-		{1073741824, "1.0 GiB"},
-		{1099511627776, "1.0 TiB"},
-	}
-
-	for _, tt := range tests {
-		got := formatBytes(tt.input)
-		if got != tt.want {
-			t.Errorf("formatBytes(%d) = %q, want %q", tt.input, got, tt.want)
-		}
 	}
 }
 
@@ -162,8 +143,8 @@ func TestBarColor(t *testing.T) {
 		{85, 100, "#f59e0b"},  // amber (85%)
 		{90, 100, "#ef4444"},  // red (90%)
 		{100, 100, "#ef4444"}, // red (100%)
-		{0, 0, "#6b7280"},    // gray (unlimited)
-		{500, 0, "#6b7280"},  // gray (unlimited)
+		{0, 0, "#6b7280"},     // gray (unlimited)
+		{500, 0, "#6b7280"},   // gray (unlimited)
 	}
 
 	for _, tt := range tests {
@@ -171,5 +152,55 @@ func TestBarColor(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("barColor(%d, %d) = %q, want %q", tt.used, tt.limit, got, tt.want)
 		}
+	}
+}
+
+// TestSub covers the subtraction the savings figures rely on, including the
+// negative case: an encoding that grew is a real state on a fleet where the
+// ratio floor was widened after the fact, and the page must show it rather than
+// clamp it to zero.
+func TestSub(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		a, b int64
+		want int64
+	}{
+		{"a saving", 1000, 250, 750},
+		{"nothing saved", 500, 500, 0},
+		{"grew", 500, 600, -100},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := sub(tt.a, tt.b); got != tt.want {
+				t.Errorf("sub(%d, %d) = %d, want %d", tt.a, tt.b, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestRatio covers the compression ratio cell, whose interesting case is an
+// empty fleet: nothing measured is a dash, not a zero, since a zero there reads
+// as an encoder achieving perfect compression.
+func TestRatio(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		a, b int64
+		want string
+	}{
+		{"quarter", 250, 1000, "0.25"},
+		{"no saving", 1000, 1000, "1.00"},
+		{"nothing measured", 0, 0, "-"},
+		{"stored without logical", 100, 0, "-"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := ratio(tt.a, tt.b); got != tt.want {
+				t.Errorf("ratio(%d, %d) = %q, want %q", tt.a, tt.b, got, tt.want)
+			}
+		})
 	}
 }

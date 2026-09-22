@@ -17,22 +17,18 @@
 //                       and telemetry side effects
 //   - admissionGate   : bounded-concurrency admission semaphore
 //
-// The public surface of *BackendRuntime is unchanged from before this split: it
-// still exposes Backends(), GetBackend(), WithTimeout(), and friends.
-// The methods are now thin forwards into the appropriate capability,
-// which keeps the consumer-declared interface pattern intact (callers
-// still see methods on *BackendRuntime, not new producer-side interfaces) and
-// makes each capability easy to test in isolation.
+// *BackendRuntime exposes Backends(), GetBackend(), WithTimeout(), and
+// friends as thin forwards into the appropriate capability, which keeps
+// the consumer-declared interface pattern intact (callers see methods on
+// *BackendRuntime, not producer-side interfaces) and makes each
+// capability easy to test in isolation.
 // -------------------------------------------------------------------------------
 
-// Package infra exposes the proxy-package backend infrastructure (backend
-// map, usage tracker, drain checker, metrics, admission, per-op timeouts)
-// as an importable type so subpackages can share it without an import
-// cycle back to the root proxy package.
 package infra
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -43,6 +39,8 @@ import (
 	"github.com/afreidah/s3-orchestrator/internal/counter"
 	"github.com/afreidah/s3-orchestrator/internal/proxy/accounting"
 	"github.com/afreidah/s3-orchestrator/internal/proxy/metrics"
+	"github.com/afreidah/s3-orchestrator/internal/s3op"
+	"github.com/afreidah/s3-orchestrator/internal/store/core"
 )
 
 // DrainChecker reports whether a named backend is currently being drained.
@@ -59,6 +57,7 @@ type Config struct {
 	Order            []string
 	BackendTimeout   time.Duration
 	Usage            *counter.UsageTracker
+	Quota            *counter.QuotaTracker
 	RoutingStrategy  config.RoutingStrategy
 	MaxObjectSizes   map[string]int64
 	MetricsCollector *metrics.Collector
@@ -67,13 +66,14 @@ type Config struct {
 }
 
 // BackendRuntime composes the five capability services every proxy subpackage
-// needs. Per-role store views live on the root-package BackendManager;
-// *BackendRuntime deliberately holds none. For which methods belong here
-// versus on *BackendManager, see docs/style-guide.md "Where new methods
-// live: infra.BackendRuntime vs *BackendManager".
+// needs. It deliberately holds no store: each collaborator takes the store
+// roles it needs directly, which is what lets every worker reuse the runtime
+// without dragging persistence along. For which methods belong here versus on
+// a collaborator, see docs/style-guide.md "Where new methods live".
 type BackendRuntime struct {
 	registry         *backendRegistry
 	usage            *usagePolicy
+	quota            *counter.QuotaTracker
 	timeouts         *timeoutPolicy
 	classifier       *errorClassifier
 	admission        *admissionGate
@@ -85,7 +85,7 @@ type BackendRuntime struct {
 
 // New constructs a *BackendRuntime from cfg. The drain checker is wired
 // post-construction via SetDrainChecker to break the
-// BackendManager ↔ drain.Manager cycle. The accounting Recorder is
+// BackendRuntime <-> drain.Manager cycle. The accounting Recorder is
 // built here so every consumer of *BackendRuntime shares one instance that
 // observes the same usage tracker and the (later-wired) metrics
 // collector via the closure over c.RecordOperation.
@@ -93,6 +93,7 @@ func New(cfg *Config) *BackendRuntime {
 	c := &BackendRuntime{
 		registry:         newBackendRegistry(cfg.Backends, cfg.Order),
 		usage:            newUsagePolicy(cfg.Usage, cfg.MaxObjectSizes),
+		quota:            cfg.Quota,
 		timeouts:         newTimeoutPolicy(cfg.BackendTimeout),
 		classifier:       newErrorClassifier(),
 		admission:        newAdmissionGate(cfg.AdmissionSem),
@@ -199,6 +200,13 @@ func (c *BackendRuntime) Usage() *counter.UsageTracker {
 	return c.usage.Tracker()
 }
 
+// Quota returns the byte-reservation tracker every write path consults before
+// it writes and credits after it commits. A deployment always has one: it is
+// what answers whether a backend has room, which no other component knows.
+func (c *BackendRuntime) Quota() *counter.QuotaTracker {
+	return c.quota
+}
+
 // MaxObjectSize returns the per-backend max object size; 0 means
 // unlimited.
 func (c *BackendRuntime) MaxObjectSize(name string) int64 {
@@ -209,10 +217,10 @@ func (c *BackendRuntime) MaxObjectSize(name string) int64 {
 // circuit-broken, and within usage limits / max-object-size for the
 // given operation. Composed pipeline of registry filters + usage
 // filter so each capability owns its half of the decision.
-func (c *BackendRuntime) EligibleForWrite(apiCalls, egress, ingress int64) []string {
+func (c *BackendRuntime) EligibleForWrite(ops []s3op.Operation, egress, ingress int64) []string {
 	eligible := c.registry.ExcludeDraining(c.registry.Order())
 	eligible = c.registry.ExcludeUnhealthy(eligible)
-	return c.usage.FilterEligible(eligible, apiCalls, egress, ingress)
+	return c.usage.FilterEligible(eligible, ops, egress, ingress)
 }
 
 // -------------------------------------------------------------------------
@@ -255,11 +263,40 @@ func (c *BackendRuntime) DeleteWithTimeout(ctx context.Context, be backend.Objec
 	return c.timeouts.DeleteWithTimeout(ctx, be, key)
 }
 
-// StreamCopy reads an object from src and writes it to dst with
-// timeouts applied to each leg. Returns a *backend.CopyError tagged
-// with the failing phase.
-func (c *BackendRuntime) StreamCopy(ctx context.Context, src, dst backend.ObjectBackend, key string) error {
-	return c.timeouts.StreamCopy(ctx, src, dst, key)
+// StreamCopy reads an object from src and writes it to dst with timeouts
+// applied to each leg, admitting the transfer against both backends' usage
+// limits first. Returns the bytes moved, or a *backend.CopyError tagged with
+// the failing phase.
+//
+// Admission lives here rather than at the call sites because this is the one
+// place every backend-to-backend copy passes through. The replicator used to
+// check only its destination and read from whichever source was healthy,
+// which let a fleet-wide repair drain a source backend's monthly egress
+// budget; the rebalancer checked both sides. Enforcing here makes the two
+// agree by construction and leaves a caller nothing to forget.
+//
+// Accounting stays with the caller. Both callers charge the size their
+// metadata commit settled on rather than the size that crossed the wire, and
+// the two disagree only when an overwrite lands mid-copy, which each of them
+// reports in its own terms. sizeEstimate is what admission is judged on.
+func (c *BackendRuntime) StreamCopy(ctx context.Context, src, dst backend.CopyEndpoint, key string, sizeEstimate int64) (int64, error) {
+	// Refusals are tagged with the leg that had no headroom, so callers get
+	// the same structural retry answer they already act on for I/O failures:
+	// another source may have egress left, but a destination that is full
+	// ends the attempt.
+	if !c.Acct().Allow(src.Name, []s3op.Operation{s3op.GetObject}, sizeEstimate, 0) {
+		return 0, &backend.CopyError{
+			Phase: backend.CopyPhaseRead,
+			Err:   fmt.Errorf("source %s: %w", src.Name, core.ErrUsageLimitExceeded),
+		}
+	}
+	if !c.Acct().Allow(dst.Name, []s3op.Operation{s3op.PutObject}, 0, sizeEstimate) {
+		return 0, &backend.CopyError{
+			Phase: backend.CopyPhaseWrite,
+			Err:   fmt.Errorf("destination %s: %w", dst.Name, core.ErrUsageLimitExceeded),
+		}
+	}
+	return c.timeouts.StreamCopy(ctx, src.Backend, dst.Backend, key)
 }
 
 // GetWithTimeout issues a GET against be using the configured backend

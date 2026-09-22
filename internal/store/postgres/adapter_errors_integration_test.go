@@ -64,30 +64,10 @@ func TestPgAdapterErr_ClaimPending(t *testing.T) {
 	}
 }
 
-// TestPgAdapterErr_InsertPending verifies the Exec error is wrapped.
-func TestPgAdapterErr_InsertPending(t *testing.T) {
-	a := closedPgAdapter(t, adapterPgStore(t))
-	err := a.InsertPending(context.Background(), &core.PendingObject{
-		IntentID: "i", ObjectKey: "k", BackendName: "backend-a", SizeBytes: 1,
-	})
-	if err == nil {
-		t.Error("expected error from closed tx")
-	}
-}
-
 // TestPgAdapterErr_DeletePending verifies the Exec error is wrapped.
 func TestPgAdapterErr_DeletePending(t *testing.T) {
 	a := closedPgAdapter(t, adapterPgStore(t))
 	if err := a.DeletePending(context.Background(), "i"); err == nil {
-		t.Error("expected error from closed tx")
-	}
-}
-
-// TestPgAdapterErr_DeletePendingByBackend verifies the Exec error is
-// wrapped.
-func TestPgAdapterErr_DeletePendingByBackend(t *testing.T) {
-	a := closedPgAdapter(t, adapterPgStore(t))
-	if err := a.DeletePendingByBackend(context.Background(), "backend-a"); err == nil {
 		t.Error("expected error from closed tx")
 	}
 }
@@ -191,20 +171,10 @@ func TestPgAdapterErr_SumAndDeleteCleanupQueueRows(t *testing.T) {
 // QUOTA TX ERRORS
 // -------------------------------------------------------------------------
 
-// TestPgAdapterErr_IncrementBackendQuota verifies the Exec error is
-// wrapped.
-func TestPgAdapterErr_IncrementBackendQuota(t *testing.T) {
+// TestPgAdapterErr_AdjustQuotaStripe verifies the Exec error is wrapped.
+func TestPgAdapterErr_AdjustQuotaStripe(t *testing.T) {
 	a := closedPgAdapter(t, adapterPgStore(t))
-	if err := a.IncrementBackendQuota(context.Background(), "backend-a", 100); err == nil {
-		t.Error("expected error from closed tx")
-	}
-}
-
-// TestPgAdapterErr_DecrementBackendQuota verifies the Exec error is
-// wrapped.
-func TestPgAdapterErr_DecrementBackendQuota(t *testing.T) {
-	a := closedPgAdapter(t, adapterPgStore(t))
-	if err := a.DecrementBackendQuota(context.Background(), "backend-a", 100); err == nil {
+	if err := a.AdjustQuotaStripe(context.Background(), "backend-a", 0, 100); err == nil {
 		t.Error("expected error from closed tx")
 	}
 }

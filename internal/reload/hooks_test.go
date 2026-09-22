@@ -32,21 +32,29 @@ import (
 	"testing"
 	"time"
 
+	"go.uber.org/mock/gomock"
+
 	"github.com/samber/do/v2"
 
 	"github.com/afreidah/s3-orchestrator/internal/backend"
 	"github.com/afreidah/s3-orchestrator/internal/config"
-	"github.com/afreidah/s3-orchestrator/internal/proxy"
+	"github.com/afreidah/s3-orchestrator/internal/ops"
+	"github.com/afreidah/s3-orchestrator/internal/provisioning"
+	"github.com/afreidah/s3-orchestrator/internal/proxy/infra"
 	"github.com/afreidah/s3-orchestrator/internal/proxy/proxytest"
-	"github.com/afreidah/s3-orchestrator/internal/store"
+	"github.com/afreidah/s3-orchestrator/internal/proxy/usage"
 	"github.com/afreidah/s3-orchestrator/internal/store/core"
-	"github.com/afreidah/s3-orchestrator/internal/testutil"
-	"github.com/afreidah/s3-orchestrator/internal/transport/admin"
+	"github.com/afreidah/s3-orchestrator/internal/store/storetest"
+	"github.com/afreidah/s3-orchestrator/internal/transport/cors"
 	"github.com/afreidah/s3-orchestrator/internal/transport/httputil"
 	"github.com/afreidah/s3-orchestrator/internal/transport/s3api"
 	"github.com/afreidah/s3-orchestrator/internal/transport/ui"
 	"github.com/afreidah/s3-orchestrator/internal/worker"
 )
+
+// -------------------------------------------------------------------------
+// CONSTANTS
+// -------------------------------------------------------------------------
 
 // errResolve is the sentinel every "provider registered but errors"
 // case threads through so tests can assert the wrapped error survives.
@@ -60,6 +68,10 @@ func failingProvider[T any](inj do.Injector) {
 		return zero, errResolve
 	})
 }
+
+// -------------------------------------------------------------------------
+// PUBLIC API
+// -------------------------------------------------------------------------
 
 // TestResolutionError_WrapsCause confirms the helper's rendered form
 // includes the subsystem label and unwraps to the original error so
@@ -89,6 +101,10 @@ func TestTlsCertHook_NilReloaderSkipped(t *testing.T) {
 		t.Errorf("Name = %q", h.Name())
 	}
 }
+
+// -------------------------------------------------------------------------
+// INTERNALS
+// -------------------------------------------------------------------------
 
 // writeSelfSignedCert generates a self-signed ECDSA cert/key pair at
 // the given paths so the tlsCertHook tests can drive a real
@@ -123,6 +139,10 @@ func writeSelfSignedCert(t *testing.T, certPath, keyPath string) {
 		t.Fatalf("write key: %v", err)
 	}
 }
+
+// -------------------------------------------------------------------------
+// PUBLIC API
+// -------------------------------------------------------------------------
 
 // TestTlsCertHook_AppliedOnSuccessfulReload wires a real CertReloader
 // over a valid cert pair, then rewrites the cert files with a fresh
@@ -174,35 +194,18 @@ func TestTlsCertHook_FailedOnReloadError(t *testing.T) {
 	}
 }
 
-// fakeLifecycleAdmin implements core.LifecycleAdmin for tests that need
-// to drive the SyncQuotaLimits success and failure branches without
-// standing up a real metadata store.
-type fakeLifecycleAdmin struct {
-	syncErr error
-	calls   int
-}
-
-func (f *fakeLifecycleAdmin) RunMigrations(context.Context) error       { return nil }
-func (f *fakeLifecycleAdmin) VerifySchemaVersion(context.Context) error { return nil }
-func (f *fakeLifecycleAdmin) SyncQuotaLimits(_ context.Context, _ []config.BackendConfig) error {
-	f.calls++
-	return f.syncErr
-}
-func (f *fakeLifecycleAdmin) Close() {}
-
 // TestQuotaSyncHook_AppliedOnSuccess wires a fake LifecycleAdmin whose
 // SyncQuotaLimits returns nil and asserts the hook reports Applied.
 func TestQuotaSyncHook_AppliedOnSuccess(t *testing.T) {
-	fake := &fakeLifecycleAdmin{}
+	fake := storetest.NewMockLifecycleAdmin(gomock.NewController(t))
+	// Exactly one sync is the assertion: the hook must not retry or skip.
+	fake.EXPECT().SyncQuotaLimits(gomock.Any(), gomock.Any()).Return(nil).Times(1)
 	inj := do.New()
 	do.ProvideValue[core.LifecycleAdmin](inj, fake)
 	h := &quotaSyncHook{inj: inj}
 	status, err := h.Apply(context.Background(), nil, &config.Config{})
 	if status != HookApplied || err != nil {
 		t.Fatalf("Apply = (%s, %v), want (applied, nil)", status, err)
-	}
-	if fake.calls != 1 {
-		t.Errorf("SyncQuotaLimits calls = %d, want 1", fake.calls)
 	}
 }
 
@@ -212,7 +215,9 @@ func TestQuotaSyncHook_AppliedOnSuccess(t *testing.T) {
 func TestQuotaSyncHook_FailedOnSyncError(t *testing.T) {
 	syncBoom := errors.New("quota sync failed")
 	inj := do.New()
-	do.ProvideValue[core.LifecycleAdmin](inj, &fakeLifecycleAdmin{syncErr: syncBoom})
+	failing := storetest.NewMockLifecycleAdmin(gomock.NewController(t))
+	failing.EXPECT().SyncQuotaLimits(gomock.Any(), gomock.Any()).Return(syncBoom).AnyTimes()
+	do.ProvideValue[core.LifecycleAdmin](inj, failing)
 	h := &quotaSyncHook{inj: inj}
 	status, err := h.Apply(context.Background(), nil, &config.Config{})
 	if status != HookFailed {
@@ -244,6 +249,73 @@ func TestBucketAuthHook_FailedResolution(t *testing.T) {
 // registered" path: the hook reports Skipped without touching anything.
 func TestBucketAuthHook_SkippedWhenDisabled(t *testing.T) {
 	h := &bucketAuthHook{inj: do.New()}
+	status, err := h.Apply(context.Background(), nil, &config.Config{})
+	if status != HookSkipped || err != nil {
+		t.Fatalf("Apply = (%s, %v), want (skipped, nil)", status, err)
+	}
+}
+
+// TestCORSHook_Applied proves a reload publishes the new rule set to the
+// live policy, which is what makes adding a browser origin a reload rather
+// than a restart.
+func TestCORSHook_Applied(t *testing.T) {
+	inj := do.New()
+	do.Provide(inj, func(do.Injector) (*cors.Policy, error) {
+		return cors.New(s3api.BucketFromPath, s3api.WriteS3Error), nil
+	})
+	h := &corsHook{inj: inj}
+	cfg := &config.Config{Buckets: []config.BucketConfig{{
+		Name: "photos",
+		CORS: []config.CORSRule{{
+			AllowedOrigins: []string{"https://app.example.com"},
+			AllowedMethods: []string{"GET"},
+		}},
+	}}}
+
+	status, err := h.Apply(context.Background(), nil, cfg)
+	if status != HookApplied || err != nil {
+		t.Fatalf("Apply = (%s, %v), want (applied, nil)", status, err)
+	}
+}
+
+// TestCORSHook_CheckRejectsUnreadableRule proves an unusable pattern aborts
+// the reload during Check, so no hook applies anything and the running
+// server keeps the rules it already had.
+func TestCORSHook_CheckRejectsUnreadableRule(t *testing.T) {
+	h := &corsHook{inj: do.New()}
+	cfg := &config.Config{Buckets: []config.BucketConfig{{
+		Name: "photos",
+		CORS: []config.CORSRule{{
+			AllowedOrigins: []string{"https://*.*.example.com"},
+			AllowedMethods: []string{"GET"},
+		}},
+	}}}
+
+	if err := h.Check(nil, cfg); err == nil {
+		t.Error("Check accepted a pattern the matcher cannot read, want an error")
+	}
+}
+
+// TestCORSHook_FailedResolution proves a broken policy provider surfaces as
+// HookFailed rather than being read as "feature off".
+func TestCORSHook_FailedResolution(t *testing.T) {
+	inj := do.New()
+	failingProvider[*cors.Policy](inj)
+	h := &corsHook{inj: inj}
+
+	status, err := h.Apply(context.Background(), nil, &config.Config{})
+	if status != HookFailed {
+		t.Fatalf("status = %s, want failed", status)
+	}
+	if !errors.Is(err, errResolve) {
+		t.Fatalf("err = %v, want wrap of errResolve", err)
+	}
+}
+
+// TestCORSHook_SkippedWhenUnregistered covers the path where no policy is
+// registered at all, which is the worker-only mode with no S3 surface.
+func TestCORSHook_SkippedWhenUnregistered(t *testing.T) {
+	h := &corsHook{inj: do.New()}
 	status, err := h.Apply(context.Background(), nil, &config.Config{})
 	if status != HookSkipped || err != nil {
 		t.Fatalf("Apply = (%s, %v), want (skipped, nil)", status, err)
@@ -312,7 +384,7 @@ func TestQuotaSyncHook_SkippedWhenDisabled(t *testing.T) {
 // TestUsageLimitsHook_FailedResolution drives the Failed branch.
 func TestUsageLimitsHook_FailedResolution(t *testing.T) {
 	inj := do.New()
-	failingProvider[*proxy.BackendManager](inj)
+	failingProvider[*infra.BackendRuntime](inj)
 	h := &usageLimitsHook{inj: inj}
 	status, err := h.Apply(context.Background(), nil, &config.Config{})
 	if status != HookFailed || !errors.Is(err, errResolve) {
@@ -414,6 +486,45 @@ func TestWorkerConfigsHook_FailedScrubber(t *testing.T) {
 	}
 }
 
+// TestWorkerConfigsHook_PushesIntegrityOntoTheReplicator covers the section the
+// replicator gained with verify_on_replicate. The replicator reads two config
+// sections now, and a reload that refreshed only Replication would leave replica
+// verification pinned to whatever it was at startup while the operator watched
+// SIGHUP report success.
+func TestWorkerConfigsHook_PushesIntegrityOntoTheReplicator(t *testing.T) {
+	mock := storetest.NewMockMetadataStore(gomock.NewController(t))
+	st := proxytest.New(t, mock, &proxytest.StackOptions{
+		Runtime: proxytest.NewRuntime(&proxytest.RuntimeOptions{
+			Backends:        map[string]backend.ObjectBackend{},
+			Order:           []string{},
+			RoutingStrategy: config.RoutingPack,
+			Metrics:         mock,
+		}),
+	})
+	workers := proxytest.BuildWorkers(st, mock)
+
+	inj := do.New()
+	do.ProvideValue(inj, workers.Replicator)
+
+	newCfg := &config.Config{
+		Replication: config.ReplicationConfig{Factor: 3},
+		Integrity:   config.IntegrityConfig{Enabled: true, VerifyOnReplicate: true},
+	}
+	h := &workerConfigsHook{inj: inj}
+	status, err := h.Apply(context.Background(), nil, newCfg)
+	if status != HookApplied || err != nil {
+		t.Fatalf("Apply = (%s, %v), want (applied, nil)", status, err)
+	}
+
+	if got := workers.Replicator.Config().Factor; got != 3 {
+		t.Errorf("replication factor = %d, want 3", got)
+	}
+	icfg := workers.Replicator.IntegrityConfig()
+	if icfg == nil || !icfg.ShouldVerifyOnReplicate() {
+		t.Errorf("integrity config = %+v, want replica verification on", icfg)
+	}
+}
+
 // TestWorkerConfigsHook_AllDisabledSkipped is the run-mode case where
 // none of the workers are wired in: the hook reports Skipped because
 // there is nothing to push config onto.
@@ -428,8 +539,8 @@ func TestWorkerConfigsHook_AllDisabledSkipped(t *testing.T) {
 // TestManagerConfigHook_FailedResolution drives the Failed branch.
 func TestManagerConfigHook_FailedResolution(t *testing.T) {
 	inj := do.New()
-	failingProvider[*proxy.BackendManager](inj)
-	h := &managerConfigHook{inj: inj}
+	failingProvider[*usage.Service](inj)
+	h := &runtimeConfigHook{inj: inj}
 	status, err := h.Apply(context.Background(), nil, &config.Config{})
 	if status != HookFailed || !errors.Is(err, errResolve) {
 		t.Fatalf("Apply = (%s, %v), want failed wrapping errResolve", status, err)
@@ -438,7 +549,7 @@ func TestManagerConfigHook_FailedResolution(t *testing.T) {
 
 // TestManagerConfigHook_SkippedWhenDisabled covers the no-provider path.
 func TestManagerConfigHook_SkippedWhenDisabled(t *testing.T) {
-	h := &managerConfigHook{inj: do.New()}
+	h := &runtimeConfigHook{inj: do.New()}
 	status, err := h.Apply(context.Background(), nil, &config.Config{})
 	if status != HookSkipped || err != nil {
 		t.Fatalf("Apply = (%s, %v), want (skipped, nil)", status, err)
@@ -485,12 +596,12 @@ func TestUIHandlerHook_AppliedPushesNewConfig(t *testing.T) {
 // pushes the new limits and returns HookApplied.
 func TestRateLimitHook_AppliedPushesNewLimits(t *testing.T) {
 	inj := do.New()
-	do.Provide(inj, func(do.Injector) (*s3api.RateLimiter, error) {
-		return s3api.NewRateLimiter(config.RateLimitConfig{
-			RequestsPerSec: 1,
-			Burst:          1,
-		}), nil
+	rl := s3api.NewRateLimiter(config.RateLimitConfig{
+		RequestsPerSec: 1,
+		Burst:          1,
 	})
+	t.Cleanup(rl.Close)
+	do.Provide(inj, func(do.Injector) (*s3api.RateLimiter, error) { return rl, nil })
 	h := &rateLimitHook{inj: inj}
 	cfg := &config.Config{}
 	cfg.RateLimit.Enabled = true
@@ -509,12 +620,14 @@ func TestHookNamesStable(t *testing.T) {
 	cases := map[Hook]string{
 		&tlsCertHook{}:       "tls_certificate",
 		&bucketAuthHook{}:    "bucket_credentials",
+		&corsHook{}:          "bucket_cors",
 		&rateLimitHook{}:     "rate_limit",
 		&quotaSyncHook{}:     "quota_sync",
 		&usageLimitsHook{}:   "usage_limits",
 		&logLevelHook{}:      "log_level",
 		&workerConfigsHook{}: "worker_configs",
-		&managerConfigHook{}: "manager_config",
+		&runtimeConfigHook{}: "runtime_config",
+		&opsHook{}:           "ops",
 		&uiHandlerHook{}:     "ui_handler",
 	}
 	for h, want := range cases {
@@ -527,51 +640,127 @@ func TestHookNamesStable(t *testing.T) {
 	}
 }
 
+// -------------------------------------------------------------------------
+// CONSTRUCTOR
+// -------------------------------------------------------------------------
+
 // newUIDepsForReloadTest wires the minimum real deps the ui handler
 // constructor requires. The reload-hook test only exercises UpdateConfig,
 // but the constructor still panics via must.NotNil on missing deps.
 func newUIDepsForReloadTest(t *testing.T) *ui.Deps {
 	t.Helper()
-	mock := testutil.NewMockStore(t)
-	cb := store.NewDatabaseBreaker(config.CircuitBreakerConfig{FailureThreshold: 3})
-	mgr := proxytest.NewManager(t, &proxy.BackendManagerConfig{
-		Storage: proxy.StorageDeps{
-			Backends: map[string]backend.ObjectBackend{},
-			Order:    []string{},
-		},
-		Stores: proxy.StoreDeps{
-			Metadata:  mock,
-			Dashboard: mock,
-		},
-		Policies: proxy.PolicyConfig{
+	mock := storetest.NewMockMetadataStore(gomock.NewController(t))
+	st := proxytest.New(t, mock, &proxytest.StackOptions{
+		Runtime: proxytest.NewRuntime(&proxytest.RuntimeOptions{
+			Backends:        map[string]backend.ObjectBackend{},
+			Order:           []string{},
 			RoutingStrategy: config.RoutingPack,
-		},
-		Operations: proxy.OperationalDeps{
-			Metrics: mock,
-		},
+			Metrics:         mock,
+		}),
 	})
-	workers := proxytest.BuildWorkers(mgr, mock)
-	t.Cleanup(mgr.Close)
-	var lv slog.LevelVar
-	adminHandler := admin.New(&admin.Deps{
-		BackendOps: mgr,
-		RuntimeOps: mgr.Runtime(),
-		Replicator: workers.Replicator,
-		OverRep:    workers.OverReplicationCleaner,
-		Drain:      mgr.Drain(),
-		Scrubber:   workers.Scrubber,
-		Lifecycle:  mock,
-		DBHealthy:  cb.IsHealthy,
-		Encryption: mock,
-		Objects:    mock,
-		Cleanup:    mock,
-		Token:      "test-token",
-		LogLevel:   &lv,
+	workers := proxytest.BuildWorkers(st, mock)
+	svc := ops.New(&ops.Deps{
+		Objects:      st.Objects,
+		Store:        mock,
+		EncStore:     mock,
+		Runtime:      st.Runtime,
+		Usage:        st.Runtime.Usage(),
+		IntegrityCfg: st.IntegrityCfg,
+		Replicator:   workers.Replicator,
+		OverRep:      workers.OverReplicationCleaner,
+		Rebalancer:   workers.Rebalancer,
+		Scrubber:     workers.Scrubber,
+		Declared:     provisioning.NewDeclared(),
+		Cfg:          &config.Config{},
 	})
 	return &ui.Deps{
-		BackendOps:   mgr,
-		Objects:      mgr.Objects(),
-		AdminHandler: adminHandler,
-		Cfg:          &config.Config{},
+		Objects:     svc.Objects,
+		Integrity:   svc.Integrity,
+		Replication: svc.Replication,
+		Rebalance:   svc.Rebalance,
+		Encryption:  svc.Encryption,
+		Compression: svc.Compression,
+		Buckets:     provisioning.NewDeclared(),
+		Cfg:         &config.Config{},
+	}
+}
+
+// duplicateKeyConfig is a config whose buckets both claim one access key.
+func duplicateKeyConfig() *config.Config {
+	return &config.Config{Buckets: []config.BucketConfig{
+		{Name: "backups", Credentials: []config.CredentialConfig{
+			{AccessKeyID: "SAME", SecretAccessKey: "backups-secret"},
+		}},
+		{Name: "traces", Credentials: []config.CredentialConfig{
+			{AccessKeyID: "SAME", SecretAccessKey: "traces-secret"},
+		}},
+	}}
+}
+
+// -------------------------------------------------------------------------
+// PUBLIC API
+// -------------------------------------------------------------------------
+
+// emptyProvisioningStore registers a store answering every listing empty, which
+// the hook reads because a reload assembles the registry from config merged with
+// the store. Without it a hook fails on the missing dependency rather than on
+// the config it was handed, and a test asserting rejection would pass for the
+// wrong reason.
+func emptyProvisioningStore(t *testing.T, inj do.Injector) {
+	t.Helper()
+	s := storetest.NewMockProvisioningStore(gomock.NewController(t))
+	a := gomock.Any()
+	s.EXPECT().ListBuckets(a).Return(nil, nil).AnyTimes()
+	s.EXPECT().ListUsers(a).Return(nil, nil).AnyTimes()
+	s.EXPECT().ListCredentials(a).Return(nil, nil).AnyTimes()
+	s.EXPECT().ListGrants(a).Return(nil, nil).AnyTimes()
+	do.ProvideValue[core.ProvisioningStore](inj, s)
+	do.ProvideValue(inj, provisioning.NewDeclared())
+}
+
+// TestBucketAuthHook_CheckRejectsAmbiguousCredential proves an ambiguous
+// credential is caught in the Check pass. That is what matters for safety:
+// Reload aborts before any hook applies, so the server keeps serving with the
+// registry it already had rather than one where an access key resolves to
+// whichever bucket happened to be written last.
+func TestBucketAuthHook_CheckRejectsAmbiguousCredential(t *testing.T) {
+	inj := do.New()
+	emptyProvisioningStore(t, inj)
+	h := &bucketAuthHook{inj: inj}
+	if err := h.Check(&config.Config{}, duplicateKeyConfig()); err == nil {
+		t.Fatal("Check must reject an access key claimed by two buckets")
+	}
+}
+
+// TestBucketAuthHook_CheckAcceptsDistinctCredentials verifies the Check pass
+// stays out of the way of a valid reload.
+func TestBucketAuthHook_CheckAcceptsDistinctCredentials(t *testing.T) {
+	inj := do.New()
+	emptyProvisioningStore(t, inj)
+	h := &bucketAuthHook{inj: inj}
+	cfg := &config.Config{Buckets: []config.BucketConfig{
+		{Name: "backups", Credentials: []config.CredentialConfig{
+			{AccessKeyID: "AKIABACKUPS", SecretAccessKey: "backups-secret"},
+		}},
+		{Name: "traces", Credentials: []config.CredentialConfig{
+			{AccessKeyID: "AKIATRACES", SecretAccessKey: "traces-secret"},
+		}},
+	}}
+	if err := h.Check(&config.Config{}, cfg); err != nil {
+		t.Fatalf("Check rejected a valid config: %v", err)
+	}
+}
+
+// TestBucketAuthHook_ApplyRejectsAmbiguousCredential covers the Apply path
+// directly, so a caller that skipped Check still cannot install a registry
+// built from an ambiguous credential.
+func TestBucketAuthHook_ApplyRejectsAmbiguousCredential(t *testing.T) {
+	inj := do.New()
+	do.ProvideValue(inj, &s3api.Server{})
+	emptyProvisioningStore(t, inj)
+	h := &bucketAuthHook{inj: inj}
+	status, err := h.Apply(context.Background(), nil, duplicateKeyConfig())
+	if status != HookFailed || err == nil {
+		t.Fatalf("Apply = (%s, %v), want (failed, error)", status, err)
 	}
 }

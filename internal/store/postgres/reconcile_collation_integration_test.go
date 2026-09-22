@@ -28,6 +28,7 @@ import (
 	"github.com/afreidah/s3-orchestrator/internal/backend"
 	"github.com/afreidah/s3-orchestrator/internal/config"
 	"github.com/afreidah/s3-orchestrator/internal/proxy/reconcile"
+	"github.com/afreidah/s3-orchestrator/internal/store/core"
 )
 
 // adversarialKeys sorts differently under byte order vs a locale/ICU collation:
@@ -53,7 +54,7 @@ func seedAdversarialKeys(t *testing.T, s *Store, backendName string) {
 		t.Fatalf("SyncQuotaLimits(%q): %v", backendName, err)
 	}
 	for _, k := range adversarialKeys {
-		if _, err := s.RecordObject(ctx, k, backendName, 1, nil); err != nil {
+		if _, _, err := s.RecordObject(ctx, &core.RecordObjectRequest{Key: k, Copies: []core.ObjectCopy{{Backend: backendName}}, Size: 1}); err != nil {
 			t.Fatalf("RecordObject(%q, %q): %v", k, backendName, err)
 		}
 	}
@@ -165,12 +166,14 @@ func runReconcile(t *testing.T, s *Store, backendName string, keys []string) rec
 
 	fake := &fakeObjectLister{keys: keys}
 	db := reconcile.NewDBCursorStream(reconcile.DBCursorStreamDeps{Store: s, BackendName: backendName})
-	s3 := reconcile.NewS3KeyStream(ctx, fake, "", nil, nil)
+	s3 := reconcile.NewS3KeyStream(ctx, fake, nil, nil, "")
 	defer s3.Stop()
 	defer db.Stop()
 
 	var res reconcile.Result
-	importer := func(_ context.Context, _, _ string, _ int64) (bool, error) { return true, nil }
+	importer := func(_ context.Context, _ *core.ImportObjectRequest) (core.ImportOutcome, error) {
+		return core.ImportInserted, nil
+	}
 	deleter := func(_ context.Context, _, _ string) error { return nil }
 	onImp := reconcile.ImportHandler(slog.Default(), backendName, importer, &res)
 	onDel := reconcile.DeleteHandler(slog.Default(), backendName, deleter, &res)

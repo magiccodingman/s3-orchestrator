@@ -13,94 +13,11 @@ package sqlite
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"fmt"
-	"time"
 
 	"github.com/afreidah/s3-orchestrator/internal/config"
 	"github.com/afreidah/s3-orchestrator/internal/store/core"
 )
-
-// -------------------------------------------------------------------------
-// ROUTING ELIGIBILITY
-// -------------------------------------------------------------------------
-
-// GetBackendWithSpace finds a backend with enough quota for the given size.
-// Returns the backend name or ErrNoSpaceAvailable if none have enough space.
-func (s *Store) GetBackendWithSpace(ctx context.Context, size int64, backendOrder []string) (string, error) {
-	for _, name := range backendOrder {
-		var available int64
-		err := s.db.QueryRowContext(ctx, `
-			SELECT CASE
-				WHEN q.bytes_limit = 0 THEN 9223372036854775807
-				ELSE (q.bytes_limit - q.bytes_used - q.orphan_bytes - COALESCE(m.inflight, 0))
-			END AS available
-			FROM backend_quotas q
-			LEFT JOIN (
-				SELECT mu.backend_name, SUM(mp.size_bytes) AS inflight
-				FROM multipart_uploads mu
-				JOIN multipart_parts mp ON mp.upload_id = mu.upload_id
-				GROUP BY mu.backend_name
-			) m ON m.backend_name = q.backend_name
-			WHERE q.backend_name = ?`, name).Scan(&available)
-		if err == sql.ErrNoRows {
-			continue
-		}
-		if err != nil {
-			return "", fmt.Errorf("failed to check quota for %s: %w", name, err)
-		}
-
-		if available >= size {
-			return name, nil
-		}
-	}
-
-	return "", core.ErrNoSpaceAvailable
-}
-
-// GetLeastUtilizedBackend finds the backend with the lowest utilization ratio
-// that has enough space for the given size. Used by the "spread" routing
-// strategy. The eligible list expands inside SQLite via the JSON1
-// extension's json_each, so the query body is a fixed literal with no
-// dynamic SQL string construction.
-func (s *Store) GetLeastUtilizedBackend(ctx context.Context, size int64, eligible []string) (string, error) {
-	if len(eligible) == 0 {
-		return "", core.ErrNoSpaceAvailable
-	}
-
-	eligibleJSON, err := json.Marshal(eligible)
-	if err != nil {
-		return "", fmt.Errorf("encode eligible backend list: %w", err)
-	}
-
-	const query = `
-		SELECT q.backend_name
-		FROM backend_quotas q
-		LEFT JOIN (
-			SELECT mu.backend_name, SUM(mp.size_bytes) AS inflight
-			FROM multipart_uploads mu
-			JOIN multipart_parts mp ON mp.upload_id = mu.upload_id
-			GROUP BY mu.backend_name
-		) m ON m.backend_name = q.backend_name
-		WHERE q.backend_name IN (SELECT value FROM json_each(?))
-		  AND CASE WHEN q.bytes_limit = 0 THEN 9223372036854775807
-		           ELSE (q.bytes_limit - q.bytes_used - q.orphan_bytes - COALESCE(m.inflight, 0))
-		      END >= ?
-		ORDER BY CASE WHEN q.bytes_limit = 0 THEN 0.0
-		              ELSE CAST(q.bytes_used + q.orphan_bytes AS REAL) / CAST(q.bytes_limit AS REAL)
-		         END ASC
-		LIMIT 1`
-
-	var backendName string
-	err = s.db.QueryRowContext(ctx, query, string(eligibleJSON), size).Scan(&backendName)
-	if err == sql.ErrNoRows {
-		return "", core.ErrNoSpaceAvailable
-	}
-	if err != nil {
-		return "", fmt.Errorf("failed to find least utilized backend: %w", err)
-	}
-	return backendName, nil
-}
 
 // -------------------------------------------------------------------------
 // QUOTA ADMIN AND STATS
@@ -110,11 +27,11 @@ func (s *Store) GetLeastUtilizedBackend(ctx context.Context, size int64, eligibl
 // backends with their quota limits. Creates new entries or updates existing limits.
 func (s *Store) SyncQuotaLimits(ctx context.Context, backends []config.BackendConfig) error {
 	return s.withTx(ctx, func(tx *sql.Tx) error {
-		now := time.Now().UTC().Format(time.RFC3339Nano)
+		now := now()
 		for i := range backends {
 			if _, err := tx.ExecContext(ctx, `
-				INSERT INTO backend_quotas (backend_name, bytes_limit, bytes_used, updated_at)
-				VALUES (?, ?, 0, ?)
+				INSERT INTO backend_quotas (backend_name, bytes_limit, updated_at)
+				VALUES (?, ?, ?)
 				ON CONFLICT (backend_name) DO UPDATE SET
 					bytes_limit = excluded.bytes_limit,
 					updated_at = excluded.updated_at`,
@@ -129,37 +46,74 @@ func (s *Store) SyncQuotaLimits(ctx context.Context, backends []config.BackendCo
 // GetQuotaStats returns quota statistics for all backends.
 func (s *Store) GetQuotaStats(ctx context.Context) (map[string]core.QuotaStat, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT backend_name, bytes_used, bytes_limit, orphan_bytes, updated_at
-		FROM backend_quotas`)
+		SELECT q.backend_name,
+		       COALESCE(MAX(0, s.bytes_used), 0),
+		       q.bytes_limit,
+		       q.orphan_bytes,
+		       q.updated_at
+		FROM backend_quotas q
+		LEFT JOIN (
+			SELECT backend_name, SUM(bytes_used) AS bytes_used
+			FROM backend_quota_stripes
+			GROUP BY backend_name
+		) s ON s.backend_name = q.backend_name`)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query quota stats: %w", err)
 	}
-	defer rows.Close()
-
-	stats := make(map[string]core.QuotaStat)
-	for rows.Next() {
-		var qs core.QuotaStat
-		var updatedAt string
+	return collectMap(rows, "quota stats", func(rows *sql.Rows) (string, core.QuotaStat, error) {
+		var (
+			qs        core.QuotaStat
+			updatedAt string
+		)
 		if err := rows.Scan(&qs.BackendName, &qs.BytesUsed, &qs.BytesLimit, &qs.OrphanBytes, &updatedAt); err != nil {
-			return nil, fmt.Errorf("failed to scan quota stat: %w", err)
+			return "", core.QuotaStat{}, fmt.Errorf("failed to scan quota stat: %w", err)
 		}
-		qs.UpdatedAt, err = parseTime(updatedAt)
+		parsed, err := parseTime(updatedAt)
 		if err != nil {
-			return nil, fmt.Errorf("invalid updated_at timestamp %q: %w", updatedAt, err)
+			return "", core.QuotaStat{}, fmt.Errorf("invalid updated_at timestamp %q: %w", updatedAt, err)
 		}
-		stats[qs.BackendName] = qs
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("failed to iterate quota stats: %w", err)
-	}
-	return stats, nil
+		qs.UpdatedAt = parsed
+		return qs.BackendName, qs, nil
+	})
 }
 
-// ReconcileUsage recomputes bytes_used from the object_locations ledger.
-// Delegates to core.ReconcileUsage so both engines share the diff-and-correct
-// logic inside a single transaction.
-func (s *Store) ReconcileUsage(ctx context.Context) (map[string]int64, error) {
-	return core.ReconcileUsage(ctx, s)
+// ListBackendQuotaUsage returns each backend's ceiling and the byte totals a
+// write is judged against, for the quota tracker's baseline refresh. The
+// in-flight join mirrors GetBackendWithSpace: parts of uploads that have not
+// completed occupy the backend without appearing in bytes_used.
+func (s *Store) ListBackendQuotaUsage(ctx context.Context) ([]core.BackendQuotaUsage, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT q.backend_name, q.bytes_limit,
+		       COALESCE(MAX(0, s.bytes_used), 0),
+		       q.orphan_bytes,
+		       COALESCE(m.inflight, 0) + COALESCE(p.inflight, 0) AS inflight_bytes
+		FROM backend_quotas q
+		LEFT JOIN (
+			SELECT backend_name, SUM(bytes_used) AS bytes_used
+			FROM backend_quota_stripes
+			GROUP BY backend_name
+		) s ON s.backend_name = q.backend_name
+		LEFT JOIN (
+			SELECT mu.backend_name, SUM(mp.size_bytes) AS inflight
+			FROM multipart_uploads mu
+			JOIN multipart_parts mp ON mp.upload_id = mu.upload_id
+			GROUP BY mu.backend_name
+		) m ON m.backend_name = q.backend_name
+		LEFT JOIN (
+			SELECT backend_name, SUM(size_bytes) AS inflight
+			FROM pending_objects
+			GROUP BY backend_name
+		) p ON p.backend_name = q.backend_name`)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query backend quota usage: %w", err)
+	}
+	return collectRows(rows, "backend quota usage", func(rows *sql.Rows) (core.BackendQuotaUsage, error) {
+		var u core.BackendQuotaUsage
+		if err := rows.Scan(&u.BackendName, &u.BytesLimit, &u.BytesUsed, &u.OrphanBytes, &u.InflightBytes); err != nil {
+			return core.BackendQuotaUsage{}, fmt.Errorf("failed to scan backend quota usage: %w", err)
+		}
+		return u, nil
+	})
 }
 
 // GetObjectCounts returns the number of objects stored on each backend.
@@ -187,21 +141,7 @@ func (s *Store) countObjectsByBackend(ctx context.Context, whereClause, errLabel
 	if err != nil {
 		return nil, fmt.Errorf("failed to query %s: %w", errLabel, err)
 	}
-	defer rows.Close()
-
-	counts := make(map[string]int64)
-	for rows.Next() {
-		var name string
-		var count int64
-		if err := rows.Scan(&name, &count); err != nil {
-			return nil, fmt.Errorf("failed to scan %s: %w", errLabel, err)
-		}
-		counts[name] = count
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("failed to iterate %s: %w", errLabel, err)
-	}
-	return counts, nil
+	return collectMap(rows, errLabel, scanNameValue)
 }
 
 // -------------------------------------------------------------------------
@@ -211,7 +151,7 @@ func (s *Store) countObjectsByBackend(ctx context.Context, whereClause, errLabel
 // IncrementOrphanBytes adds bytes to the orphan_bytes counter for a backend.
 // Called when a physical delete fails and is enqueued for retry.
 func (s *Store) IncrementOrphanBytes(ctx context.Context, backendName string, amount int64) error {
-	now := time.Now().UTC().Format(time.RFC3339Nano)
+	now := now()
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE backend_quotas
 		SET orphan_bytes = orphan_bytes + ?, updated_at = ?
@@ -227,7 +167,7 @@ func (s *Store) IncrementOrphanBytes(ctx context.Context, backendName string, am
 // exhausted. Uses MAX(0, x-y) instead of PostgreSQL GREATEST to prevent
 // underflow.
 func (s *Store) DecrementOrphanBytes(ctx context.Context, backendName string, amount int64) error {
-	now := time.Now().UTC().Format(time.RFC3339Nano)
+	now := now()
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE backend_quotas
 		SET orphan_bytes = MAX(0, orphan_bytes - ?), updated_at = ?
@@ -245,7 +185,7 @@ func (s *Store) DecrementOrphanBytes(ctx context.Context, backendName string, am
 // FlushUsageDeltas atomically adds accumulated usage deltas to the persistent
 // usage row. Creates the row if it doesn't exist for this (backend, period).
 func (s *Store) FlushUsageDeltas(ctx context.Context, backendName, period string, apiRequests, egressBytes, ingressBytes int64) error {
-	now := time.Now().UTC().Format(time.RFC3339Nano)
+	now := now()
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO backend_usage (backend_name, period, api_requests, egress_bytes, ingress_bytes, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?)
@@ -261,6 +201,59 @@ func (s *Store) FlushUsageDeltas(ctx context.Context, backendName, period string
 	return nil
 }
 
+// FlushPoolDeltas adds one backend's accumulated per-pool request counts to
+// their persistent rows, one statement per pool so a single bad pool name does
+// not fail the whole flush.
+func (s *Store) FlushPoolDeltas(ctx context.Context, backendName, period string, deltas core.PoolUsage) error {
+	now := now()
+	for pool, requests := range deltas {
+		if requests == 0 {
+			continue
+		}
+		_, err := s.db.ExecContext(ctx, `
+			INSERT INTO backend_request_usage (backend_name, period, pool, requests, updated_at)
+			VALUES (?, ?, ?, ?, ?)
+			ON CONFLICT (backend_name, period, pool) DO UPDATE SET
+				requests   = backend_request_usage.requests + excluded.requests,
+				updated_at = excluded.updated_at`,
+			backendName, period, pool, requests, now)
+		if err != nil {
+			return fmt.Errorf("failed to flush pool deltas: %w", err)
+		}
+	}
+	return nil
+}
+
+// GetPoolUsageForPeriod returns every backend's per-pool request counts for
+// the given period, keyed by backend name.
+func (s *Store) GetPoolUsageForPeriod(ctx context.Context, period string) (map[string]core.PoolUsage, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT backend_name, pool, requests
+		FROM backend_request_usage
+		WHERE period = ?`, period)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	usage := make(map[string]core.PoolUsage)
+	for rows.Next() {
+		var (
+			name     string
+			pool     string
+			requests int64
+		)
+		if err := rows.Scan(&name, &pool, &requests); err != nil {
+			return nil, fmt.Errorf("failed to scan pool usage: %w", err)
+		}
+		if usage[name] == nil {
+			usage[name] = make(core.PoolUsage)
+		}
+		usage[name][pool] = requests
+	}
+	return usage, rows.Err()
+}
+
 // GetUsageForPeriod returns usage statistics for all backends in the given period.
 func (s *Store) GetUsageForPeriod(ctx context.Context, period string) (map[string]core.UsageStat, error) {
 	rows, err := s.db.QueryContext(ctx, `
@@ -270,19 +263,14 @@ func (s *Store) GetUsageForPeriod(ctx context.Context, period string) (map[strin
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
-	stats := make(map[string]core.UsageStat)
-	for rows.Next() {
-		var name string
-		var us core.UsageStat
+	return collectMap(rows, "usage stats", func(rows *sql.Rows) (string, core.UsageStat, error) {
+		var (
+			name string
+			us   core.UsageStat
+		)
 		if err := rows.Scan(&name, &us.APIRequests, &us.EgressBytes, &us.IngressBytes); err != nil {
-			return nil, fmt.Errorf("failed to scan usage stat: %w", err)
+			return "", core.UsageStat{}, fmt.Errorf("failed to scan usage stat: %w", err)
 		}
-		stats[name] = us
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("failed to iterate usage stats: %w", err)
-	}
-	return stats, nil
+		return name, us, nil
+	})
 }

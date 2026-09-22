@@ -14,11 +14,9 @@
 package ui
 
 import (
-	"log/slog"
 	"net/http"
 	"net/url"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/afreidah/s3-orchestrator/internal/observe/telemetry"
@@ -58,34 +56,17 @@ func (h *Handler) handleAPILogs(w http.ResponseWriter, r *http.Request) {
 // unset). The Limit on opts is the client limit plus one so the handler
 // can detect whether more entries exist.
 func buildLogQueryOpts(q url.Values) (telemetry.LogQueryOpts, int) {
-	opts := telemetry.LogQueryOpts{}
-	opts.MinLevel = parseLogLevel(q.Get("level"))
-	opts.Since = parseLogTimestamp(q.Get("since"))
-	opts.Before = parseLogTimestamp(q.Get("before"))
-	opts.Component = q.Get("component")
+	opts := telemetry.LogQueryOpts{
+		MinLevel:  telemetry.ParseLevel(q.Get("level")),
+		Since:     parseLogTimestamp(q.Get("since")),
+		Before:    parseLogTimestamp(q.Get("before")),
+		Component: q.Get("component")}
 
 	requestedLimit := parseLogLimit(q.Get("limit"))
 	if requestedLimit > 0 {
 		opts.Limit = requestedLimit + 1
 	}
 	return opts, requestedLimit
-}
-
-// parseLogLevel maps the string name of a slog level to its numeric
-// value. Unrecognized inputs return slog's zero value (Info), matching
-// the previous behaviour of leaving MinLevel unset.
-func parseLogLevel(lvl string) slog.Level {
-	switch strings.ToUpper(lvl) {
-	case "DEBUG":
-		return slog.LevelDebug
-	case "INFO":
-		return slog.LevelInfo
-	case "WARN":
-		return slog.LevelWarn
-	case "ERROR":
-		return slog.LevelError
-	}
-	return 0
 }
 
 // parseLogTimestamp parses an RFC3339 timestamp into a time.Time. Empty

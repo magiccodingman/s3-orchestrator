@@ -1,0 +1,120 @@
+// -------------------------------------------------------------------------------
+// Ops - Service Construction
+//
+// Author: Alex Freidah
+//
+// One construction site for the whole operations layer. Each service takes
+// only the collaborators it uses, but they share a configuration holder, so a
+// SIGHUP reaches every operation through a single update rather than one hook
+// per service.
+// -------------------------------------------------------------------------------
+
+package ops
+
+import (
+	"github.com/afreidah/s3-orchestrator/internal/config"
+	"github.com/afreidah/s3-orchestrator/internal/encryption"
+)
+
+// -------------------------------------------------------------------------
+// TYPES
+// -------------------------------------------------------------------------
+
+// Deps holds every collaborator the operations layer needs. Encryptor and
+// EncStore are nil when the orchestrator runs without encryption, Codec and
+// CompStore when it runs without a compression codec, and Rebalancer when the
+// worker pool is not wired; the operations that depend on them report that
+// rather than failing.
+type Deps struct {
+	Objects      ObjectAPI
+	Store        ObjectStore
+	Encryptor    *encryption.Encryptor
+	EncStore     EncryptionStore
+	Codec        CompressionCodec
+	CompStore    CompressionStore
+	Runtime      RuntimeOps
+	Usage        UsageGate
+	IntegrityCfg IntegrityConfigLoader
+	Replicator   ReplicatorOps
+	OverRep      OverReplicationOps
+	Rebalancer   RebalancerOps
+	Expiry       LifecycleOps
+	Scrubber     ScrubberOps
+	Provisioning ProvisioningStore
+	Registry     RegistryPublisher
+	Declared     BucketMatcher
+	Cfg          *config.Config
+}
+
+// Services is the assembled operations layer. Transports hold the services
+// they serve; the composition root holds Config so it can push reloads.
+type Services struct {
+	Config      *ConfigStore
+	Objects     *Objects
+	Integrity   *Integrity
+	Replication *Replication
+	Rebalance   *Rebalance
+	Lifecycle   *Lifecycle
+	Encryption  *Encryption
+	Compression *Compression
+	Provision   *Provisioning
+}
+
+// -------------------------------------------------------------------------
+// CONSTRUCTOR
+// -------------------------------------------------------------------------
+
+// New builds every operation service from one dependency bag.
+func New(d *Deps) *Services {
+	cfg := NewConfigStore(d.Cfg)
+	return &Services{
+		Config: cfg,
+		Objects: NewObjects(ObjectsDeps{
+			Objects: d.Objects,
+			Store:   d.Store,
+			Buckets: d.Declared,
+		}),
+		Integrity: NewIntegrity(IntegrityDeps{
+			Scrubber:     d.Scrubber,
+			IntegrityCfg: d.IntegrityCfg,
+		}),
+		Replication: NewReplication(ReplicationDeps{
+			Replicator: d.Replicator,
+			OverRep:    d.OverRep,
+			Runtime:    d.Runtime,
+			Config:     cfg,
+		}),
+		Rebalance: NewRebalance(RebalanceDeps{
+			Rebalancer: d.Rebalancer,
+			Runtime:    d.Runtime,
+			Config:     cfg,
+		}),
+		Lifecycle: NewLifecycle(LifecycleDeps{Expiry: d.Expiry}),
+		Encryption: NewEncryption(EncryptionDeps{
+			Encryptor: d.Encryptor,
+			Store:     d.EncStore,
+			Runtime:   d.Runtime,
+			Usage:     d.Usage,
+		}),
+		Compression: NewCompression(&CompressionDeps{
+			Codec:     d.Codec,
+			Config:    d.Cfg.Compression,
+			Encryptor: d.Encryptor,
+			Store:     d.CompStore,
+			Runtime:   d.Runtime,
+			Usage:     d.Usage,
+		}),
+		Provision: NewProvisioning(ProvisioningDeps{
+			Store:    d.Provisioning,
+			Objects:  d.Store,
+			Registry: d.Registry,
+			Config:   cfg,
+		}),
+	}
+}
+
+// UpdateConfig replaces the configuration every service reads. Called by the
+// reload hook after a successful SIGHUP.
+func (s *Services) UpdateConfig(cfg *config.Config) {
+	s.Config.UpdateConfig(cfg)
+}

@@ -11,6 +11,52 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const clearPendingForKey = `-- name: ClearPendingForKey :many
+DELETE FROM pending_objects
+WHERE object_key = $1
+  AND intent_id <> ALL($2::text[])
+RETURNING intent_id, backend_name, size_bytes
+`
+
+type ClearPendingForKeyParams struct {
+	ObjectKey string
+	Keep      []string
+}
+
+type ClearPendingForKeyRow struct {
+	IntentID    string
+	BackendName string
+	SizeBytes   int64
+}
+
+// Removes the key's intents apart from the ones the caller is committing, and
+// reports what it removed so the caller can clean their bytes off the backends
+// once its own transaction is durable.
+//
+// Unconditional even for a backend the caller is writing to: the row left
+// behind would let an upload still in flight commit a copy of the object this
+// write just replaced. Whether those bytes are deleted is the caller's decision,
+// and a different one.
+func (q *Queries) ClearPendingForKey(ctx context.Context, arg ClearPendingForKeyParams) ([]ClearPendingForKeyRow, error) {
+	rows, err := q.db.Query(ctx, clearPendingForKey, arg.ObjectKey, arg.Keep)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ClearPendingForKeyRow{}
+	for rows.Next() {
+		var i ClearPendingForKeyRow
+		if err := rows.Scan(&i.IntentID, &i.BackendName, &i.SizeBytes); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const countPendingObjects = `-- name: CountPendingObjects :one
 SELECT COUNT(*)::bigint FROM pending_objects
 `
@@ -44,7 +90,9 @@ func (q *Queries) DeletePendingObjectsByBackend(ctx context.Context, backendName
 
 const getStalePendingObjects = `-- name: GetStalePendingObjects :many
 SELECT intent_id, object_key, backend_name, size_bytes,
-       encrypted, encryption_key, key_id, plaintext_size, content_hash, created_at
+       encrypted, encryption_key, key_id, plaintext_size, content_hash, created_at,
+       compression_algorithm, compression_level, compression_format_version, logical_size,
+       etag, content_type, user_metadata, role
 FROM pending_objects
 WHERE created_at <= $1
 ORDER BY created_at ASC
@@ -78,6 +126,14 @@ func (q *Queries) GetStalePendingObjects(ctx context.Context, arg GetStalePendin
 			&i.PlaintextSize,
 			&i.ContentHash,
 			&i.CreatedAt,
+			&i.CompressionAlgorithm,
+			&i.CompressionLevel,
+			&i.CompressionFormatVersion,
+			&i.LogicalSize,
+			&i.Etag,
+			&i.ContentType,
+			&i.UserMetadata,
+			&i.Role,
 		); err != nil {
 			return nil, err
 		}
@@ -89,24 +145,60 @@ func (q *Queries) GetStalePendingObjects(ctx context.Context, arg GetStalePendin
 	return items, nil
 }
 
-const insertPendingObject = `-- name: InsertPendingObject :exec
+const insertPendingObjectIfFits = `-- name: InsertPendingObjectIfFits :execrows
 
 INSERT INTO pending_objects (
     intent_id, object_key, backend_name, size_bytes,
-    encrypted, encryption_key, key_id, plaintext_size, content_hash
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+    encrypted, encryption_key, key_id, plaintext_size, content_hash,
+    compression_algorithm, compression_level, compression_format_version, logical_size,
+    etag, content_type, user_metadata, role
+)
+SELECT $1, $2, $3::text, $4::bigint,
+       $5, $6, $7, $8, $9,
+       $10, $11, $12, $13,
+       $14, $15, $16, $17
+FROM backend_quotas q
+LEFT JOIN (
+    SELECT backend_name, SUM(bytes_used) AS bytes_used
+    FROM backend_quota_stripes GROUP BY backend_name
+) s ON s.backend_name = q.backend_name
+LEFT JOIN (
+    SELECT mu.backend_name, SUM(mp.size_bytes) AS inflight
+    FROM multipart_uploads mu
+    JOIN multipart_parts mp ON mp.upload_id = mu.upload_id
+    GROUP BY mu.backend_name
+) m ON m.backend_name = q.backend_name
+LEFT JOIN (
+    SELECT backend_name, SUM(size_bytes) AS inflight
+    FROM pending_objects GROUP BY backend_name
+) p ON p.backend_name = q.backend_name
+WHERE q.backend_name = $3::text
+  AND (q.bytes_limit = 0
+       OR q.bytes_limit
+          - GREATEST(0, COALESCE(s.bytes_used, 0))::bigint
+          - q.orphan_bytes
+          - COALESCE(m.inflight, 0)
+          - COALESCE(p.inflight, 0) >= $4::bigint)
 `
 
-type InsertPendingObjectParams struct {
-	IntentID      string
-	ObjectKey     string
-	BackendName   string
-	SizeBytes     int64
-	Encrypted     bool
-	EncryptionKey []byte
-	KeyID         *string
-	PlaintextSize *int64
-	ContentHash   *string
+type InsertPendingObjectIfFitsParams struct {
+	IntentID                 string
+	ObjectKey                string
+	BackendName              string
+	SizeBytes                int64
+	Encrypted                bool
+	EncryptionKey            []byte
+	KeyID                    *string
+	PlaintextSize            *int64
+	ContentHash              *string
+	CompressionAlgorithm     *string
+	CompressionLevel         *string
+	CompressionFormatVersion *int16
+	LogicalSize              *int64
+	Etag                     *string
+	ContentType              *string
+	UserMetadata             []byte
+	Role                     string
 }
 
 // -----------------------------------------------------------------------------
@@ -120,8 +212,23 @@ type InsertPendingObjectParams struct {
 // timestamp-aware reaper scan that finds stale rows surviving a failed
 // metadata commit.
 // -----------------------------------------------------------------------------
-func (q *Queries) InsertPendingObject(ctx context.Context, arg InsertPendingObjectParams) error {
-	_, err := q.db.Exec(ctx, insertPendingObject,
+// Claims the bytes and records the intent in one statement, so admission and
+// the durable record of it cannot disagree.
+//
+// The headroom is read inside this statement rather than from a snapshot, which
+// is what makes the limit hold across a fleet: every instance's committed
+// bytes, orphans, and writes in progress are rows here, so two instances
+// admitting at once are judged against the same totals. Zero rows affected
+// means the backend had no room and the caller should try the next candidate.
+//
+// bytes_limit = 0 is unlimited, matching every other reader of the column.
+// backend_name and size_bytes are cast explicitly because they appear both
+// here and in the headroom test below. A bare parameter in a SELECT list takes
+// no type from the INSERT target the way one in VALUES does, so Postgres would
+// otherwise deduce them from the arithmetic in the WHERE, come out with
+// integer, and reject the statement for contradicting the bigint column.
+func (q *Queries) InsertPendingObjectIfFits(ctx context.Context, arg InsertPendingObjectIfFitsParams) (int64, error) {
+	result, err := q.db.Exec(ctx, insertPendingObjectIfFits,
 		arg.IntentID,
 		arg.ObjectKey,
 		arg.BackendName,
@@ -131,13 +238,26 @@ func (q *Queries) InsertPendingObject(ctx context.Context, arg InsertPendingObje
 		arg.KeyID,
 		arg.PlaintextSize,
 		arg.ContentHash,
+		arg.CompressionAlgorithm,
+		arg.CompressionLevel,
+		arg.CompressionFormatVersion,
+		arg.LogicalSize,
+		arg.Etag,
+		arg.ContentType,
+		arg.UserMetadata,
+		arg.Role,
 	)
-	return err
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const lockPendingForUpdate = `-- name: LockPendingForUpdate :one
 SELECT intent_id, object_key, backend_name, size_bytes,
-       encrypted, encryption_key, key_id, plaintext_size, content_hash, created_at
+       encrypted, encryption_key, key_id, plaintext_size, content_hash, created_at,
+       compression_algorithm, compression_level, compression_format_version, logical_size,
+       etag, content_type, user_metadata, role
 FROM pending_objects
 WHERE intent_id = $1
 FOR UPDATE
@@ -161,6 +281,14 @@ func (q *Queries) LockPendingForUpdate(ctx context.Context, intentID string) (Pe
 		&i.PlaintextSize,
 		&i.ContentHash,
 		&i.CreatedAt,
+		&i.CompressionAlgorithm,
+		&i.CompressionLevel,
+		&i.CompressionFormatVersion,
+		&i.LogicalSize,
+		&i.Etag,
+		&i.ContentType,
+		&i.UserMetadata,
+		&i.Role,
 	)
 	return i, err
 }

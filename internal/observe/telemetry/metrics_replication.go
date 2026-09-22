@@ -14,10 +14,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
-// ReplicationPending and related package-level variables used by this package.
+// Replication backlog and copy-creation metrics.
 var (
-	// --- Replication metrics ---
-
 	// ReplicationPending tracks objects currently below the target replication factor.
 	ReplicationPending = promauto.NewGauge(
 		prometheus.GaugeOpts{
@@ -31,6 +29,70 @@ var (
 		prometheus.CounterOpts{
 			Name: "s3o_replication_copies_created_total",
 			Help: "Total number of replica copies created",
+		},
+	)
+
+	// ReplicationWriteCopiesTotal counts the further copies a write placed
+	// itself rather than leaving to the replicator, by what became of each.
+	// Outcome is one of: committed, untrusted (a newer write took the key while
+	// the upload ran), failed (the backend refused it).
+	//
+	// A rising untrusted count is overwrites racing their own extra copies, and
+	// each one costs a rebuild; a rising failed count is the fan-out asking more
+	// of the backends than they will take, and both mean the replicator is
+	// picking up work this was meant to save.
+	ReplicationWriteCopiesTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "s3o_replication_write_copies_total",
+			Help: "Further copies placed during the write, by outcome",
+		},
+		[]string{"outcome"},
+	)
+
+	// DetachedUploadsDepth tracks the writes whose copies are still uploading
+	// after their client was answered.
+	//
+	// The number a healthy fleet sits at is roughly the write rate times how
+	// long a copy takes, so a handful. A rising depth is the signal a backend
+	// is slow rather than broken: nothing fails, nothing retries, and the work
+	// simply accumulates until the ceiling turns the fan-out off.
+	DetachedUploadsDepth = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "s3o_detached_uploads_depth",
+			Help: "Writes whose further copies are still uploading after the response",
+		},
+	)
+
+	// ReplicationWriteCopiesCommitted is how many copies each fan-out write
+	// ended up committing, counting the one that answered the client.
+	//
+	// The number that says whether the feature is working. A distribution
+	// sitting at the replication factor means writes are reaching it on their
+	// own; one drifting toward 1 means they are degrading to a single copy and
+	// the replicator is quietly picking the difference back up, which the
+	// per-copy counters show the reason for.
+	//
+	// Bucketed to small integers because that is what it is: copies, capped by
+	// the factor, which cannot exceed the backend count.
+	ReplicationWriteCopiesCommitted = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "s3o_replication_write_copies_committed",
+			Help:    "Copies committed per fan-out write, including the one that answered the client",
+			Buckets: prometheus.LinearBuckets(1, 1, 6),
+		},
+	)
+
+	// ReplicationWriteFanoutSkippedTotal counts writes that placed a single
+	// copy because no slot was free, leaving the rest to the replicator.
+	//
+	// Every one of these costs what the fan-out exists to avoid - a read of the
+	// object plus the source backend's egress - so a sustained rate means
+	// either the ceiling is too low for the write rate or a backend is falling
+	// behind. The depth gauge above says which.
+	ReplicationWriteFanoutSkippedTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "s3o_replication_write_fanout_skipped_total",
+			Help: "Writes that fell back to a single copy because no detached-upload slot was free",
 		},
 	)
 
@@ -69,8 +131,6 @@ var (
 		},
 	)
 
-	// --- Over-replication cleanup metrics ---
-
 	// OverReplicationPending tracks objects currently above the target replication factor.
 	OverReplicationPending = promauto.NewGauge(
 		prometheus.GaugeOpts{
@@ -84,6 +144,17 @@ var (
 		prometheus.CounterOpts{
 			Name: "s3o_over_replication_removed_total",
 			Help: "Total excess copies removed by over-replication cleanup",
+		},
+	)
+
+	// OverReplicationKeyPreservedTotal counts copies the over-replication
+	// cleaner declined to remove because they held the only usable encryption
+	// key for their object. A non-zero value means some copy set disagrees
+	// about encryption and wants repair.
+	OverReplicationKeyPreservedTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "s3o_over_replication_key_preserved_total",
+			Help: "Copies kept because they held the only usable encryption key for the object",
 		},
 	)
 
@@ -112,5 +183,4 @@ var (
 			Buckets: []float64{1, 5, 10, 30, 60, 120, 300, 600},
 		},
 	)
-
 )

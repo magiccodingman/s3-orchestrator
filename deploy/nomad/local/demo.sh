@@ -20,26 +20,128 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 IMAGE="s3-orchestrator:local"
 PORT=9000
 
-# Force all Nomad commands to target the local dev agent, not any remote
-# cluster that may be configured in the user's shell environment.
+# Pin every Nomad AND Consul endpoint/credential to the local dev agent so a
+# sourced prod profile (e.g. munchbox-env.sh) can never redirect us at a real
+# cluster. The Nomad dev agent's Consul integration falls back to CONSUL_HTTP_*
+# env vars, so leaving those set makes the dev agent self-register nomad/
+# nomad-client services into the real Consul -- clear them too. The demo uses
+# Nomad-native service discovery (provider="nomad"), so no Consul is needed.
 unset NOMAD_TOKEN NOMAD_CACERT NOMAD_CLIENT_CERT NOMAD_CLIENT_KEY NOMAD_TLS_SERVER_NAME NOMAD_NAMESPACE NOMAD_REGION
+unset CONSUL_HTTP_TOKEN CONSUL_CACERT CONSUL_CLIENT_CERT CONSUL_CLIENT_KEY CONSUL_TLS_SERVER_NAME CONSUL_HTTP_SSL CONSUL_HTTP_SSL_VERIFY CONSUL_NAMESPACE
+export NOMAD_ADDR="http://127.0.0.1:4646"
+export CONSUL_HTTP_ADDR="http://127.0.0.1:8500"
 nomad() { NOMAD_ADDR="http://127.0.0.1:4646" command nomad "$@"; }
 
 cd "$REPO_ROOT"
+
+BUCKET="photos"
+PERF_USER="perf"
+PERF_GRANTS="list-buckets,list,read,write,delete"
+CREDENTIALS_FILE="$SCRIPT_DIR/.perf-credentials.env"
+
+# rand_chars draws n characters from the given set.
+#
+# The random source is a fixed-size read rather than a stream, because a reader
+# that stops early leaves the filter writing into a closed pipe: under
+# "set -o pipefail" that SIGPIPE fails the whole script, which is a confusing
+# way for a demo to die before it prints anything.
+rand_chars() {
+    local set="$1" n="$2"
+    head -c 1024 /dev/urandom | LC_ALL=C tr -dc "$set" | cut -c1-"$n"
+}
+
+# The root keypair, minted per run and substituted into the job's config. This
+# is the credential the demo administers itself with: the admin API, the TUI and
+# the dashboard all take it, so there is one thing to hold rather than a token
+# for one surface and a password for another.
+ROOT_ACCESS_KEY="AKIA$(rand_chars 'A-Z0-9' 16)"
+ROOT_SECRET_KEY="$(rand_chars 'A-Za-z0-9' 40)"
+
+# s3o runs the admin CLI out of the image the demo just built, so the demo needs
+# no host-installed binary beyond docker. It signs, rather than presenting a
+# token, which is the path an operator should be on.
+s3o() {
+    docker run --rm --network host "$IMAGE" \
+        admin -addr "http://127.0.0.1:$PORT" \
+        -access-key "$ROOT_ACCESS_KEY" -secret-key "$ROOT_SECRET_KEY" "$@"
+}
+
+# provision_perf_identity creates the user, mints its keypair and grants it the
+# bucket, writing the keypair where the perf suite reads it.
+#
+# Idempotent, because the demo can be re-run against a database that survived
+# the last one: the user and the grant are reused where they already exist. A
+# fresh keypair is minted every run regardless - a minted secret is returned
+# once and never read back, so a previous run's is unrecoverable, and issuing a
+# second keypair for one user is exactly what the model is for.
+provision_perf_identity() {
+    echo "Provisioning the '$PERF_USER' identity..."
+    local listing user_id has_grant minted access_key secret
+
+    # Every call is tolerated rather than fatal: the environment is already up by
+    # this point, and losing the whole demo over a provisioning hiccup would be a
+    # worse outcome than falling back to the config credential.
+    listing=$(s3o -json user list 2>/dev/null || echo '{}')
+    user_id=$(jq -r --arg n "$PERF_USER" \
+        'first(.users[]? | select(.name == $n) | .id) // ""' <<<"$listing" 2>/dev/null || echo "")
+    has_grant=$(jq -r --arg n "$PERF_USER" --arg b "$BUCKET" \
+        'any(.users[]? | select(.name == $n) | .grants[]?;
+             .kind == "bucket" and .name == $b)' <<<"$listing" 2>/dev/null || echo false)
+
+    if [[ -z "$user_id" ]]; then
+        user_id=$(s3o -json user create -name "$PERF_USER" 2>/dev/null \
+            | jq -r '.user_id // ""' 2>/dev/null || echo "")
+    fi
+    if [[ -z "$user_id" ]]; then
+        echo "Warning: could not provision '$PERF_USER'; the perf suite will fall"
+        echo "         back to the config credential and its full access."
+        return 0
+    fi
+
+    if [[ "$has_grant" != "true" ]]; then
+        s3o grant add -user "$user_id" -name "$BUCKET" -permissions "$PERF_GRANTS" >/dev/null 2>&1 || true
+    fi
+
+    minted=$(s3o -json credential issue -user "$user_id" -label "perf suite" 2>/dev/null || echo '{}')
+    access_key=$(jq -r '.access_key_id // ""' <<<"$minted" 2>/dev/null || echo "")
+    secret=$(jq -r '.secret_access_key // ""' <<<"$minted" 2>/dev/null || echo "")
+    if [[ -z "$access_key" || -z "$secret" ]]; then
+        echo "Warning: could not mint a keypair for '$PERF_USER'; the perf suite"
+        echo "         will fall back to the config credential."
+        return 0
+    fi
+
+    # The secret reaches a file the caller owns and nothing else. Written in a
+    # subshell so the tightened umask does not outlive this function.
+    (
+        umask 077
+        cat > "$CREDENTIALS_FILE" <<EOF
+# Written by demo.sh. The perf suite signs as the perf identity, so a run goes
+# through a stored grant rather than the config credential's full access. The
+# root keypair is here too, for reaching the admin API by hand.
+PERF_ACCESS_KEY="$access_key"
+PERF_SECRET_KEY="$secret"
+PERF_USER_ID="$user_id"
+S3O_ACCESS_KEY_ID="$ROOT_ACCESS_KEY"
+S3O_SECRET_ACCESS_KEY="$ROOT_SECRET_KEY"
+EOF
+    )
+    echo "  user $user_id, key $access_key, granted $PERF_GRANTS on $BUCKET"
+}
 
 # --- Teardown ---
 if [[ "${1:-}" == "down" ]]; then
     echo "Tearing down demo environment..."
     nomad job stop -purge s3-orchestrator 2>/dev/null || true
     pkill -f '[n]omad agent -dev' 2>/dev/null || true
-    rm -f /tmp/nomad-demo.pid
+    rm -f /tmp/nomad-demo.pid "$CREDENTIALS_FILE"
     docker compose -f docker-compose.test.yml down -v 2>/dev/null || true
     echo "Done."
     exit 0
 fi
 
 # --- Preflight checks ---
-for cmd in docker nomad; do
+for cmd in docker nomad jq; do
     if ! command -v "$cmd" &>/dev/null; then
         echo "Error: $cmd is required but not installed."
         exit 1
@@ -88,7 +190,10 @@ docker compose -f docker-compose.test.yml up -d tempo loki alloy prometheus graf
 
 # --- Submit job ---
 echo "Submitting Nomad job..."
-sed "s/__HOST_IP__/$HOST_IP/g" "$SCRIPT_DIR/s3-orchestrator.nomad.hcl" | nomad job run -detach -
+sed -e "s/__HOST_IP__/$HOST_IP/g" \
+    -e "s|__ROOT_ACCESS_KEY__|$ROOT_ACCESS_KEY|g" \
+    -e "s|__ROOT_SECRET_KEY__|$ROOT_SECRET_KEY|g" \
+    "$SCRIPT_DIR/s3-orchestrator.nomad.hcl" | nomad job run -detach -
 
 # --- Wait for healthy allocation ---
 echo "Waiting for allocation to become healthy..."
@@ -102,6 +207,18 @@ done
 
 HEALTH=$(curl -s "http://localhost:$PORT/health" 2>/dev/null || true)
 if echo "$HEALTH" | grep -q '"status":"ok"'; then
+    # --- Provision the perf identity ---
+    #
+    # The config file declares one credential on "photos", and a config
+    # credential carries full access because the file has no syntax for
+    # narrowing it. Running the perf suite as that credential would measure the
+    # request path with the permission check trivially satisfied, so the demo
+    # provisions a stored user instead and grants it exactly what the suite
+    # does: list, read, write, delete. Tagging is deliberately absent - the
+    # suite runs no tagging scenario, and a grant that carried it would not be
+    # proving anything.
+    provision_perf_identity
+
     # --- Create Grafana trace→log correlation ---
     curl -s -X POST http://localhost:13000/api/datasources/uid/tempo/correlations \
         -H "Content-Type: application/json" \
@@ -121,10 +238,25 @@ if echo "$HEALTH" | grep -q '"status":"ok"'; then
     echo "  Tempo:      http://localhost:3200"
     echo "  Nomad UI:   http://localhost:4646"
     echo ""
-    echo "  Dashboard login: admin / admin"
+    echo "  Root keypair - the only credential, for the dashboard login, the"
+    echo "  TUI, and the admin API:"
+    echo "    access key: $ROOT_ACCESS_KEY"
+    echo "    secret key: $ROOT_SECRET_KEY"
+    echo ""
+    echo "    export S3O_ADMIN_ADDR=http://localhost:$PORT"
+    echo "    export S3O_ACCESS_KEY_ID=$ROOT_ACCESS_KEY"
+    echo "    export S3O_SECRET_ACCESS_KEY=$ROOT_SECRET_KEY"
+    echo "    s3-orchestrator admin status"
+    echo "    s3-orchestrator tui"
     echo ""
     echo "  Test upload:"
-    echo "    aws --endpoint-url http://localhost:$PORT s3 cp /etc/hostname s3://photos/test.txt"
+    echo "    aws --endpoint-url http://localhost:$PORT s3 cp /etc/hostname s3://$BUCKET/test.txt"
+    echo ""
+    echo "  The '$PERF_USER' identity holds $PERF_GRANTS on $BUCKET."
+    echo "  Its keypair is in $CREDENTIALS_FILE, and 'make perf' signs as it."
+    echo ""
+    echo "  See what it reaches:"
+    echo "    s3-orchestrator admin user list"
     echo ""
     echo "  Nomad agent log: /tmp/nomad-demo.log"
     echo ""

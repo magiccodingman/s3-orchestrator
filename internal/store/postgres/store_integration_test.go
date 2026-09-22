@@ -19,6 +19,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -176,12 +178,12 @@ func TestStoreInt_GetObjectsWithoutHash(t *testing.T) {
 	s := adapterPgStore(t)
 	ctx := context.Background()
 	key := uniqueKey(t, "k")
-	if _, err := s.RecordObject(ctx, key, "backend-a", 100, nil); err != nil {
+	if _, _, err := s.RecordObject(ctx, &core.RecordObjectRequest{Key: key, Copies: []core.ObjectCopy{{Backend: "backend-a"}}, Size: 100}); err != nil {
 		t.Fatalf("RecordObject: %v", err)
 	}
-	defer func() { _, _ = s.DeleteObject(ctx, key) }()
+	defer func() { _, _, _ = s.DeleteObject(ctx, key) }()
 
-	rows, err := s.GetObjectsWithoutHash(ctx, 1000, 0)
+	rows, err := s.GetObjectsWithoutHash(ctx, 1000, 0, "")
 	if err != nil {
 		t.Fatalf("GetObjectsWithoutHash: %v", err)
 	}
@@ -199,7 +201,7 @@ func TestStoreInt_GetObjectsWithoutHash(t *testing.T) {
 	if err := s.UpdateContentHash(ctx, key, "backend-a", "deadbeef"); err != nil {
 		t.Fatalf("UpdateContentHash: %v", err)
 	}
-	rows, err = s.GetObjectsWithoutHash(ctx, 1000, 0)
+	rows, err = s.GetObjectsWithoutHash(ctx, 1000, 0, "")
 	if err != nil {
 		t.Fatalf("GetObjectsWithoutHash(after): %v", err)
 	}
@@ -210,28 +212,26 @@ func TestStoreInt_GetObjectsWithoutHash(t *testing.T) {
 	}
 }
 
-// TestStoreInt_GetRandomHashedObjects verifies the helper returns
+// TestStoreInt_GetLeastRecentlyScrubbedObjects verifies the helper returns
 // hashed rows. The clamp on small/zero limits is exercised too.
-func TestStoreInt_GetRandomHashedObjects(t *testing.T) {
+func TestStoreInt_GetLeastRecentlyScrubbedObjects(t *testing.T) {
 	s := adapterPgStore(t)
 	ctx := context.Background()
 	key := uniqueKey(t, "k")
-	if _, err := s.RecordObject(ctx, key, "backend-a", 100, nil); err != nil {
+	if _, _, err := s.RecordObject(ctx, &core.RecordObjectRequest{Key: key, Copies: []core.ObjectCopy{{Backend: "backend-a"}}, Size: 100}); err != nil {
 		t.Fatalf("RecordObject: %v", err)
 	}
-	defer func() { _, _ = s.DeleteObject(ctx, key) }()
+	defer func() { _, _, _ = s.DeleteObject(ctx, key) }()
 	if err := s.UpdateContentHash(ctx, key, "backend-a", "abc123"); err != nil {
 		t.Fatalf("UpdateContentHash: %v", err)
 	}
 
-	// The query uses TABLESAMPLE / RANDOM and may return 0 rows on a
-	// small table; we assert only that the query runs without error.
-	if _, err := s.GetRandomHashedObjects(ctx, 100); err != nil {
-		t.Fatalf("GetRandomHashedObjects: %v", err)
+	if _, err := s.GetLeastRecentlyScrubbedObjects(ctx, 100, []string{"backend-a"}); err != nil {
+		t.Fatalf("GetLeastRecentlyScrubbedObjects: %v", err)
 	}
 	// Zero/negative limits clamp to 1, exercising the safeLimit branch.
-	if _, err := s.GetRandomHashedObjects(ctx, 0); err != nil {
-		t.Errorf("GetRandomHashedObjects(0): %v", err)
+	if _, err := s.GetLeastRecentlyScrubbedObjects(ctx, 0, []string{"backend-a"}); err != nil {
+		t.Errorf("GetLeastRecentlyScrubbedObjects(0): %v", err)
 	}
 }
 
@@ -314,6 +314,66 @@ func TestStoreInt_UsageFlushAndRead(t *testing.T) {
 	}
 }
 
+// TestStoreInt_PoolUsageFlushAndRead exercises the per-pool counters
+// admission is judged against: the insert and additive-upsert paths of
+// FlushPoolDeltas, and the period-scoped read that seeds the baselines.
+func TestStoreInt_PoolUsageFlushAndRead(t *testing.T) {
+	s := adapterPgStore(t)
+	ctx := context.Background()
+	period := "2026-06"
+
+	if err := s.FlushPoolDeltas(ctx, "backend-a", period, core.PoolUsage{"class_a": 10, "class_b": 4}); err != nil {
+		t.Fatalf("FlushPoolDeltas(insert): %v", err)
+	}
+	// Second flush exercises the upsert path, which is what lets several
+	// instances flush the same period without losing each other's deltas.
+	if err := s.FlushPoolDeltas(ctx, "backend-a", period, core.PoolUsage{"class_a": 5}); err != nil {
+		t.Fatalf("FlushPoolDeltas(upsert): %v", err)
+	}
+	// A zero delta writes no row: a pool nothing charged should not report as
+	// active from the first tick of a period.
+	if err := s.FlushPoolDeltas(ctx, "backend-a", period, core.PoolUsage{"class_c": 0}); err != nil {
+		t.Fatalf("FlushPoolDeltas(zero): %v", err)
+	}
+
+	got, err := s.GetPoolUsageForPeriod(ctx, period)
+	if err != nil {
+		t.Fatalf("GetPoolUsageForPeriod: %v", err)
+	}
+	pools, ok := got["backend-a"]
+	if !ok {
+		t.Fatalf("backend-a not in pool usage map: %+v", got)
+	}
+	if pools["class_a"] < 15 {
+		t.Errorf("class_a = %d, want at least 15 after the upsert", pools["class_a"])
+	}
+	if pools["class_b"] < 4 {
+		t.Errorf("class_b = %d, want at least 4", pools["class_b"])
+	}
+	if _, charged := pools["class_c"]; charged {
+		t.Errorf("class_c has a row: %+v; a zero delta must write nothing", pools)
+	}
+}
+
+// TestStoreInt_PoolUsageIsScopedToPeriod pins the monthly rollover: budgets
+// reset because the read is keyed by period, with no reset job to run.
+func TestStoreInt_PoolUsageIsScopedToPeriod(t *testing.T) {
+	s := adapterPgStore(t)
+	ctx := context.Background()
+
+	if err := s.FlushPoolDeltas(ctx, "backend-a", "2026-07", core.PoolUsage{"class_a": 9}); err != nil {
+		t.Fatalf("FlushPoolDeltas: %v", err)
+	}
+
+	got, err := s.GetPoolUsageForPeriod(ctx, "2026-08")
+	if err != nil {
+		t.Fatalf("GetPoolUsageForPeriod: %v", err)
+	}
+	if pools, ok := got["backend-a"]; ok {
+		t.Errorf("backend-a carried %v into the next period, want none", pools)
+	}
+}
+
 // -------------------------------------------------------------------------
 // MULTIPART
 // -------------------------------------------------------------------------
@@ -361,10 +421,10 @@ func TestStoreInt_RecordPartAndGetParts(t *testing.T) {
 	uploadID, _ := seedMultipartUpload(t, s, "", nil)
 	ctx := context.Background()
 
-	if err := s.RecordPart(ctx, uploadID, 1, "etag-1", 1024, nil); err != nil {
+	if err := s.RecordPart(ctx, &core.RecordPartParams{UploadID: uploadID, PartNumber: 1, ETag: "etag-1", SizeBytes: 1024, Form: nil}); err != nil {
 		t.Fatalf("RecordPart(1): %v", err)
 	}
-	if err := s.RecordPart(ctx, uploadID, 2, "etag-2", 2048, nil); err != nil {
+	if err := s.RecordPart(ctx, &core.RecordPartParams{UploadID: uploadID, PartNumber: 2, ETag: "etag-2", SizeBytes: 2048, Form: nil}); err != nil {
 		t.Fatalf("RecordPart(2): %v", err)
 	}
 	parts, err := s.GetParts(ctx, uploadID)
@@ -437,10 +497,10 @@ func TestStoreInt_GetStaleMultipartUploads(t *testing.T) {
 // validation branch.
 func TestStoreInt_RecordPart_RejectsInvalidPartNumber(t *testing.T) {
 	s := adapterPgStore(t)
-	if err := s.RecordPart(context.Background(), "any", 0, "x", 0, nil); err == nil {
+	if err := s.RecordPart(context.Background(), &core.RecordPartParams{UploadID: "any", PartNumber: 0, ETag: "x"}); err == nil {
 		t.Error("expected error for partNumber=0")
 	}
-	if err := s.RecordPart(context.Background(), "any", 100001, "x", 0, nil); err == nil {
+	if err := s.RecordPart(context.Background(), &core.RecordPartParams{UploadID: "any", PartNumber: 100001, ETag: "x"}); err == nil {
 		t.Error("expected error for partNumber>10000")
 	}
 }
@@ -459,10 +519,10 @@ func TestStoreInt_RecordPart_PreservesEncryptionFields(t *testing.T) {
 		t.Fatalf("CreateMultipartUpload: %v", err)
 	}
 	defer func() { _ = s.DeleteMultipartUpload(ctx, uploadID) }()
-	enc := &core.EncryptionMeta{
+	form := &core.StoredForm{
 		Encrypted: true, EncryptionKey: []byte("packed"), KeyID: "kid-1", PlaintextSize: 50,
 	}
-	if err := s.RecordPart(ctx, uploadID, 1, "etag", 1024, enc); err != nil {
+	if err := s.RecordPart(ctx, &core.RecordPartParams{UploadID: uploadID, PartNumber: 1, ETag: "etag", SizeBytes: 1024, Form: form}); err != nil {
 		t.Fatalf("RecordPart: %v", err)
 	}
 	parts, err := s.GetParts(ctx, uploadID)
@@ -481,40 +541,30 @@ func TestStoreInt_RecordPart_PreservesEncryptionFields(t *testing.T) {
 // QUOTA
 // -------------------------------------------------------------------------
 
-// TestStoreInt_GetBackendWithSpace verifies the iteration finds the
-// first backend with sufficient space, skipping unknown names.
-func TestStoreInt_GetBackendWithSpace(t *testing.T) {
+// TestStoreInt_ListBackendQuotaUsage verifies the routing view carries a row
+// per configured backend with the three byte totals a placement decision is
+// judged against. This is the query that replaced the placement SQL: the
+// tracker loads it once per flush and decides in memory from there, so a row
+// missing a total would route against a backend that is fuller than it reports.
+func TestStoreInt_ListBackendQuotaUsage(t *testing.T) {
 	s := adapterPgStore(t)
-	ctx := context.Background()
-	got, err := s.GetBackendWithSpace(ctx, 100, []string{"unknown-backend", "backend-a"})
+	usage, err := s.ListBackendQuotaUsage(context.Background())
 	if err != nil {
-		t.Fatalf("GetBackendWithSpace: %v", err)
+		t.Fatalf("ListBackendQuotaUsage: %v", err)
 	}
-	if got != "backend-a" {
-		t.Errorf("expected backend-a, got %q", got)
+	byName := make(map[string]core.BackendQuotaUsage, len(usage))
+	for _, u := range usage {
+		byName[u.BackendName] = u
 	}
-	// Empty order yields ErrNoSpaceAvailable.
-	if _, err := s.GetBackendWithSpace(ctx, 100, nil); !errors.Is(err, core.ErrNoSpaceAvailable) {
-		t.Errorf("expected ErrNoSpaceAvailable, got %v", err)
+	got, ok := byName["backend-a"]
+	if !ok {
+		t.Fatalf("backend-a missing from usage: %+v", usage)
 	}
-}
-
-// TestStoreInt_GetLeastUtilizedBackend verifies the helper returns
-// a backend with enough space, and ErrNoSpaceAvailable when none
-// fits.
-func TestStoreInt_GetLeastUtilizedBackend(t *testing.T) {
-	s := adapterPgStore(t)
-	ctx := context.Background()
-	got, err := s.GetLeastUtilizedBackend(ctx, 100, []string{"backend-a", "backend-b"})
-	if err != nil {
-		t.Fatalf("GetLeastUtilizedBackend: %v", err)
+	if got.BytesUsed < 0 || got.OrphanBytes < 0 || got.InflightBytes < 0 {
+		t.Errorf("negative byte total in usage row: %+v", got)
 	}
-	if got != "backend-a" && got != "backend-b" {
-		t.Errorf("unexpected backend %q", got)
-	}
-	// Asking for an unrealistic size yields ErrNoSpaceAvailable.
-	if _, err := s.GetLeastUtilizedBackend(ctx, 1<<62, []string{"backend-a"}); !errors.Is(err, core.ErrNoSpaceAvailable) {
-		t.Errorf("expected ErrNoSpaceAvailable, got %v", err)
+	if got.Occupied() != got.BytesUsed+got.OrphanBytes+got.InflightBytes {
+		t.Errorf("Occupied disagrees with its parts: %+v", got)
 	}
 }
 
@@ -590,13 +640,13 @@ func TestStoreInt_EncryptionAdminLifecycle(t *testing.T) {
 	s := adapterPgStore(t)
 	ctx := context.Background()
 	key := uniqueKey(t, "k")
-	if _, err := s.RecordObject(ctx, key, "backend-a", 100, nil); err != nil {
+	if _, _, err := s.RecordObject(ctx, &core.RecordObjectRequest{Key: key, Copies: []core.ObjectCopy{{Backend: "backend-a"}}, Size: 100}); err != nil {
 		t.Fatalf("RecordObject: %v", err)
 	}
-	defer func() { _, _ = s.DeleteObject(ctx, key) }()
+	defer func() { _, _, _ = s.DeleteObject(ctx, key) }()
 
 	// Initially unencrypted.
-	rows, err := s.ListUnencryptedLocations(ctx, 1000, 0)
+	rows, err := s.ListUnencryptedLocations(ctx, 1000, core.Cursor{}, "")
 	if err != nil {
 		t.Fatalf("ListUnencryptedLocations: %v", err)
 	}
@@ -612,7 +662,10 @@ func TestStoreInt_EncryptionAdminLifecycle(t *testing.T) {
 	}
 
 	// Mark as encrypted.
-	if err := s.MarkObjectEncrypted(ctx, key, "backend-a", []byte("packed"), "kid-1", 80, 100); err != nil {
+	if err := s.MarkObjectEncrypted(ctx, &core.EncryptedUpdate{
+		ObjectKey: key, BackendName: "backend-a", EncryptionKey: []byte("packed"),
+		KeyID: "kid-1", PlaintextSize: 80, CiphertextSize: 100,
+	}); err != nil {
 		t.Fatalf("MarkObjectEncrypted: %v", err)
 	}
 
@@ -638,12 +691,12 @@ func TestStoreInt_EncryptionAdminLifecycle(t *testing.T) {
 	}
 
 	// ListAllEncryptedLocations sees the row regardless of key ID.
-	if _, err := s.ListAllEncryptedLocations(ctx, 1000, 0); err != nil {
+	if _, err := s.ListAllEncryptedLocations(ctx, 1000, core.Cursor{}, ""); err != nil {
 		t.Fatalf("ListAllEncryptedLocations: %v", err)
 	}
 
 	// Mark decrypted.
-	if err := s.MarkObjectDecrypted(ctx, key, "backend-a", 80); err != nil {
+	if err := s.MarkObjectDecrypted(ctx, &core.DecryptedUpdate{ObjectKey: key, BackendName: "backend-a", PlaintextSize: 80}); err != nil {
 		t.Fatalf("MarkObjectDecrypted: %v", err)
 	}
 }
@@ -709,13 +762,161 @@ func TestStoreInt_CleanupQueueLifecycle(t *testing.T) {
 // for prefixes containing wildcards.
 func TestStoreInt_ListExpiredObjects(t *testing.T) {
 	s := adapterPgStore(t)
-	if _, err := s.ListExpiredObjects(context.Background(), t.Name(), time.Now().Add(time.Hour), 100); err != nil {
+	if _, err := s.ListExpiredObjects(context.Background(), core.ExpiredObjectsQuery{
+		Prefix: t.Name(), Cutoff: time.Now().Add(time.Hour), Limit: 100,
+	}); err != nil {
 		t.Fatalf("ListExpiredObjects: %v", err)
 	}
 	// Prefix containing a LIKE wildcard exercises the escaper.
-	if _, err := s.ListExpiredObjects(context.Background(), t.Name()+"%", time.Now().Add(time.Hour), 100); err != nil {
+	if _, err := s.ListExpiredObjects(context.Background(), core.ExpiredObjectsQuery{
+		Prefix: t.Name() + "%", Cutoff: time.Now().Add(time.Hour), Limit: 100,
+	}); err != nil {
 		t.Errorf("ListExpiredObjects(wildcard): %v", err)
 	}
+}
+
+// TestStoreInt_ImportSuppressedByPendingCleanup proves the suppression against
+// real Postgres, where the check is a UNION over cleanup_queue and cleanup_dlq
+// rather than the SQLite variant the unit tests cover.
+//
+// Without it a delete that could not reach a backend is undone the next time
+// reconcile walks it: the object returns live, the replicator spreads it, and
+// its created_at restarts so a lifecycle rule that expired it waits another
+// full window.
+func TestStoreInt_ImportSuppressedByPendingCleanup(t *testing.T) {
+	s := adapterPgStore(t)
+	ctx := context.Background()
+	key := t.Name() + "/deleted"
+
+	if err := s.EnqueueCleanup(ctx, "backend-a", key, "delete_failed", 500); err != nil {
+		t.Fatalf("EnqueueCleanup: %v", err)
+	}
+
+	outcome, err := s.ImportObject(ctx, &core.ImportObjectRequest{Key: key, Backend: "backend-a", Size: 500})
+	if err != nil {
+		t.Fatalf("ImportObject: %v", err)
+	}
+	if outcome != core.ImportSkippedPendingCleanup {
+		t.Errorf("outcome = %s, want skipped_pending_cleanup", outcome)
+	}
+
+	if _, err := s.GetAllObjectLocations(ctx, key); !errors.Is(err, core.ErrObjectNotFound) {
+		t.Errorf("ledger error = %v, want ErrObjectNotFound for a suppressed import", err)
+	}
+
+	// Scoped to the backend the delete is outstanding on: a copy removed
+	// cleanly elsewhere must still be importable, or one stuck cleanup would
+	// block the whole key from ever being reconciled.
+	other, err := s.ImportObject(ctx, &core.ImportObjectRequest{Key: key, Backend: "backend-b", Size: 500})
+	if err != nil {
+		t.Fatalf("ImportObject(backend-b): %v", err)
+	}
+	if other != core.ImportInserted {
+		t.Errorf("outcome = %s, want inserted on a backend with no pending delete", other)
+	}
+}
+
+// expiredKeysPg runs one query against real Postgres and returns the keys it
+// selected, sorted, so a test can compare against a literal.
+func expiredKeysPg(t *testing.T, s *Store, q core.ExpiredObjectsQuery) []string {
+	t.Helper()
+	rows, err := s.ListExpiredObjects(context.Background(), q)
+	if err != nil {
+		t.Fatalf("ListExpiredObjects: %v", err)
+	}
+	keys := make([]string, 0, len(rows))
+	for i := range rows {
+		keys = append(keys, rows[i].ObjectKey)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// TestStoreInt_ListExpiredObjectsTagFilter proves the lifecycle tag filter
+// against real Postgres. The unit tests cover the SQLite variant only, so this
+// is the only thing exercising the jsonb_each_text join, the tag_count
+// equality that makes several tags an intersection, and the interaction with
+// the DISTINCT ON that reduces an object's replicas to one row.
+func TestStoreInt_ListExpiredObjectsTagFilter(t *testing.T) {
+	s := adapterPgStore(t)
+	ctx := context.Background()
+	prefix := t.Name() + "/"
+
+	objects := []struct {
+		key  string
+		tags []core.Tag
+	}{
+		{prefix + "both", []core.Tag{{Key: "env", Value: "staging"}, {Key: "team", Value: "infra"}}},
+		{prefix + "one", []core.Tag{{Key: "env", Value: "staging"}}},
+		{prefix + "other", []core.Tag{{Key: "env", Value: "prod"}, {Key: "team", Value: "infra"}}},
+		{prefix + "none", nil},
+	}
+	for _, o := range objects {
+		if _, _, err := s.RecordObject(ctx, &core.RecordObjectRequest{
+			Key: o.key, Copies: []core.ObjectCopy{{Backend: "backend-a"}}, Size: 100, Tags: o.tags,
+		}); err != nil {
+			t.Fatalf("RecordObject %s: %v", o.key, err)
+		}
+	}
+
+	// A second copy of one key, so a tag-filtered query has to dedup replicas
+	// rather than trivially returning one row per object.
+	if _, _, err := s.RecordReplica(ctx, prefix+"both", "backend-b", "backend-a"); err != nil {
+		t.Fatalf("RecordReplica: %v", err)
+	}
+
+	future := time.Now().Add(time.Hour)
+	base := core.ExpiredObjectsQuery{Prefix: prefix, Cutoff: future, Limit: 100}
+
+	cases := []struct {
+		name string
+		tags map[string]string
+		want []string
+	}{
+		{
+			name: "no filter selects every object once",
+			want: []string{prefix + "both", prefix + "none", prefix + "one", prefix + "other"},
+		},
+		{
+			name: "one tag",
+			tags: map[string]string{"env": "staging"},
+			want: []string{prefix + "both", prefix + "one"},
+		},
+		{
+			name: "two tags select the intersection",
+			tags: map[string]string{"env": "staging", "team": "infra"},
+			want: []string{prefix + "both"},
+		},
+		{
+			name: "a tag the objects carry with a different value matches nothing",
+			tags: map[string]string{"env": "nonexistent"},
+			want: []string{},
+		},
+		{
+			name: "keys and values are not matched independently",
+			tags: map[string]string{"env": "infra", "team": "staging"},
+			want: []string{},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			q := base
+			q.Tags = tc.tags
+			if got := expiredKeysPg(t, s, q); !slices.Equal(got, tc.want) {
+				t.Errorf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
+
+	t.Run("cutoff still applies alongside the tags", func(t *testing.T) {
+		q := base
+		q.Tags = map[string]string{"env": "staging"}
+		q.Cutoff = time.Now().Add(-time.Hour)
+		if got := expiredKeysPg(t, s, q); len(got) != 0 {
+			t.Errorf("got %v, want nothing for a past cutoff", got)
+		}
+	})
 }
 
 // TestStoreInt_ListObjectsByBackendKeyAsc verifies the paginated
@@ -762,17 +963,17 @@ func TestStoreInt_GetObjectBackendsForKeys_GroupsByKey(t *testing.T) {
 	k1 := uniqueKey(t, "k1")
 	k2 := uniqueKey(t, "k2")
 	missing := uniqueKey(t, "missing")
-	if _, err := s.RecordObject(ctx, k1, "backend-a", 100, nil); err != nil {
+	if _, _, err := s.RecordObject(ctx, &core.RecordObjectRequest{Key: k1, Copies: []core.ObjectCopy{{Backend: "backend-a"}}, Size: 100}); err != nil {
 		t.Fatalf("RecordObject(k1): %v", err)
 	}
-	defer func() { _, _ = s.DeleteObject(ctx, k1) }()
+	defer func() { _, _, _ = s.DeleteObject(ctx, k1) }()
 	if _, _, err := s.RecordReplica(ctx, k1, "backend-b", "backend-a"); err != nil {
 		t.Fatalf("RecordReplica: %v", err)
 	}
-	if _, err := s.RecordObject(ctx, k2, "backend-a", 50, nil); err != nil {
+	if _, _, err := s.RecordObject(ctx, &core.RecordObjectRequest{Key: k2, Copies: []core.ObjectCopy{{Backend: "backend-a"}}, Size: 50}); err != nil {
 		t.Fatalf("RecordObject(k2): %v", err)
 	}
-	defer func() { _, _ = s.DeleteObject(ctx, k2) }()
+	defer func() { _, _, _ = s.DeleteObject(ctx, k2) }()
 
 	got, err := s.GetObjectBackendsForKeys(ctx, []string{k1, k2, missing})
 	if err != nil {
@@ -797,7 +998,7 @@ func TestStoreInt_GetObjectBackendsForKeys_GroupsByKey(t *testing.T) {
 // short-circuits on an empty input without opening a transaction.
 func TestStoreInt_DeleteObjectsBatch_EmptyInput(t *testing.T) {
 	s := adapterPgStore(t)
-	got, err := s.DeleteObjectsBatch(context.Background(), nil)
+	got, _, err := s.DeleteObjectsBatch(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("DeleteObjectsBatch(nil): %v", err)
 	}
@@ -816,13 +1017,13 @@ func TestStoreInt_DeleteObjectsBatch_RemovesRowsAndDecrementsQuotas(t *testing.T
 	k1 := uniqueKey(t, "k1")
 	k2 := uniqueKey(t, "k2")
 	missing := uniqueKey(t, "missing")
-	if _, err := s.RecordObject(ctx, k1, "backend-a", 100, nil); err != nil {
+	if _, _, err := s.RecordObject(ctx, &core.RecordObjectRequest{Key: k1, Copies: []core.ObjectCopy{{Backend: "backend-a"}}, Size: 100}); err != nil {
 		t.Fatalf("RecordObject(k1): %v", err)
 	}
 	if _, _, err := s.RecordReplica(ctx, k1, "backend-b", "backend-a"); err != nil {
 		t.Fatalf("RecordReplica: %v", err)
 	}
-	if _, err := s.RecordObject(ctx, k2, "backend-a", 50, nil); err != nil {
+	if _, _, err := s.RecordObject(ctx, &core.RecordObjectRequest{Key: k2, Copies: []core.ObjectCopy{{Backend: "backend-a"}}, Size: 50}); err != nil {
 		t.Fatalf("RecordObject(k2): %v", err)
 	}
 
@@ -831,7 +1032,7 @@ func TestStoreInt_DeleteObjectsBatch_RemovesRowsAndDecrementsQuotas(t *testing.T
 		t.Fatalf("GetQuotaStats(before): %v", err)
 	}
 
-	got, err := s.DeleteObjectsBatch(ctx, []string{k1, k2, missing})
+	got, _, err := s.DeleteObjectsBatch(ctx, []string{k1, k2, missing})
 	if err != nil {
 		t.Fatalf("DeleteObjectsBatch: %v", err)
 	}
@@ -954,5 +1155,332 @@ func TestStoreInt_VerifySchemaVersion_NewerThanExpected(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "newer than expected") {
 		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+// TestStoreInt_ScrubQueue_FreshWritesDoNotJumpTheQueue pins the property that
+// keeps the sweep alive on a busy fleet. Ordering purely on the verified
+// timestamp put every new write at the head of the queue, so once writes
+// outpaced the scrubber nothing older was ever reached.
+func TestStoreInt_ScrubQueue_FreshWritesDoNotJumpTheQueue(t *testing.T) {
+	s := adapterPgStore(t)
+	ctx := context.Background()
+
+	oldKey := uniqueKey(t, "old")
+	freshKey := uniqueKey(t, "fresh")
+	for _, key := range []string{oldKey, freshKey} {
+		if _, _, err := s.RecordObject(ctx, &core.RecordObjectRequest{Key: key, Copies: []core.ObjectCopy{{Backend: "backend-a"}}, Size: 100}); err != nil {
+			t.Fatalf("RecordObject(%s): %v", key, err)
+		}
+		defer func() { _, _, _ = s.DeleteObject(ctx, key) }()
+		if err := s.UpdateContentHash(ctx, key, "backend-a", "abc123"); err != nil {
+			t.Fatalf("UpdateContentHash(%s): %v", key, err)
+		}
+	}
+
+	// oldKey was written a year ago and verified a month ago; freshKey was
+	// written just now and has never been verified.
+	if _, err := s.pool.Exec(ctx,
+		`UPDATE object_locations
+		 SET created_at = NOW() - interval '365 days',
+		     last_scrubbed_at = NOW() - interval '30 days'
+		 WHERE object_key = $1`, oldKey); err != nil {
+		t.Fatalf("backdating %s: %v", oldKey, err)
+	}
+
+	got, err := s.GetLeastRecentlyScrubbedObjects(ctx, 100, []string{"backend-a"})
+	if err != nil {
+		t.Fatalf("GetLeastRecentlyScrubbedObjects: %v", err)
+	}
+
+	var oldPos, freshPos = -1, -1
+	for i := range got {
+		switch got[i].ObjectKey {
+		case oldKey:
+			oldPos = i
+		case freshKey:
+			freshPos = i
+		}
+	}
+	if oldPos == -1 || freshPos == -1 {
+		t.Fatalf("expected both copies in the queue, got old=%d fresh=%d", oldPos, freshPos)
+	}
+	if oldPos > freshPos {
+		t.Errorf("a copy verified a month ago sorted behind one written moments ago (old=%d fresh=%d)",
+			oldPos, freshPos)
+	}
+}
+
+// TestStoreInt_ScrubQueue_IndexMatchesQuery verifies the partial expression
+// index can serve the candidate query, which is what keeps the sweep from
+// sorting the whole ledger once it is large.
+//
+// Sequential scans are disabled rather than asserting the planner picks the
+// index unprompted: on a test-sized table a sequential scan is genuinely
+// cheaper and choosing it is correct. What matters here is that the index is
+// usable at all, since an ORDER BY expression that drifts from the indexed one
+// would still fall back to a sort with sequential scans off.
+func TestStoreInt_ScrubQueue_IndexMatchesQuery(t *testing.T) {
+	s := adapterPgStore(t)
+	ctx := context.Background()
+
+	conn, err := s.pool.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("acquiring a connection: %v", err)
+	}
+	defer conn.Release()
+
+	if _, err := conn.Exec(ctx, `SET enable_seqscan = off`); err != nil {
+		t.Fatalf("disabling seqscan: %v", err)
+	}
+
+	rows, err := conn.Query(ctx, `EXPLAIN (COSTS OFF)
+		SELECT object_key FROM object_locations
+		WHERE content_hash IS NOT NULL AND managed
+		ORDER BY COALESCE(last_scrubbed_at, created_at) ASC, object_key ASC
+		LIMIT 100`)
+	if err != nil {
+		t.Fatalf("EXPLAIN: %v", err)
+	}
+	defer rows.Close()
+
+	var plan strings.Builder
+	for rows.Next() {
+		var line string
+		if err := rows.Scan(&line); err != nil {
+			t.Fatalf("scanning plan: %v", err)
+		}
+		plan.WriteString(line)
+		plan.WriteString("\n")
+	}
+	if !strings.Contains(plan.String(), "idx_object_locations_scrub_queue") {
+		t.Errorf("the scrub queue index cannot serve the candidate query, so the "+
+			"ORDER BY and the index expression have drifted apart:\n%s", plan.String())
+	}
+}
+
+// TestStoreInt_ScrubQueue_BackendFilter proves the Postgres selection applies
+// the affordable-backend filter in SQL. Filtering after selection would force
+// the scrubber to either stamp a copy it never read or leave it at the head of
+// the queue to be re-selected every cycle.
+func TestStoreInt_ScrubQueue_BackendFilter(t *testing.T) {
+	s := adapterPgStore(t)
+	ctx := context.Background()
+
+	keyA := uniqueKey(t, "affordable")
+	keyB := uniqueKey(t, "declined")
+	for backend, key := range map[string]string{"backend-a": keyA, "backend-b": keyB} {
+		if _, _, err := s.RecordObject(ctx, &core.RecordObjectRequest{Key: key, Copies: []core.ObjectCopy{{Backend: backend}}, Size: 10}); err != nil {
+			t.Fatalf("RecordObject(%s): %v", key, err)
+		}
+		defer func() { _, _, _ = s.DeleteObject(ctx, key) }()
+		if err := s.UpdateContentHash(ctx, key, backend, "abc123"); err != nil {
+			t.Fatalf("UpdateContentHash(%s): %v", key, err)
+		}
+	}
+
+	got, err := s.GetLeastRecentlyScrubbedObjects(ctx, 100, []string{"backend-a"})
+	if err != nil {
+		t.Fatalf("GetLeastRecentlyScrubbedObjects: %v", err)
+	}
+	for _, loc := range got {
+		if loc.BackendName != "backend-a" {
+			t.Fatalf("batch contains a copy on %s, which was not offered", loc.BackendName)
+		}
+	}
+
+	// An empty affordable set selects nothing rather than everything.
+	none, err := s.GetLeastRecentlyScrubbedObjects(ctx, 100, nil)
+	if err != nil {
+		t.Fatalf("GetLeastRecentlyScrubbedObjects(nil): %v", err)
+	}
+	if len(none) != 0 {
+		t.Errorf("an empty backend list returned %d copies, want 0", len(none))
+	}
+
+	n, err := s.CountScrubCandidatesOnBackends(ctx, []string{"backend-b"})
+	if err != nil {
+		t.Fatalf("CountScrubCandidatesOnBackends: %v", err)
+	}
+	if n < 1 {
+		t.Errorf("count on the declined backend = %d, want at least the one copy written here", n)
+	}
+	if n, err := s.CountScrubCandidatesOnBackends(ctx, nil); err != nil || n != 0 {
+		t.Errorf("empty backend list: count=%d err=%v, want 0/nil", n, err)
+	}
+}
+
+// TestStoreInt_CountUnencryptedLocations pins the figure the dashboard, the
+// status endpoint and the plaintext gauge all read. It has to agree with
+// ListUnencryptedLocations, because that is the set encrypt-existing processes:
+// a count that drifts from the work would tell an operator the fleet is covered
+// when it is not.
+func TestStoreInt_CountUnencryptedLocations(t *testing.T) {
+	s := adapterPgStore(t)
+	ctx := context.Background()
+
+	before, err := s.CountUnencryptedLocations(ctx)
+	if err != nil {
+		t.Fatalf("CountUnencryptedLocations: %v", err)
+	}
+
+	key := uniqueKey(t, "plaintext")
+	if _, _, err := s.RecordObject(ctx, &core.RecordObjectRequest{Key: key, Copies: []core.ObjectCopy{{Backend: "backend-a"}}, Size: 100}); err != nil {
+		t.Fatalf("RecordObject: %v", err)
+	}
+	defer func() { _, _, _ = s.DeleteObject(ctx, key) }()
+
+	after, err := s.CountUnencryptedLocations(ctx)
+	if err != nil {
+		t.Fatalf("CountUnencryptedLocations: %v", err)
+	}
+	if after != before+1 {
+		t.Errorf("count = %d after writing one plaintext copy, want %d", after, before+1)
+	}
+
+	// Encrypting the copy removes it from the count, so the figure falls as an
+	// operator works through the backlog rather than staying put.
+	if err := s.MarkObjectEncrypted(ctx, &core.EncryptedUpdate{
+		ObjectKey: key, BackendName: "backend-a", EncryptionKey: []byte("wrapped"),
+		KeyID: "key-0", PlaintextSize: 100, CiphertextSize: 132,
+	}); err != nil {
+		t.Fatalf("MarkObjectEncrypted: %v", err)
+	}
+	encrypted, err := s.CountUnencryptedLocations(ctx)
+	if err != nil {
+		t.Fatalf("CountUnencryptedLocations: %v", err)
+	}
+	if encrypted != before {
+		t.Errorf("count = %d after encrypting the copy, want %d", encrypted, before)
+	}
+
+	// The count and the list describe the same set.
+	listed, err := s.ListUnencryptedLocations(ctx, 10000, core.Cursor{}, "")
+	if err != nil {
+		t.Fatalf("ListUnencryptedLocations: %v", err)
+	}
+	if int64(len(listed)) != encrypted {
+		t.Errorf("count = %d but list returned %d rows", encrypted, len(listed))
+	}
+}
+
+// TestStoreInt_GetAllObjectLocations_ReportsVerifiedTimestamp pins the field
+// per copy against a real database. Having a content hash only says a hash was
+// recorded; this says whether the bytes were ever compared to it, and the two
+// copies here differ on exactly that while sharing everything else.
+func TestStoreInt_GetAllObjectLocations_ReportsVerifiedTimestamp(t *testing.T) {
+	s := adapterPgStore(t)
+	ctx := context.Background()
+
+	key := uniqueKey(t, "verified")
+	// Hashed at write, not by backfill, which stamps: the replica insert carries
+	// the hash across without the stamp, leaving two hashed copies that differ
+	// only on whether the bytes were ever read back.
+	if _, _, err := s.RecordObject(ctx, &core.RecordObjectRequest{
+		Key: key, Copies: []core.ObjectCopy{{Backend: "backend-a"}}, Size: 100,
+		Form: &core.StoredForm{ContentHash: "abc123"},
+	}); err != nil {
+		t.Fatalf("RecordObject: %v", err)
+	}
+	defer func() { _, _, _ = s.DeleteObject(ctx, key) }()
+	if _, _, err := s.RecordReplica(ctx, key, "backend-b", "backend-a"); err != nil {
+		t.Fatalf("RecordReplica: %v", err)
+	}
+
+	if err := s.MarkObjectScrubbed(ctx, key, "backend-a"); err != nil {
+		t.Fatalf("MarkObjectScrubbed: %v", err)
+	}
+
+	locs, err := s.GetAllObjectLocations(ctx, key)
+	if err != nil {
+		t.Fatalf("GetAllObjectLocations: %v", err)
+	}
+	byBackend := map[string]core.ObjectLocation{}
+	for _, l := range locs {
+		byBackend[l.BackendName] = l
+	}
+
+	verified, ok := byBackend["backend-a"]
+	if !ok {
+		t.Fatalf("backend-a copy missing from %v", locs)
+	}
+	if verified.LastScrubbedAt == nil || verified.LastScrubbedAt.IsZero() {
+		t.Errorf("verified copy reports %v, want a timestamp", verified.LastScrubbedAt)
+	}
+
+	never, ok := byBackend["backend-b"]
+	if !ok {
+		t.Fatalf("backend-b copy missing from %v", locs)
+	}
+	if never.LastScrubbedAt != nil {
+		t.Errorf("never-verified copy reports %v, want nil", never.LastScrubbedAt)
+	}
+	if verified.ContentHash == "" || never.ContentHash == "" {
+		t.Error("both copies should carry a hash, so the hash alone cannot tell them apart")
+	}
+}
+
+// TestStoreInt_IntegrityCoverage_CountsNeverVerifiedCopies pins the figure the
+// dashboard reads to the backlog rather than to the copies the sweep already
+// reached. A copy with no scrub stamp is measured from when it was written, the
+// same fallback the scrub queue orders on; taking MIN over the stamp alone skips
+// it, and a fleet the sweep has never touched then reports an age of zero.
+//
+// The suite shares one database, so the assertion is a lower bound: other rows
+// can only be younger than the backdated copy, so they cannot mask it.
+func TestStoreInt_IntegrityCoverage_CountsNeverVerifiedCopies(t *testing.T) {
+	s := adapterPgStore(t)
+	ctx := context.Background()
+	reachable := []string{"backend-a", "backend-b"}
+
+	key := uniqueKey(t, "unverified-age")
+	if _, _, err := s.RecordObject(ctx, &core.RecordObjectRequest{Key: key, Copies: []core.ObjectCopy{{Backend: "backend-a"}}, Size: 100}); err != nil {
+		t.Fatalf("RecordObject: %v", err)
+	}
+	defer func() { _, _, _ = s.DeleteObject(ctx, key) }()
+	// Hashed at write rather than by backfill, which stamps, so the copy is
+	// hashed and unverified: the state the coverage figures are about.
+	if _, err := s.pool.Exec(ctx,
+		`UPDATE object_locations SET content_hash = 'abc123', created_at = NOW() - INTERVAL '48 hours'
+		 WHERE object_key = $1 AND backend_name = $2`, key, "backend-a",
+	); err != nil {
+		t.Fatalf("hashing at write and backdating created_at: %v", err)
+	}
+
+	stat, err := s.IntegrityCoverage(ctx, reachable)
+	if err != nil {
+		t.Fatalf("IntegrityCoverage: %v", err)
+	}
+	if stat.NeverVerified < 1 {
+		t.Errorf("never verified = %d, want at least the copy just written", stat.NeverVerified)
+	}
+	if stat.OldestUnverifiedAge < 47*time.Hour {
+		t.Errorf("age = %s, want at least the 48h-old never-verified copy", stat.OldestUnverifiedAge)
+	}
+
+	// Scoping the query away from the copy's backend moves it out of the age
+	// and into the deferred count, which is what keeps an unreachable copy from
+	// pinning a figure the sweep can never bring down.
+	stat, err = s.IntegrityCoverage(ctx, []string{"backend-b"})
+	if err != nil {
+		t.Fatalf("IntegrityCoverage scoped away from backend-a: %v", err)
+	}
+	if stat.Deferred < 1 {
+		t.Errorf("deferred = %d, want at least the copy on the excluded backend", stat.Deferred)
+	}
+	if stat.OldestUnverifiedAge >= 47*time.Hour {
+		t.Errorf("age = %s, want the excluded copy left out", stat.OldestUnverifiedAge)
+	}
+
+	// Verifying it retires it from both figures.
+	if err := s.MarkObjectScrubbed(ctx, key, "backend-a"); err != nil {
+		t.Fatalf("MarkObjectScrubbed: %v", err)
+	}
+	stat, err = s.IntegrityCoverage(ctx, reachable)
+	if err != nil {
+		t.Fatalf("IntegrityCoverage after stamping: %v", err)
+	}
+	if stat.OldestUnverifiedAge >= 47*time.Hour {
+		t.Errorf("age = %s, want the stamped copy to have left the head of the queue", stat.OldestUnverifiedAge)
 	}
 }

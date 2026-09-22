@@ -14,7 +14,6 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/afreidah/s3-orchestrator/internal/config"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
@@ -23,17 +22,16 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.24.0"
 	"go.opentelemetry.io/otel/trace"
+
+	"github.com/afreidah/s3-orchestrator/internal/config"
 )
 
 // -------------------------------------------------------------------------
 // CONSTANTS
 // -------------------------------------------------------------------------
 
-// TracerName and related constants used by this package.
-const (
-	// TracerName identifies spans created by this service.
-	TracerName = "s3-orchestrator"
-)
+// TracerName identifies spans created by this service.
+const TracerName = "s3-orchestrator"
 
 // Version of the service for trace metadata. Set at build time via
 // -ldflags "-X github.com/afreidah/s3-orchestrator/internal/telemetry.Version=..."
@@ -51,7 +49,6 @@ func InitTracer(ctx context.Context, cfg config.TracingConfig) (func(context.Con
 		return func(context.Context) error { return nil }, nil
 	}
 
-	// --- Create OTLP exporter ---
 	opts := []otlptracegrpc.Option{
 		otlptracegrpc.WithEndpoint(cfg.Endpoint),
 	}
@@ -63,7 +60,6 @@ func InitTracer(ctx context.Context, cfg config.TracingConfig) (func(context.Con
 		return nil, fmt.Errorf("failed to create trace exporter: %w", err)
 	}
 
-	// --- Create resource with service info ---
 	res, err := resource.Merge(
 		resource.Default(),
 		resource.NewSchemaless(
@@ -75,7 +71,6 @@ func InitTracer(ctx context.Context, cfg config.TracingConfig) (func(context.Con
 		return nil, fmt.Errorf("failed to create resource: %w", err)
 	}
 
-	// --- Configure sampler ---
 	var sampler sdktrace.Sampler
 	switch {
 	case cfg.SampleRate >= 1.0:
@@ -86,17 +81,14 @@ func InitTracer(ctx context.Context, cfg config.TracingConfig) (func(context.Con
 		sampler = sdktrace.TraceIDRatioBased(cfg.SampleRate)
 	}
 
-	// --- Create trace provider ---
 	tp := sdktrace.NewTracerProvider(
 		sdktrace.WithBatcher(exporter),
 		sdktrace.WithResource(res),
 		sdktrace.WithSampler(sampler),
 	)
 
-	// --- Set global tracer provider ---
 	otel.SetTracerProvider(tp)
 
-	// --- Set propagator for context propagation ---
 	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
 		propagation.TraceContext{},
 		propagation.Baggage{},
@@ -124,35 +116,31 @@ func StartServerSpan(ctx context.Context, name string, attrs ...attribute.KeyVal
 	return Tracer().Start(ctx, name, trace.WithAttributes(attrs...), trace.WithSpanKind(trace.SpanKindServer))
 }
 
-// StartClientSpan creates a span for outbound calls (backend S3 operations).
-func StartClientSpan(ctx context.Context, name string, attrs ...attribute.KeyValue) (context.Context, trace.Span) {
-	return Tracer().Start(ctx, name, trace.WithAttributes(attrs...), trace.WithSpanKind(trace.SpanKindClient))
-}
-
 // -------------------------------------------------------------------------
 // COMMON ATTRIBUTES
 // -------------------------------------------------------------------------
 
 // S3 orchestrator specific attribute keys.
 var (
-	AttrRequestID          = attribute.Key("s3o.request_id")
-	AttrVirtualBucket      = attribute.Key("s3o.bucket.virtual")
-	AttrBackendBucket      = attribute.Key("s3o.bucket.backend")
-	AttrObjectKey          = attribute.Key("s3o.key")
-	AttrBackendName        = attribute.Key("s3o.backend.name")
-	AttrBackendEndpoint    = attribute.Key("s3o.backend.endpoint")
-	AttrObjectSize         = attribute.Key("s3o.object.size")
-	AttrContentType        = attribute.Key("s3o.object.content_type")
-	AttrOperation          = attribute.Key("s3o.operation")
-	AttrUploadID           = attribute.Key("s3o.upload_id")
-	AttrPartNumber         = attribute.Key("s3o.part_number")
-	AttrWriteFailover      = attribute.Key("s3o.write_failover")
-	AttrFailoverAttempts   = attribute.Key("s3o.write_failover_attempts")
-	AttrFailover           = attribute.Key("s3o.failover")
-	AttrDegradedMode       = attribute.Key("s3o.degraded_mode")
-	AttrCacheHit           = attribute.Key("s3o.cache_hit")
-	AttrParallelBroadcast  = attribute.Key("s3o.parallel_broadcast")
-	AttrNativeCopy         = attribute.Key("s3o.native_copy")
+	AttrRequestID         = attribute.Key("s3o.request_id")
+	AttrVirtualBucket     = attribute.Key("s3o.bucket.virtual")
+	AttrBackendBucket     = attribute.Key("s3o.bucket.backend")
+	AttrObjectKey         = attribute.Key("s3o.key")
+	AttrBackendName       = attribute.Key("s3o.backend.name")
+	AttrBackendEndpoint   = attribute.Key("s3o.backend.endpoint")
+	AttrObjectSize        = attribute.Key("s3o.object.size")
+	AttrContentType       = attribute.Key("s3o.object.content_type")
+	AttrOperation         = attribute.Key("s3o.operation")
+	AttrUploadID          = attribute.Key("s3o.upload_id")
+	AttrPartNumber        = attribute.Key("s3o.part_number")
+	AttrWriteFailover     = attribute.Key("s3o.write_failover")
+	AttrFailoverAttempts  = attribute.Key("s3o.write_failover_attempts")
+	AttrFailover          = attribute.Key("s3o.failover")
+	AttrDegradedMode      = attribute.Key("s3o.degraded_mode")
+	AttrCacheHit          = attribute.Key("s3o.cache_hit")
+	AttrParallelBroadcast = attribute.Key("s3o.parallel_broadcast")
+	AttrNativeCopy        = attribute.Key("s3o.native_copy")
+	AttrCopiesClaimed     = attribute.Key("s3o.write_copies_claimed")
 )
 
 // RequestAttributes returns common attributes for HTTP request spans.

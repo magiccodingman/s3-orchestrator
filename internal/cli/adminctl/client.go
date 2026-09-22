@@ -19,26 +19,32 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"time"
+
+	"github.com/afreidah/s3-orchestrator/internal/cli/adminclient"
 
 	"github.com/afreidah/s3-orchestrator/internal/cli/output"
 )
 
-const requestTimeout = 30 * time.Second
+// -------------------------------------------------------------------------
+// TYPES
+// -------------------------------------------------------------------------
 
-// client carries the resolved target, auth token, output format, and writers
-// shared by every admin subcommand handler.
+// client carries the shared admin transport, output format, and writers used
+// by every admin subcommand handler.
 type client struct {
-	baseAddr string
-	token    string
-	format   output.Format
-	stdout   io.Writer
-	stderr   io.Writer
+	api    *adminclient.Client
+	format output.Format
+	stdout io.Writer
+	stderr io.Writer
 }
 
 // renderFunc renders a successful response body in text mode. A nil renderer
 // falls back to the generic key/value renderer.
 type renderFunc func(w io.Writer, body []byte) error
+
+// -------------------------------------------------------------------------
+// INTERNALS
+// -------------------------------------------------------------------------
 
 // get/post/put/delete issue the named verb against path (appended to the
 // resolved base address) and render the response per the client's format.
@@ -52,6 +58,10 @@ func (c *client) post(path, body string, render renderFunc) int {
 
 func (c *client) put(path, body string, render renderFunc) int {
 	return c.do(http.MethodPut, path, body, render)
+}
+
+func (c *client) patch(path, body string, render renderFunc) int {
+	return c.do(http.MethodPatch, path, body, render)
 }
 
 func (c *client) delete(path string, render renderFunc) int {
@@ -76,26 +86,11 @@ func (c *client) do(method, path, body string, render renderFunc) int {
 
 // request issues an authenticated request and returns the response body, the
 // HTTP status code, and an exit code (non-zero when a transport or read error
-// was already reported to stderr). Sets the X-Admin-Token header for auth, the
+// was already reported to stderr). Signs the request, sets the
 // Content-Type header when a body is present, and a fixed client timeout so a
 // hung server cannot stall the CLI indefinitely.
 func (c *client) request(method, path, body string) ([]byte, int, int) {
-	var bodyReader io.Reader
-	if body != "" {
-		bodyReader = strings.NewReader(body)
-	}
-
-	req, err := http.NewRequestWithContext(context.Background(), method, c.baseAddr+path, bodyReader)
-	if err != nil {
-		fmt.Fprintf(c.stderr, fmtError, err)
-		return nil, 0, 1
-	}
-	req.Header.Set(adminTokenHeader, c.token)
-	if body != "" {
-		req.Header.Set("Content-Type", "application/json")
-	}
-
-	resp, err := (&http.Client{Timeout: requestTimeout}).Do(req) //nolint:gosec // G704: admin CLI target address is user-provided via --addr flag
+	resp, err := c.api.Do(context.Background(), method, path, nil, bodyReader(body))
 	if err != nil {
 		fmt.Fprintf(c.stderr, fmtError, err)
 		return nil, 0, 1
@@ -108,6 +103,15 @@ func (c *client) request(method, path, body string) ([]byte, int, int) {
 		return nil, 0, 1
 	}
 	return data, resp.StatusCode, 0
+}
+
+// bodyReader returns nil for an empty body so the shared client can tell "no
+// body" from "empty body" and omit the Content-Type header accordingly.
+func bodyReader(body string) io.Reader {
+	if body == "" {
+		return nil
+	}
+	return strings.NewReader(body)
 }
 
 // renderSuccess writes a successful response body. JSON mode pretty-prints the
@@ -143,14 +147,7 @@ func (c *client) renderError(data []byte) {
 // remove-backend preview and purge flows, which each carry only the
 // response-shape handling unique to them.
 func (c *client) fetchJSON(method, path string, out any) int {
-	req, err := http.NewRequestWithContext(context.Background(), method, c.baseAddr+path, nil)
-	if err != nil {
-		fmt.Fprintf(c.stderr, fmtError, err)
-		return 1
-	}
-	req.Header.Set(adminTokenHeader, c.token)
-
-	resp, err := (&http.Client{Timeout: requestTimeout}).Do(req) //nolint:gosec // G704: admin CLI target address is user-provided via --addr flag
+	resp, err := c.api.Do(context.Background(), method, path, nil, nil)
 	if err != nil {
 		fmt.Fprintf(c.stderr, fmtError, err)
 		return 1
@@ -167,11 +164,5 @@ func (c *client) fetchJSON(method, path string, out any) int {
 // errorMessage extracts the "error" field from a JSON error body, falling back
 // to the trimmed raw body when the response is not the expected shape.
 func errorMessage(data []byte) string {
-	var m map[string]any
-	if json.Unmarshal(data, &m) == nil {
-		if e, ok := m["error"].(string); ok && e != "" {
-			return e
-		}
-	}
-	return strings.TrimSpace(string(data))
+	return (&adminclient.Error{Body: strings.TrimSpace(string(data))}).Detail()
 }

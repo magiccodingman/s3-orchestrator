@@ -1,4 +1,5 @@
 ---
+description: "Interactive diagram of the envelope encryption and decryption paths, using chunked AES-256-GCM with pluggable key providers."
 title: "Encryption Flow"
 linkTitle: "Encryption Flow"
 weight: 5
@@ -28,16 +29,18 @@ When encryption is enabled, every object stored through the S3 Orchestrator is e
 2. **Wrap the DEK**: The master key encrypts the DEK via the configured key provider (e.g., Vault Transit API call). This produces a **wrapped DEK** — an opaque blob that can only be unwrapped by the same master key.
 3. **Generate a base nonce**: 12 random bytes.
 4. **Write the header**: A 32-byte header is prepended to the ciphertext stream — `"SENC"` magic bytes, format version, chunk size, and the base nonce.
-5. **Encrypt chunk by chunk** (default 1 MB per chunk):
-   - Read up to 1 MB of plaintext.
+5. **Encrypt chunk by chunk** (default 64 KiB per chunk):
+   - Read up to one chunk of plaintext.
    - Derive this chunk's nonce: take the base nonce and XOR the chunk index into its last 8 bytes.
    - Encrypt the chunk with AES-256-GCM using the DEK and the derived nonce. This produces ciphertext + a 16-byte auth tag.
    - Write to the output: `nonce (12 bytes) | ciphertext | auth tag (16 bytes)`.
    - Repeat until all plaintext is consumed.
 6. **Upload the ciphertext stream** (header + chunks) to the S3 backend.
-7. **Store metadata in PostgreSQL**: the wrapped DEK, the master key ID, the base nonce (packed together as `baseNonce || wrappedDEK` in the `encryption_key` column), and the original plaintext size.
+7. **Store metadata in PostgreSQL**: the wrapped DEK, the master key ID, the base nonce (packed together as `baseNonce || wrappedDEK` in the `encryption_key` column), and the plaintext size.
 
 The plaintext DEK is never stored anywhere — it exists only in memory during the encryption operation.
+
+"Plaintext" here means whatever the encryptor was handed, which is not always the object the client wrote. With [compression](../../docs/compression/) also enabled, the object is encoded first - ciphertext does not compress - so the encryptor's input is the compressed stream and `plaintext_size` records that. The client's own size lives in `logical_size`. With compression off the two are the same and `logical_size` is unset.
 
 #### Decrypting an object (read path)
 
@@ -143,8 +146,28 @@ The base nonce is stored in the database specifically so range decryption can de
   ].join('\n');
 
   mermaid.initialize({
-    startOnLoad: false, theme: 'dark',
-    flowchart: { nodeSpacing: 14, rankSpacing: 22, curve: 'basis', padding: 5, diagramPadding: 8, useMaxWidth: true }
+    startOnLoad: false,
+    theme: 'base',
+    themeVariables: {
+      darkMode: true,
+      background: '#191c23',
+      fontFamily: 'Inter, ui-sans-serif, system-ui, sans-serif',
+      fontSize: '15px',
+      primaryColor: '#26332f',
+      primaryTextColor: '#f8fafc',
+      primaryBorderColor: '#2a9d73',
+      secondaryColor: '#3a2e20',
+      secondaryTextColor: '#e8dfd0',
+      secondaryBorderColor: '#c4a35a',
+      tertiaryColor: '#20262d',
+      tertiaryTextColor: '#e8dfd0',
+      tertiaryBorderColor: '#4aaa8a',
+      lineColor: '#7f8b86',
+      edgeLabelBackground: '#191c23',
+      clusterBkg: '#1d2229',
+      clusterBorder: '#39443f'
+    },
+    flowchart: { nodeSpacing: 32, rankSpacing: 46, curve: 'linear', padding: 12, diagramPadding: 16, useMaxWidth: true, htmlLabels: true }
   });
 
   mermaid.render('enc-mermaid-svg', diagramSrc).then(function(result) {
@@ -166,7 +189,7 @@ The base nonce is stored in the database specifically so range decryption can de
     WRAP: {
       title: 'WrapDEK via KeyProvider',
       badge: 'storage', badgeText: 'key wrapping',
-      body: '<p><code>provider.WrapDEK(ctx, dek)</code> encrypts the plaintext DEK with the master key. Returns <code>(wrappedDEK, keyID, error)</code>.</p><p>The <code>keyID</code> identifies which master key was used, enabling key rotation via <code>MultiKeyProvider</code>. The wrapped DEK and keyID are stored in PostgreSQL alongside the object record.</p><p class="ac-metric">Metric: s3o_encryption_ops_total{operation="encrypt"}</p>'
+      body: '<p><code>provider.WrapDEK(ctx, dek)</code> encrypts the plaintext DEK with the master key. Returns <code>(wrappedDEK, keyID, error)</code>.</p><p>The <code>keyID</code> identifies which master key was used, enabling key rotation via <code>MultiKeyProvider</code>. The wrapped DEK and keyID are stored in PostgreSQL alongside the object record.</p><p class="ac-metric">Metric: s3o_encryption_operations_total{operation="encrypt"}</p>'
     },
     PROVIDER: {
       title: 'Key Provider Type',
@@ -191,7 +214,7 @@ The base nonce is stored in the database specifically so range decryption can de
     CHUNK: {
       title: 'Read Plaintext Chunk',
       badge: 'process', badgeText: 'chunking',
-      body: '<p><code>io.ReadFull(src, plain[:chunkSize])</code> reads up to <code>chunkSize</code> bytes (default 1MB = 1048576 bytes). The last chunk may be shorter.</p><p>Streaming design: <code>encryptReader</code> implements <code>io.Reader</code>, encrypting one chunk per <code>Read()</code> call. No need to buffer the entire object in memory.</p>'
+      body: '<p><code>io.ReadFull(src, plain[:chunkSize])</code> reads up to <code>chunkSize</code> bytes (default 65536 bytes; configurable 4 KiB-1 MiB, power of two). The last chunk may be shorter.</p><p>Streaming design: <code>encryptReader</code> implements <code>io.Reader</code>, encrypting one chunk per <code>Read()</code> call. No need to buffer the entire object in memory.</p>'
     },
     NONCE: {
       title: 'Derive Per-Chunk Nonce',
@@ -221,7 +244,7 @@ The base nonce is stored in the database specifically so range decryption can de
     UNWRAP: {
       title: 'UnwrapDEK via KeyProvider',
       badge: 'storage', badgeText: 'key unwrapping',
-      body: '<p><code>provider.UnwrapDEK(ctx, wrappedDEK, keyID)</code> recovers the plaintext 32-byte DEK.</p><p>For <code>MultiKeyProvider</code>: if <code>keyID</code> matches the primary key, uses primary; otherwise looks up in the <code>previous</code> map by keyID. Falls back to primary as best-effort for unknown keyIDs.</p><p>Vault Transit: POST to <code>{vault}/v1/{mount}/decrypt/{keyName}</code>, returns base64-decoded plaintext DEK.</p><p class="ac-metric">Metric: s3o_encryption_ops_total{operation="decrypt"}</p>'
+      body: '<p><code>provider.UnwrapDEK(ctx, wrappedDEK, keyID)</code> recovers the plaintext 32-byte DEK.</p><p>For <code>MultiKeyProvider</code>: if <code>keyID</code> matches the primary key, uses primary; otherwise looks up in the <code>previous</code> map by keyID. Falls back to primary as best-effort for unknown keyIDs.</p><p>Vault Transit: POST to <code>{vault}/v1/{mount}/decrypt/{keyName}</code>, returns base64-decoded plaintext DEK.</p><p class="ac-metric">Metric: s3o_encryption_operations_total{operation="decrypt"}</p>'
     },
     PARSE: {
       title: 'Parse 32-Byte Header',
@@ -297,10 +320,25 @@ The base nonce is stored in the database specifically so range decryption can de
     if (tooltip.style.display === 'block') positionTooltip();
   });
   function positionTooltip() {
-    var pad = 12, x = mouseX + pad, y = mouseY + pad;
-    if (x + tooltip.offsetWidth > window.innerWidth - pad) x = mouseX - tooltip.offsetWidth - pad;
-    if (y + tooltip.offsetHeight > window.innerHeight - pad) y = mouseY - tooltip.offsetHeight - pad;
-    tooltip.style.left = x + 'px'; tooltip.style.top = y + 'px';
+    var pad = 12;
+    var w = tooltip.offsetWidth, h = tooltip.offsetHeight;
+    var vw = window.innerWidth, vh = window.innerHeight;
+
+    var x = mouseX + pad;
+    if (x + w > vw - pad) x = mouseX - w - pad;
+    x = Math.max(pad, Math.min(x, vw - w - pad));
+
+    // Prefer below the cursor, and flip above only when above genuinely has
+    // more room. Clamping afterwards is what keeps a tall panel on screen: an
+    // unclamped flip puts its top edge above the viewport, and a panel taller
+    // than the viewport pins to the top and scrolls instead.
+    var below = vh - mouseY - pad * 2;
+    var above = mouseY - pad * 2;
+    var y = (h <= below || below >= above) ? mouseY + pad : mouseY - h - pad;
+    y = Math.max(pad, Math.min(y, vh - h - pad));
+
+    tooltip.style.left = x + 'px';
+    tooltip.style.top = y + 'px';
   }
   function showInfo(id) {
     var info = nodeInfo[id];

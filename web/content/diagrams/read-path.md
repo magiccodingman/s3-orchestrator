@@ -1,10 +1,11 @@
 ---
+description: "Interactive diagram of a GetObject request through location lookup, failover, broadcast reads, decryption, decoding, and streaming."
 title: "Read Path"
 linkTitle: "Read Path"
 weight: 3
 ---
 
-Detailed flow of a GetObject request through location lookup, failover, broadcast reads, decryption, and streaming. **Hover over any component** for implementation details.
+Detailed flow of a GetObject request through location lookup, failover, broadcast reads, decryption, decoding, and streaming. **Hover over any component** for implementation details.
 
 <style>
   #ac-diagram { margin: 1rem 0; }
@@ -62,7 +63,17 @@ Detailed flow of a GetObject request through location lookup, failover, broadcas
     '    COPIES --> ULIMIT{Usage Limit<br>Check}:::filter',
     '    ULIMIT -->|over limit, more copies| COPIES',
     '    ULIMIT -->|all over limit| RLIMIT[429 Usage<br>Limit Exceeded]:::reject',
-    '    ULIMIT -->|within limits| FETCH[Backend<br>GetObject]:::process',
+    '    ULIMIT -->|within limits| COMP{Compressed<br>Copy?}:::decision',
+    '',
+    '    COMP -->|no| FETCH[Backend<br>GetObject]:::process',
+    '    COMP -->|yes| SEEK[Open Seekable<br>Reader]:::process',
+    '    SEEK --> FRAME[Ranged GET<br>per Frame]:::storage',
+    '    FRAME --> FDEC{Frame<br>Encrypted?}:::decision',
+    '    FDEC -->|yes| FDECRANGE[DecryptRange:<br>Ciphertext Chunks]:::process',
+    '    FDEC -->|no| DECODE',
+    '    FDECRANGE --> DECODE[Decode Frames:<br>zstd]:::process',
+    '    DECODE --> SLICE[Slice to<br>Client Range]:::process',
+    '    SLICE --> INTEG',
     '',
     '    FETCH --> CB{Circuit<br>Breaker}:::decision',
     '    CB -->|open| FETCHFAIL',
@@ -88,7 +99,8 @@ Detailed flow of a GetObject request through location lookup, failover, broadcas
     '    INTEG -->|disabled or no hash| STREAM',
     '    VERIFY --> STREAM',
     '',
-    '    STREAM[Stream Body<br>to Client]:::process --> CACHEFILL{Cache<br>Fill?}:::decision',
+    '    STREAM[Stream Body<br>to Client]:::process --> TAGCOUNT[Count Tags:<br>x-amz-tagging-count]:::storage',
+    '    TAGCOUNT --> CACHEFILL{Cache<br>Fill?}:::decision',
     '    CACHEFILL -->|cacheable| CACHEPUT[Store in<br>Data Cache]:::process',
     '    CACHEFILL -->|too large or range| METRICS',
     '    CACHEPUT --> METRICS',
@@ -105,8 +117,28 @@ Detailed flow of a GetObject request through location lookup, failover, broadcas
   ].join('\n');
 
   mermaid.initialize({
-    startOnLoad: false, theme: 'dark',
-    flowchart: { nodeSpacing: 14, rankSpacing: 22, curve: 'basis', padding: 5, diagramPadding: 8, useMaxWidth: true }
+    startOnLoad: false,
+    theme: 'base',
+    themeVariables: {
+      darkMode: true,
+      background: '#191c23',
+      fontFamily: 'Inter, ui-sans-serif, system-ui, sans-serif',
+      fontSize: '15px',
+      primaryColor: '#26332f',
+      primaryTextColor: '#f8fafc',
+      primaryBorderColor: '#2a9d73',
+      secondaryColor: '#3a2e20',
+      secondaryTextColor: '#e8dfd0',
+      secondaryBorderColor: '#c4a35a',
+      tertiaryColor: '#20262d',
+      tertiaryTextColor: '#e8dfd0',
+      tertiaryBorderColor: '#4aaa8a',
+      lineColor: '#7f8b86',
+      edgeLabelBackground: '#191c23',
+      clusterBkg: '#1d2229',
+      clusterBorder: '#39443f'
+    },
+    flowchart: { nodeSpacing: 32, rankSpacing: 46, curve: 'linear', padding: 12, diagramPadding: 16, useMaxWidth: true, htmlLabels: true }
   });
 
   mermaid.render('read-mermaid-svg', diagramSrc).then(function(result) {
@@ -128,7 +160,7 @@ Detailed flow of a GetObject request through location lookup, failover, broadcas
     CACHESTREAM: {
       title: 'Return Cached Response',
       badge: 'success', badgeText: 'cache hit',
-      body: '<p>Serves the object directly from the in-memory cache. The response includes all original metadata (content type, ETag, user metadata) captured when the object was first cached.</p><p>Avoids backend API calls, egress charges, decryption overhead, and database queries. Audit event is emitted with <code>source=cache</code>.</p>'
+      body: '<p>Serves the object directly from the in-memory cache. The response includes all original metadata (content type, ETag, user metadata) captured when the object was first cached, plus the tag count that fills <code>x-amz-tagging-count</code>.</p><p>The count rides on the entry because a hit reaches no database at all, which would otherwise leave the header off exactly the responses the cache serves. A tag write drops the entry, so the next read counts again.</p><p>Avoids backend API calls, egress charges, decryption overhead, and database queries. Audit event is emitted with <code>source=cache</code>.</p>'
     },
     DBLOOKUP: {
       title: 'DB Lookup: GetAllObjectLocations',
@@ -163,12 +195,47 @@ Detailed flow of a GetObject request through location lookup, failover, broadcas
     ULIMIT: {
       title: 'Usage Limit Check (Pre-fetch)',
       badge: 'filter', badgeText: 'quota check',
-      body: '<p><code>usage.WithinLimits(backendName, apiCalls=1, egress=0, ingress=0)</code></p><p>Checks if this backend can accept one more API call without exceeding its monthly limits. This is a <b>pre-fetch</b> check &mdash; egress is checked again after the response size is known.</p><p>Skipping over-limit backends avoids wasting API calls on backends that can\'t serve the egress anyway. If copies remain on other backends, the loop continues. If all copies were on over-limit backends, returns <code>ErrUsageLimitExceeded</code>.</p><p class="ac-metric">Metric: s3o_usage_limit_rejections_total{operation="GetObject", direction="read"}</p>'
+      body: '<p><code>usage.WithinLimits(backendName, []Operation{GetObject}, egress=0, ingress=0)</code></p><p>Checks if this backend can accept one more read without exceeding its monthly limits. The operation is named rather than counted, so only the request pools a <code>GetObject</code> belongs to are consulted &mdash; a backend out of upload budget still serves reads. This is a <b>pre-fetch</b> check &mdash; egress is checked again after the response size is known.</p><p>Skipping over-limit backends avoids wasting API calls on backends that can\'t serve the egress anyway. If copies remain on other backends, the loop continues. If all copies were on over-limit backends, returns <code>ErrUsageLimitExceeded</code>.</p><p class="ac-metric">Metric: s3o_usage_limit_rejections_total{operation="GetObject", direction="read"}</p>'
     },
     RLIMIT: {
       title: '429 Usage Limit Exceeded',
       badge: 'reject', badgeText: 'rate limited',
       body: '<p>All copies of this object are on backends that have exceeded their monthly usage limits (API calls or egress).</p><p>The HTTP handler translates <code>ErrUsageLimitExceeded</code> to a 429 Too Many Requests response with a <code>SlowDown</code> S3 error code.</p>'
+    },
+    COMP: {
+      title: 'Compressed Copy?',
+      badge: 'decision', badgeText: 'stored form check',
+      body: '<p>Checks whether this copy\'s row carries a <code>compression_algorithm</code>. An empty algorithm is the ledger\'s own way of saying the bytes are stored verbatim, so nothing else has to agree with it.</p><p>A compressed copy is not served by a whole-object GET. The codec drives the read instead, pulling the frames it needs through a ranged fetcher, which is the entire reason the stored format is chunked.</p><p>Every copy of a key agrees on whether it is compressed, so whichever copy wins the failover takes the same branch.</p><p><a href="../compression/">Compression flow diagram &rarr;</a></p>'
+    },
+    SEEK: {
+      title: 'Open Seekable Reader',
+      badge: 'process', badgeText: 'seek table',
+      body: '<p><code>codec.DecompressRanged(ctx, fetcher, compressedSize)</code> reads the seek table from the trailing skippable frame, which is what maps a logical offset to the frame holding it.</p><p>The size handed to the decoder is the compressed stream\'s size, not the stored size: for an encrypted copy the stored bytes are its ciphertext, so the figure comes from <code>plaintext_size</code> rather than <code>size_bytes</code>.</p><p>Reading the table is itself a ranged fetch, so the object metadata (content type, ETag, user metadata) is captured from that first response rather than paid for with a separate HEAD.</p>'
+    },
+    FRAME: {
+      title: 'Ranged GET per Frame',
+      badge: 'storage', badgeText: 'S3 API call',
+      body: '<p><code>storedRangeFetcher.FetchRange()</code> turns a request for part of the compressed stream into one ranged backend GET.</p><p>Each fetch is charged its own API call and its own egress, on the bytes that actually left the backend. A compressed read makes one call per frame it touches, so charging once per client request would under-report all but the first.</p><p>The usage limit is re-checked per fetch, before and after the response size is known, exactly as the uncompressed path checks it once.</p><p class="ac-metric">Metric: s3o_compression_fetched_bytes_total</p>'
+    },
+    FDEC: {
+      title: 'Frame Encrypted?',
+      badge: 'decision', badgeText: 'decryption check',
+      body: '<p>Compression runs inside encryption, so a copy with both features on is ciphertext of compressed data.</p><p>That ordering is what lets the same offset arithmetic serve both layers: the compressed stream is exactly the encryptor\'s plaintext domain, so a compressed-domain range translates into a ciphertext range through <code>encryption.CiphertextRange()</code> with no new maths.</p>'
+    },
+    FDECRANGE: {
+      title: 'DecryptRange: Ciphertext Chunks',
+      badge: 'process', badgeText: 'range decryption',
+      body: '<p><code>encryptor.DecryptStored()</code> with the translated range unwraps the frame bytes the fetcher asked for.</p><p>Whole ciphertext chunks are fetched because each carries its own GCM auth tag, so the bytes crossing the backend link exceed the frame requested, and that is what the egress charge counts.</p><p class="ac-metric">Metric: s3o_encryption_operations_total{operation="decrypt_range"}</p>'
+    },
+    DECODE: {
+      title: 'Decode Frames: zstd',
+      badge: 'process', badgeText: 'decompression',
+      body: '<p>Frames are decoded as the client reads, not up front. Each is independently decodable, which is what makes an entry point every <code>chunk_size</code> possible instead of only at byte zero.</p><p>A decode failure here is reported against <code>s3o_compression_errors_total{operation="decode"}</code>, which deserves an alert on any value: an encode failure costs one write, a decode failure means stored bytes cannot be read back.</p><p class="ac-metric">Metrics: s3o_compression_errors_total{operation="decode"}, s3o_compression_served_bytes_total</p>'
+    },
+    SLICE: {
+      title: 'Slice to Client Range',
+      badge: 'process', badgeText: 'range slice',
+      body: '<p>The client\'s <code>Range</code> is applied in logical coordinates, against the size the client originally wrote (<code>logical_size</code>), not against the stored size.</p><p>The decoded reader is seeked to the range start and limited to its length, and <code>Content-Range</code> is reported over the logical size. An unsatisfiable range is served as the whole object, which is what the uncompressed path does with one it cannot translate.</p>'
     },
     FETCH: {
       title: 'Backend GetObject',
@@ -183,7 +250,7 @@ Detailed flow of a GetObject request through location lookup, failover, broadcas
     S3: {
       title: 'S3 Backend GetObject',
       badge: 'storage', badgeText: 'S3 API call',
-      body: '<p>AWS SDK v2 <code>s3.GetObject()</code> call to the backend endpoint. Returns <code>GetObjectResult</code> with Body (io.ReadCloser), Size, ContentType, ETag, LastModified, and Metadata.</p><p>For range requests, the backend returns HTTP 206 Partial Content with only the requested byte range.</p><p class="ac-metric">Metrics: s3o_backend_requests_total, s3o_backend_latency_seconds</p>'
+      body: '<p>AWS SDK v2 <code>s3.GetObject()</code> call to the backend endpoint. Returns <code>GetObjectResult</code> with Body (io.ReadCloser), Size, ContentType, ETag, LastModified, and Metadata.</p><p>For range requests, the backend returns HTTP 206 Partial Content with only the requested byte range.</p><p class="ac-metric">Metrics: s3o_backend_requests_total, s3o_backend_duration_seconds</p>'
     },
     FETCHFAIL: {
       title: 'Fetch Failed?',
@@ -198,7 +265,7 @@ Detailed flow of a GetObject request through location lookup, failover, broadcas
     EGRESSCHK: {
       title: 'Egress Limit Check (Post-fetch)',
       badge: 'filter', badgeText: 'egress check',
-      body: '<p><code>usage.WithinLimits(backendName, 1, response.Size, 0)</code></p><p>Now that the response size is known, checks if downloading this object would exceed the backend\'s monthly egress limit.</p><p>If over limit: closes the response body (releasing the HTTP connection), records the API call against usage, and loops back to try the next copy. If no copies remain within limits, returns <code>ErrUsageLimitExceeded</code>.</p>'
+      body: '<p><code>usage.WithinLimits(backendName, []Operation{GetObject}, response.Size, 0)</code></p><p>Now that the response size is known, checks if downloading this object would exceed the backend\'s monthly egress limit.</p><p>If over limit: closes the response body (releasing the HTTP connection), records the API call against usage, and loops back to try the next copy. If no copies remain within limits, returns <code>ErrUsageLimitExceeded</code>.</p>'
     },
     DECRYPT: {
       title: 'Decrypt Needed?',
@@ -208,12 +275,12 @@ Detailed flow of a GetObject request through location lookup, failover, broadcas
     DECRANGE: {
       title: 'DecryptRange: Chunk Slice',
       badge: 'process', badgeText: 'range decryption',
-      body: '<p>Envelope decryption for range requests:</p><p>1. <code>UnpackKeyData(loc.EncryptionKey)</code> &mdash; extract <code>baseNonce</code> and <code>wrappedDEK</code><br>2. <code>encryptor.DecryptRange(ctx, body, wrappedDEK, keyID, rangeResult, baseNonce)</code></p><p>Decrypts only the fetched ciphertext chunks, then slices to the exact requested plaintext bytes. Sets <code>Content-Range</code> header using the original plaintext offsets.</p><p>Response size is set to the plaintext range length. The body is wrapped with <code>wrapReader()</code> so Close reaches the original HTTP body.</p><p class="ac-metric">Metric: s3o_encryption_ops_total{operation="decrypt_range"}</p>'
+      body: '<p>Envelope decryption for range requests:</p><p>1. <code>UnpackKeyData(loc.EncryptionKey)</code> &mdash; extract <code>baseNonce</code> and <code>wrappedDEK</code><br>2. <code>encryptor.DecryptRange(ctx, body, wrappedDEK, keyID, rangeResult, baseNonce)</code></p><p>Decrypts only the fetched ciphertext chunks, then slices to the exact requested plaintext bytes. Sets <code>Content-Range</code> header using the original plaintext offsets.</p><p>Response size is set to the plaintext range length. The body is wrapped with <code>wrapReader()</code> so Close reaches the original HTTP body.</p><p class="ac-metric">Metric: s3o_encryption_operations_total{operation="decrypt_range"}</p>'
     },
     DECFULL: {
       title: 'Decrypt: Full Stream',
       badge: 'process', badgeText: 'full decryption',
-      body: '<p>Envelope decryption for full reads:</p><p>1. <code>UnpackKeyData(loc.EncryptionKey)</code> &mdash; extract <code>baseNonce</code> and <code>wrappedDEK</code><br>2. <code>encryptor.Decrypt(ctx, body, wrappedDEK, keyID)</code></p><p>Streams AES-256-GCM decryption chunk by chunk. Each chunk\'s authentication tag is verified independently. Response size is set to <code>loc.PlaintextSize</code> from the DB record.</p><p class="ac-metric">Metric: s3o_encryption_ops_total{operation="decrypt"}</p>'
+      body: '<p>Envelope decryption for full reads:</p><p>1. <code>UnpackKeyData(loc.EncryptionKey)</code> &mdash; extract <code>baseNonce</code> and <code>wrappedDEK</code><br>2. <code>encryptor.Decrypt(ctx, body, wrappedDEK, keyID)</code></p><p>Streams AES-256-GCM decryption chunk by chunk. Each chunk\'s authentication tag is verified independently. Response size is set to <code>loc.PlaintextSize</code> from the DB record.</p><p class="ac-metric">Metric: s3o_encryption_operations_total{operation="decrypt"}</p>'
     },
     INTEG: {
       title: 'Integrity Verify?',
@@ -223,12 +290,17 @@ Detailed flow of a GetObject request through location lookup, failover, broadcas
     VERIFY: {
       title: 'Wrap with VerifyingReader',
       badge: 'process', badgeText: 'integrity',
-      body: '<p><code>VerifyingReader</code> wraps the response body and computes SHA-256 incrementally as data streams through to the client.</p><p>When the reader reaches EOF, it compares the computed hash to the stored <code>content_hash</code>. On mismatch, the corrupted copy is enqueued for cleanup via <code>deleteOrEnqueue()</code>.</p><p>Verification is zero-copy and adds no buffering &mdash; it runs inline with the streaming read.</p><p class="ac-metric">Metrics: s3o_integrity_checks_total{operation="read"}, s3o_integrity_errors_total{operation="read"}</p>'
+      body: '<p><code>VerifyingReader</code> wraps the response body and computes SHA-256 incrementally as data streams through to the client.</p><p>When the reader reaches EOF, it compares the computed hash to the stored <code>content_hash</code>. On mismatch, the corrupted copy is enqueued for cleanup via <code>DeleteOrEnqueue()</code>.</p><p>Verification is zero-copy and adds no buffering &mdash; it runs inline with the streaming read.</p><p class="ac-metric">Metrics: s3o_integrity_checks_total{operation="read"}, s3o_integrity_errors_total{operation="read"}</p>'
     },
     STREAM: {
       title: 'Stream Body to Client',
       badge: 'process', badgeText: 'streaming',
       body: '<p>The (possibly decrypted) response body streams directly to the HTTP client. Uses <code>sync.Once</code> to protect the result assignment when parallel broadcast is enabled &mdash; only the first successful response is returned, and losing responses have their bodies closed.</p><p>The body is an <code>io.ReadCloser</code>; the HTTP handler streams it to the response writer and closes it when done.</p>'
+    },
+    TAGCOUNT: {
+      title: 'Count Tags',
+      badge: 'storage', badgeText: 'metadata store',
+      body: '<p><code>count(*)</code> on <code>object_tags</code> for the key, an index-only scan over the primary key prefix. Fills <code>x-amz-tagging-count</code>, which is sent only when the object carries at least one tag.</p><p>Counted here rather than folded into the location lookup: that lookup is shared by the scrubber, drain, reconcile and the sync command, and a per-object count does not belong on the per-copy rows they read.</p><p>Advisory. A count the store cannot serve is reported as none and the header left off, because the bytes are already correct and one header is not worth failing a read over. A degraded read, having reached the object by broadcast with the store unreachable, omits it for the same reason.</p><p><a href="../tagging/">Object tagging &rarr;</a></p>'
     },
     CACHEFILL: {
       title: 'Cache Fill Decision',
@@ -238,12 +310,12 @@ Detailed flow of a GetObject request through location lookup, failover, broadcas
     CACHEPUT: {
       title: 'Store in Data Cache',
       badge: 'process', badgeText: 'cache store',
-      body: '<p>Stores the object data, content type, ETag, and user metadata in the in-memory LRU cache via <code>objectCache.Put()</code>.</p><p>If the cache is at capacity, the least recently used entry is evicted to make room. The entry expires after the configured <code>cache.ttl</code> (default: 5 minutes).</p><p class="ac-metric">Metrics: s3o_cache_size_bytes, s3o_cache_entries, s3o_cache_evictions_total</p>'
+      body: '<p>Stores the object data, content type, ETag, user metadata, and tag count in the in-memory LRU cache via <code>objectCache.Put()</code>.</p><p>If the cache is at capacity, the least recently used entry is evicted to make room. The entry expires after the configured <code>cache.ttl</code> (default: 5 minutes).</p><p class="ac-metric">Metrics: s3o_cache_size_bytes, s3o_cache_entries, s3o_cache_evictions_total</p>'
     },
     METRICS: {
       title: 'Record Usage & Metrics',
       badge: 'process', badgeText: 'telemetry',
-      body: '<p><code>Record(backendName, apiCalls=1, egress=result.Size, ingress=0)</code> increments the monthly usage counters in the counter backend.</p><p>Operation duration is recorded via <code>MetricsCollector</code>. If failover occurred (primary copy failed), the span includes <code>s3o.failover=true</code>.</p><p>Audit event: <code>storage.GetObject</code> with key, backend name, and size.</p>'
+      body: '<p><code>Record(backendName, GetObject, egress=wireBytes, ingress=0)</code> increments the monthly usage counters in the counter backend, charging the backend&#39;s request total and every budget pool containing <code>GetObject</code>.</p><p>The egress charged is what crossed the backend link, which is not the size the client is served. Decryption happens on this side of that link, so an encrypted object is served as a smaller plaintext than the ciphertext fetched, and a ranged read of one crosses whole chunks to serve a slice.</p><p>A compressed read is not charged here at all: it meters itself per frame inside the fetcher, and adding the logical size on top would double-count the larger of the two figures.</p><p>Operation duration is recorded via <code>MetricsCollector</code>. If failover occurred (primary copy failed), the span includes <code>s3o.failover=true</code>.</p><p>Audit event: <code>storage.GetObject</code> with key, backend name, and size.</p>'
     },
     OK: {
       title: 'Return GetObjectResult',
@@ -267,10 +339,25 @@ Detailed flow of a GetObject request through location lookup, failover, broadcas
     if (tooltip.style.display === 'block' && !pinned) positionTooltip();
   });
   function positionTooltip() {
-    var pad = 12, x = mouseX + pad, y = mouseY + pad;
-    if (x + tooltip.offsetWidth > window.innerWidth - pad) x = mouseX - tooltip.offsetWidth - pad;
-    if (y + tooltip.offsetHeight > window.innerHeight - pad) y = mouseY - tooltip.offsetHeight - pad;
-    tooltip.style.left = x + 'px'; tooltip.style.top = y + 'px';
+    var pad = 12;
+    var w = tooltip.offsetWidth, h = tooltip.offsetHeight;
+    var vw = window.innerWidth, vh = window.innerHeight;
+
+    var x = mouseX + pad;
+    if (x + w > vw - pad) x = mouseX - w - pad;
+    x = Math.max(pad, Math.min(x, vw - w - pad));
+
+    // Prefer below the cursor, and flip above only when above genuinely has
+    // more room. Clamping afterwards is what keeps a tall panel on screen: an
+    // unclamped flip puts its top edge above the viewport, and a panel taller
+    // than the viewport pins to the top and scrolls instead.
+    var below = vh - mouseY - pad * 2;
+    var above = mouseY - pad * 2;
+    var y = (h <= below || below >= above) ? mouseY + pad : mouseY - h - pad;
+    y = Math.max(pad, Math.min(y, vh - h - pad));
+
+    tooltip.style.left = x + 'px';
+    tooltip.style.top = y + 'px';
   }
   function showInfo(id) {
     var info = nodeInfo[id];

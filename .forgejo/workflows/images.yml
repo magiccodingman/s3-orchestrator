@@ -1,0 +1,67 @@
+# -------------------------------------------------------------------------------
+# Build and push the container images on every merge to main.
+#
+# Author: Alex Freidah
+#
+# This file runs only on a Forgejo instance -- GitHub ignores .forgejo/workflows.
+# Its presence is also what stops Forgejo from falling back to .github/workflows,
+# which targets GitHub-hosted runners and fails on a self-hosted one.
+#
+# Nothing here is scoped to changed paths. The repository reaches Forgejo through
+# a mirror whose pushes are force-updated and can batch several commits, so a
+# push event's own commit range does not reliably describe what changed. A filter
+# that silently skips a build is worse than always building.
+#
+# `make push` tags from .version, so a merge that does not bump it republishes
+# that tag from current main.
+# -------------------------------------------------------------------------------
+
+name: Images
+
+on:
+  push:
+    branches: [main]
+
+env:
+  # The Makefile defaults REGISTRY to a placeholder so a fork never publishes here.
+  DOCKER_REGISTRY: registry.munchbox.cc
+
+jobs:
+  images:
+    name: Build and push images
+    runs-on: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and push
+        run: |
+          set -euo pipefail
+
+          # The build host carries no qemu handlers, so without this buildx
+          # reports amd64 only and the arm64 half of each image fails.
+          docker run --privileged --rm tonistiigi/binfmt --install all
+
+          make push
+          make web-push
+
+      # The edge worker's bundle and the grafana dashboard are built here and
+      # read back by whatever deploys them, under a key carrying .version. Both
+      # were published by hand until now, so the key a consumer pins only
+      # existed for versions somebody remembered to run a target for.
+      - name: Publish the artifacts a deployment reads back
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: us-east-1
+        run: make artifacts-publish
+
+      # The GitHub release attaches the .deb to a release page, which the apt
+      # repository cannot read: it is reachable from the cluster only. So the
+      # package is built and published here, versioned from .version like the
+      # images above rather than from the newest git tag.
+      - name: Build and publish the Debian package
+        env:
+          APTLY_PASS: ${{ secrets.APTLY_PASS }}
+        run: |
+          make deb
+          make publish-deb

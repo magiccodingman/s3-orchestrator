@@ -1,11 +1,11 @@
 // -------------------------------------------------------------------------------
-// Admin Handler Tests with a Real BackendManager
+// Admin Handler Tests with a Real Backend Runtime
 //
 // Author: Alex Freidah
 //
 // Extends handler_test.go, which only exercises the auth and input-validation
-// paths, with tests that route through a real BackendManager backed by the
-// shared testutil.MockStore. Covers status, cleanup queue, replication,
+// paths, with tests that route through a real proxy stack backed by the
+// shared union store mock. Covers status, cleanup queue, replication,
 // drain, and integrity-skip branches of the admin API.
 // -------------------------------------------------------------------------------
 
@@ -22,46 +22,49 @@ import (
 	"testing"
 
 	"github.com/afreidah/s3-orchestrator/internal/backend"
+	"github.com/afreidah/s3-orchestrator/internal/backend/backendtest"
 	"github.com/afreidah/s3-orchestrator/internal/config"
 	"github.com/afreidah/s3-orchestrator/internal/encryption"
 	"github.com/afreidah/s3-orchestrator/internal/observe/logfmt"
-	"github.com/afreidah/s3-orchestrator/internal/proxy"
+	"github.com/afreidah/s3-orchestrator/internal/ops"
+	"github.com/afreidah/s3-orchestrator/internal/ops/opstest"
 	"github.com/afreidah/s3-orchestrator/internal/proxy/dashboard"
 	"github.com/afreidah/s3-orchestrator/internal/proxy/proxytest"
 	"github.com/afreidah/s3-orchestrator/internal/store"
 	"github.com/afreidah/s3-orchestrator/internal/store/core"
-	"github.com/afreidah/s3-orchestrator/internal/testutil"
+	"github.com/afreidah/s3-orchestrator/internal/store/storetest"
+	"github.com/afreidah/s3-orchestrator/internal/transport/auth"
+
+	"go.uber.org/mock/gomock"
+
 	"github.com/afreidah/s3-orchestrator/internal/transport/admin/adminapi"
 )
 
-// newTestHandlerWithManager returns a Handler backed by a real BackendManager
-// wrapping testutil.MockStore. Suitable for exercising handlers that reach
-// into manager or cb-store methods. Encryptor, rawStore, and reconciler are
+// -------------------------------------------------------------------------
+// CONSTRUCTOR
+// -------------------------------------------------------------------------
+
+// newTestHandlerWithManager returns a Handler backed by a real proxy stack
+// wrapping the generated union store mock. Suitable for exercising handlers that reach
+// into stack or cb-store methods. Encryptor, rawStore, and reconciler are
 // nil  -  handlers that require them should assert the documented nil-handling
 // behaviour rather than the happy path.
 func newTestHandlerWithManager(t *testing.T) *Handler {
 	t.Helper()
-	mock := testutil.NewMockStore(t)
+	mock := storetest.NewMockMetadataStore(gomock.NewController(t))
+	storetest.Permissive(mock)
 	cb := store.NewDatabaseBreaker(config.CircuitBreakerConfig{
 		FailureThreshold: 3,
 	})
-	mgr := proxytest.NewManager(t, &proxy.BackendManagerConfig{
-		Storage: proxy.StorageDeps{
-			Backends: map[string]backend.ObjectBackend{},
-			Order:    []string{},
-		},
-		Stores: proxy.StoreDeps{
-			Metadata:  mock,
-			Dashboard: mock,
-		},
-		Policies: proxy.PolicyConfig{
+	st := proxytest.New(t, mock, &proxytest.StackOptions{
+		Runtime: proxytest.NewRuntime(&proxytest.RuntimeOptions{
+			Backends:        map[string]backend.ObjectBackend{},
+			Order:           []string{},
 			RoutingStrategy: config.RoutingPack,
-		},
-		Operations: proxy.OperationalDeps{
-			Metrics: mock,
-		},
+			Metrics:         mock,
+		}),
 	})
-	workers := proxytest.BuildWorkers(mgr, mock)
+	workers := proxytest.BuildWorkers(st, mock)
 	// Empty reloadable configs so Replicator.Config()/Scrubber.Config() return
 	// sentinel states the handlers can interpret.
 	workers.Replicator.SetConfig(&config.ReplicationConfig{Factor: 1})
@@ -69,30 +72,69 @@ func newTestHandlerWithManager(t *testing.T) *Handler {
 
 	var lv slog.LevelVar
 	lv.Set(slog.LevelInfo)
+	svc := testOps(st, workers, mock, nil)
 	return &Handler{
-		log:        slog.Default().With(logfmt.Component("admin")),
-		backendOps: mgr,
-		runtimeOps: mgr.Runtime(),
-		replicator: workers.Replicator,
-		overRep:    workers.OverReplicationCleaner,
-		drain:      mgr.Drain(),
-		scrubber:   workers.Scrubber,
-		lifecycle:  mock,
-		dbHealthy:  cb.IsHealthy,
-		objects:    mock,
-		cleanup:    mock,
-		encAdmin:   mock,
-		token:      "test-token",
-		logLevel:   &lv,
+		log:          slog.Default().With(logfmt.Component("admin")),
+		backendOps:   st.Usage,
+		dashboardOps: dashboard.New(mock, st.Runtime.Usage(), nil, st.Runtime, st.Drain),
+		objects:      svc.Objects,
+		integrity:    svc.Integrity,
+		replication:  svc.Replication,
+		rebalance:    svc.Rebalance,
+		encryption:   svc.Encryption,
+		drain:        st.Drain,
+		lifecycle:    mock,
+		dbHealthy:    cb.IsHealthy,
+		cleanup:      mock,
+		logLevel:     &lv,
+		registry:     func() *auth.BucketRegistry { return rootRegistry(t) },
 	}
 }
 
-// doAuth builds a request pre-populated with the correct admin token.
-func doAuth(method, path string, body string) *http.Request {
-	req := httptest.NewRequestWithContext(context.Background(), method, path, strings.NewReader(body))
-	req.Header.Set("X-Admin-Token", "test-token")
-	return req
+// -------------------------------------------------------------------------
+// INTERNALS
+// -------------------------------------------------------------------------
+
+// objectsOver builds an object operations service over one store mock, for the
+// handlers that only read object metadata and never move bytes.
+func objectsOver(t *testing.T, store ops.ObjectStore) *ops.Objects {
+	t.Helper()
+	return ops.NewObjects(ops.ObjectsDeps{
+		Objects: opstest.NewMockObjectAPI(gomock.NewController(t)),
+		Store:   store,
+		Buckets: declaredBuckets(),
+	})
 }
+
+// testOps assembles the operations layer over the fixture's real stack and
+// workers, so a handler test drives the same code the process wires.
+func testOps(st *proxytest.Stack, workers *proxytest.Workers, store storetest.MetadataStore, enc *encryption.Encryptor) *ops.Services {
+	return ops.New(&ops.Deps{
+		Objects:      st.Objects,
+		Store:        store,
+		Encryptor:    enc,
+		EncStore:     store,
+		Runtime:      st.Runtime,
+		Usage:        st.Runtime.Usage(),
+		IntegrityCfg: st.IntegrityCfg,
+		Replicator:   workers.Replicator,
+		OverRep:      workers.OverReplicationCleaner,
+		Rebalancer:   workers.Rebalancer,
+		Scrubber:     workers.Scrubber,
+		Declared:     declaredBuckets(),
+		Cfg:          &config.Config{},
+	})
+}
+
+// doAuth builds a request signed with the root credential.
+func doAuth(tb testing.TB, method, path string, body string) *http.Request {
+	tb.Helper()
+	return doRoot(tb, method, path, body)
+}
+
+// -------------------------------------------------------------------------
+// PUBLIC API
+// -------------------------------------------------------------------------
 
 // TestHandleStatus_EmptyBackends covers the status path with a well-formed
 // manager and no backends configured. Should return 200 with empty arrays
@@ -104,7 +146,7 @@ func TestHandleStatus_EmptyBackends(t *testing.T) {
 	h.Register(mux)
 
 	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, doAuth(http.MethodGet, "/admin/api/status", ""))
+	mux.ServeHTTP(w, doAuth(t, http.MethodGet, "/admin/api/status", ""))
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
@@ -130,10 +172,57 @@ func TestHandleCleanupQueue_ReturnsDepth(t *testing.T) {
 	h.Register(mux)
 
 	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, doAuth(http.MethodGet, "/admin/api/cleanup-queue", ""))
+	mux.ServeHTTP(w, doAuth(t, http.MethodGet, "/admin/api/cleanup-queue", ""))
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+}
+
+// TestHandleCleanupQueue_ItemShape pins the wire shape of a pending cleanup:
+// snake_case names shared with the dead-letter listing, and claim fields
+// omitted while no worker holds the row.
+func TestHandleCleanupQueue_ItemShape(t *testing.T) {
+	t.Parallel()
+	h := newTestHandlerWithManager(t)
+	cleanupMock := storetest.NewMockCleanupStore(gomock.NewController(t))
+	cleanupMock.EXPECT().CleanupQueueDepth(gomock.Any()).Return(int64(2), nil).Times(1)
+	cleanupMock.EXPECT().GetPendingCleanups(gomock.Any(), gomock.Any()).Return([]core.CleanupItem{{
+		ID:          7,
+		BackendName: "minio-1",
+		ObjectKey:   "photos/cat.jpg",
+		Reason:      "delete_failed",
+		SizeBytes:   4096,
+		Attempts:    2,
+	}}, nil).Times(1)
+	h.cleanup = cleanupMock
+	mux := http.NewServeMux()
+	h.Register(mux)
+
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, doAuth(t, http.MethodGet, "/admin/api/cleanup-queue", ""))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	var resp adminapi.CleanupQueueResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Depth != 2 || len(resp.Items) != 1 {
+		t.Fatalf("got depth=%d items=%d, want 2/1", resp.Depth, len(resp.Items))
+	}
+	got := resp.Items[0]
+	want := adminapi.CleanupQueueItem{
+		ID: 7, Backend: "minio-1", ObjectKey: "photos/cat.jpg",
+		Reason: "delete_failed", SizeBytes: 4096, Attempts: 2,
+	}
+	if got != want {
+		t.Errorf("item = %+v, want %+v", got, want)
+	}
+	// An unclaimed row must not emit null claim fields.
+	if body := w.Body.String(); strings.Contains(body, "claimed_at") || strings.Contains(body, "claimed_by") {
+		t.Errorf("unclaimed item emitted claim fields: %s", body)
 	}
 }
 
@@ -141,22 +230,22 @@ func TestHandleCleanupQueue_ReturnsDepth(t *testing.T) {
 // is pre-seeded so GetAllObjectLocations returns a non-empty slice.
 func TestHandleObjectLocations_Happy(t *testing.T) {
 	t.Parallel()
-	mock := testutil.NewMockStore(t)
-	mock.GetAllLocationsResp = []core.ObjectLocation{{
+	mock := storetest.NewMockObjectStore(gomock.NewController(t))
+	mock.EXPECT().GetAllObjectLocations(gomock.Any(), "foo").Return([]core.ObjectLocation{{
 		ObjectKey:     "foo",
 		BackendName:   "b1",
 		Encrypted:     true,
 		KeyID:         "kid-1",
 		EncryptionKey: []byte("super-secret-raw-key"),
-	}}
+	}}, nil).Times(1)
 	cb := store.NewDatabaseBreaker(config.CircuitBreakerConfig{FailureThreshold: 3})
 	var lv slog.LevelVar
-	h := &Handler{log: slog.Default().With(logfmt.Component("admin")), dbHealthy: cb.IsHealthy, objects: mock, cleanup: mock, token: "test-token", logLevel: &lv}
+	h := &Handler{log: slog.Default().With(logfmt.Component("admin")), dbHealthy: cb.IsHealthy, objects: objectsOver(t, mock), logLevel: &lv, registry: func() *auth.BucketRegistry { return rootRegistry(t) }}
 	mux := http.NewServeMux()
 	h.Register(mux)
 
 	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, doAuth(http.MethodGet, "/admin/api/object-locations?key=foo", ""))
+	mux.ServeHTTP(w, doAuth(t, http.MethodGet, "/admin/api/object-locations?key=foo", ""))
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
@@ -180,84 +269,72 @@ func TestHandleObjectLocations_Happy(t *testing.T) {
 }
 
 // TestHandleObjectLocations_NotFound covers the 500 path when the store
-// returns ErrObjectNotFound (the default MockStore behaviour). Handler
-// currently does not distinguish not-found from other store errors.
+// returns ErrObjectNotFound. The handler does not distinguish not-found from
+// any other store error, so an unknown key is a 500 rather than a 404.
 func TestHandleObjectLocations_NotFound(t *testing.T) {
 	t.Parallel()
 	h := newTestHandlerWithManager(t)
+	objects := storetest.NewMockObjectStore(gomock.NewController(t))
+	objects.EXPECT().GetAllObjectLocations(gomock.Any(), "ghost").Return(nil, core.ErrObjectNotFound).Times(1)
+	h.objects = objectsOver(t, objects)
 	mux := http.NewServeMux()
 	h.Register(mux)
 
 	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, doAuth(http.MethodGet, "/admin/api/object-locations?key=ghost", ""))
+	mux.ServeHTTP(w, doAuth(t, http.MethodGet, "/admin/api/object-locations?key=ghost", ""))
 
 	if w.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want 500; body=%s", w.Code, w.Body.String())
 	}
 }
 
-// TestHandleUsageFlush_Success exercises the usage-flush POST path.
-func TestHandleUsageFlush_Success(t *testing.T) {
+// TestManagerRouteOutcomes covers the routes whose contract on a default,
+// nothing-configured handler is a status code: the worker triggers that
+// short-circuit, the drain routes asked about a backend that does not exist,
+// and the endpoints whose subsystem is not wired. Cases that also inspect the
+// response body keep their own test.
+func TestManagerRouteOutcomes(t *testing.T) {
 	t.Parallel()
-	h := newTestHandlerWithManager(t)
-	mux := http.NewServeMux()
-	h.Register(mux)
-
-	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, doAuth(http.MethodPost, "/admin/api/usage-flush", ""))
-
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	tests := []struct {
+		name   string
+		method string
+		path   string
+		// want is the exact status expected, or 0 when the contract is only
+		// that the handler answers rather than crashing: those routes may
+		// legitimately return a 200 or a well-formed error.
+		want int
+	}{
+		{"usage flush", http.MethodPost, "/admin/api/usage-flush", http.StatusOK},
+		{"replicate with replication unconfigured", http.MethodPost, "/admin/api/replicate", 0},
+		{"over-replication status with no backends", http.MethodGet, "/admin/api/over-replication", http.StatusOK},
+		{"over-replication clean with no backends", http.MethodPost, "/admin/api/over-replication", http.StatusOK},
+		{"backfill checksums with integrity disabled", http.MethodPost, "/admin/api/backfill-checksums", http.StatusOK},
+		{"reconcile with no reconciler", http.MethodPost, "/admin/api/reconcile", http.StatusServiceUnavailable},
+		{"drain an unknown backend", http.MethodPost, "/admin/api/backends/nope/drain", http.StatusBadRequest},
+		{"progress for an unknown backend", http.MethodGet, "/admin/api/backends/nope/drain", 0},
+		{"cancel a drain that never started", http.MethodDelete, "/admin/api/backends/nope/drain", http.StatusBadRequest},
 	}
-}
 
-// TestHandleReplicate_NoReplicationConfigured hits replicate when the
-// reloadable replication config is at factor=1; worker should short-circuit.
-func TestHandleReplicate_NoReplicationConfigured(t *testing.T) {
-	t.Parallel()
-	h := newTestHandlerWithManager(t)
-	mux := http.NewServeMux()
-	h.Register(mux)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			h := newTestHandlerWithManager(t)
+			mux := http.NewServeMux()
+			h.Register(mux)
 
-	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, doAuth(http.MethodPost, "/admin/api/replicate", ""))
+			w := httptest.NewRecorder()
+			mux.ServeHTTP(w, doAuth(t, tt.method, tt.path, ""))
 
-	// Either 200 (no-op) or a well-formed error; never a crash or 500 from
-	// a nil-deref.
-	if w.Code >= 500 {
-		t.Fatalf("status = %d, want <500; body=%s", w.Code, w.Body.String())
-	}
-}
-
-// TestHandleOverReplicationStatus_EmptyBackends covers over-replication
-// status with no backends.
-func TestHandleOverReplicationStatus_EmptyBackends(t *testing.T) {
-	t.Parallel()
-	h := newTestHandlerWithManager(t)
-	mux := http.NewServeMux()
-	h.Register(mux)
-
-	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, doAuth(http.MethodGet, "/admin/api/over-replication", ""))
-
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
-	}
-}
-
-// TestHandleOverReplicationClean_EmptyBackends covers over-replication
-// cleanup with no backends.
-func TestHandleOverReplicationClean_EmptyBackends(t *testing.T) {
-	t.Parallel()
-	h := newTestHandlerWithManager(t)
-	mux := http.NewServeMux()
-	h.Register(mux)
-
-	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, doAuth(http.MethodPost, "/admin/api/over-replication", ""))
-
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+			if tt.want == 0 {
+				if w.Code >= 500 {
+					t.Fatalf("status = %d, want <500; body=%s", w.Code, w.Body.String())
+				}
+				return
+			}
+			if w.Code != tt.want {
+				t.Fatalf("status = %d, want %d; body=%s", w.Code, tt.want, w.Body.String())
+			}
+		})
 	}
 }
 
@@ -271,97 +348,20 @@ func TestHandleScrub_IntegrityDisabled(t *testing.T) {
 	h.Register(mux)
 
 	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, doAuth(http.MethodPost, "/admin/api/scrub", ""))
+	mux.ServeHTTP(w, doAuth(t, http.MethodPost, "/admin/api/scrub", ""))
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
 	}
-	var resp map[string]any
+	var resp adminapi.ScrubResponse
 	_ = json.NewDecoder(w.Body).Decode(&resp)
-	if resp["status"] != "skipped" {
-		t.Errorf("status = %v, want %q", resp["status"], "skipped")
+	if resp.Status != "skipped" || resp.Reason == "" {
+		t.Errorf("got status=%q reason=%q, want skipped with a reason", resp.Status, resp.Reason)
 	}
-}
-
-// TestHandleBackfillChecksums_IntegrityDisabled mirrors scrub: the
-// integrity-disabled short-circuit returns status=skipped.
-func TestHandleBackfillChecksums_IntegrityDisabled(t *testing.T) {
-	t.Parallel()
-	h := newTestHandlerWithManager(t)
-	mux := http.NewServeMux()
-	h.Register(mux)
-
-	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, doAuth(http.MethodPost, "/admin/api/backfill-checksums", ""))
-
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
-	}
-}
-
-// TestHandleReconcile_NilReconciler covers the 503 path taken when no
-// reconciler is wired up (the common single-instance default).
-func TestHandleReconcile_NilReconciler(t *testing.T) {
-	t.Parallel()
-	h := newTestHandlerWithManager(t)
-	mux := http.NewServeMux()
-	h.Register(mux)
-
-	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, doAuth(http.MethodPost, "/admin/api/reconcile", ""))
-
-	if w.Code != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, want 503; body=%s", w.Code, w.Body.String())
-	}
-}
-
-// TestHandleStartDrain_UnknownBackend drains a backend that doesn't exist;
-// DrainManager should return an error and handleStartDrain translates to 400.
-func TestHandleStartDrain_UnknownBackend(t *testing.T) {
-	t.Parallel()
-	h := newTestHandlerWithManager(t)
-	mux := http.NewServeMux()
-	h.Register(mux)
-
-	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, doAuth(http.MethodPost, "/admin/api/backends/nope/drain", ""))
-
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400; body=%s", w.Code, w.Body.String())
-	}
-}
-
-// TestHandleDrainProgress_UnknownBackend asks for progress on a backend
-// that was never drained. DrainManager.GetDrainProgress may return 404 or
-// a well-formed "not draining" response; accept either as long as it's not
-// a 5xx crash.
-func TestHandleDrainProgress_UnknownBackend(t *testing.T) {
-	t.Parallel()
-	h := newTestHandlerWithManager(t)
-	mux := http.NewServeMux()
-	h.Register(mux)
-
-	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, doAuth(http.MethodGet, "/admin/api/backends/nope/drain", ""))
-
-	if w.Code >= 500 {
-		t.Fatalf("status = %d, want <500; body=%s", w.Code, w.Body.String())
-	}
-}
-
-// TestHandleCancelDrain_NoActiveDrain cancels a drain that was never started;
-// handler returns 400 per its contract.
-func TestHandleCancelDrain_NoActiveDrain(t *testing.T) {
-	t.Parallel()
-	h := newTestHandlerWithManager(t)
-	mux := http.NewServeMux()
-	h.Register(mux)
-
-	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, doAuth(http.MethodDelete, "/admin/api/backends/nope/drain", ""))
-
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400; body=%s", w.Code, w.Body.String())
+	// The skipped branch reports the counters as zero rather than omitting
+	// them, so both branches of the endpoint carry one shape.
+	if resp.Checked != 0 || resp.Failed != 0 {
+		t.Errorf("got checked=%d failed=%d, want both zero", resp.Checked, resp.Failed)
 	}
 }
 
@@ -375,7 +375,7 @@ func TestHandleRemoveBackend_NonPurge(t *testing.T) {
 	h.Register(mux)
 
 	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, doAuth(http.MethodDelete, "/admin/api/backends/someb", ""))
+	mux.ServeHTTP(w, doAuth(t, http.MethodDelete, "/admin/api/backends/someb", ""))
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
@@ -392,7 +392,7 @@ func TestHandleRemoveBackend_PurgePhase1(t *testing.T) {
 	h.Register(mux)
 
 	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, doAuth(http.MethodDelete, "/admin/api/backends/b1?purge=true", ""))
+	mux.ServeHTTP(w, doAuth(t, http.MethodDelete, "/admin/api/backends/b1?purge=true", ""))
 
 	// MockStore is permissive  -  it may return 200 with a confirm_token, or
 	// 400 if the backend doesn't exist in its view. Either is a contract-
@@ -411,7 +411,7 @@ func TestHandleRotateEncryptionKey_NoEncryptor(t *testing.T) {
 	h.Register(mux)
 
 	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, doAuth(http.MethodPost, "/admin/api/rotate-encryption-key", ""))
+	mux.ServeHTTP(w, doAuth(t, http.MethodPost, "/admin/api/rotate-encryption-key", ""))
 
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400; body=%s", w.Code, w.Body.String())
@@ -424,6 +424,14 @@ func TestHandleRotateEncryptionKey_NoEncryptor(t *testing.T) {
 func newRotateEncryptionKeyHandler(t *testing.T) *Handler {
 	t.Helper()
 	h := newTestHandlerWithManager(t)
+	encryptionWith(t, h, testEncryptor(t), emptyEncryptionStore(t))
+	return h
+}
+
+// testEncryptor builds a real encryptor over the local config-key provider,
+// for the paths that must get past the encryption-disabled guard.
+func testEncryptor(t *testing.T) *encryption.Encryptor {
+	t.Helper()
 	provider, err := encryption.NewConfigKeyProvider(
 		"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", "test-key")
 	if err != nil {
@@ -433,9 +441,7 @@ func newRotateEncryptionKeyHandler(t *testing.T) *Handler {
 	if err != nil {
 		t.Fatalf("NewEncryptor: %v", err)
 	}
-	h.encryptor = enc
-	h.encAdmin = emptyEncAdmin{}
-	return h
+	return enc
 }
 
 // TestHandleRotateEncryptionKey_BodyValidation covers the request-body
@@ -462,7 +468,7 @@ func TestHandleRotateEncryptionKey_BodyValidation(t *testing.T) {
 			h.Register(mux)
 
 			w := httptest.NewRecorder()
-			mux.ServeHTTP(w, doAuth(http.MethodPost, "/admin/api/rotate-encryption-key", tc.body))
+			mux.ServeHTTP(w, doAuth(t, http.MethodPost, "/admin/api/rotate-encryption-key", tc.body))
 
 			if w.Code != http.StatusBadRequest {
 				t.Fatalf("status = %d, want 400; body=%s", w.Code, w.Body.String())
@@ -487,14 +493,14 @@ func TestHandleCleanupQueue_DepthError(t *testing.T) {
 	// Swap the cleanup store for one whose depth call fails. The
 	// handler reads h.cleanup directly, so assigning a fresh mock
 	// is sufficient.
-	cleanupMock := testutil.NewMockStore(t)
-	cleanupMock.CleanupQueueDepthErr = errors.New("db down")
+	cleanupMock := storetest.NewMockCleanupStore(gomock.NewController(t))
+	cleanupMock.EXPECT().CleanupQueueDepth(gomock.Any()).Return(int64(0), errors.New("db down")).Times(1)
 	h.cleanup = cleanupMock
 	mux := http.NewServeMux()
 	h.Register(mux)
 
 	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, doAuth(http.MethodGet, "/admin/api/cleanup-queue", ""))
+	mux.ServeHTTP(w, doAuth(t, http.MethodGet, "/admin/api/cleanup-queue", ""))
 
 	if w.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want 500; body=%s", w.Code, w.Body.String())
@@ -506,15 +512,15 @@ func TestHandleCleanupQueue_DepthError(t *testing.T) {
 func TestHandleCleanupQueue_PendingError(t *testing.T) {
 	t.Parallel()
 	h := newTestHandlerWithManager(t)
-	cleanupMock := testutil.NewMockStore(t)
-	cleanupMock.CleanupQueueDepthResp = 5
-	cleanupMock.PendingCleanupsErr = errors.New("query failed")
+	cleanupMock := storetest.NewMockCleanupStore(gomock.NewController(t))
+	cleanupMock.EXPECT().CleanupQueueDepth(gomock.Any()).Return(int64(5), nil).Times(1)
+	cleanupMock.EXPECT().GetPendingCleanups(gomock.Any(), gomock.Any()).Return(nil, errors.New("query failed")).Times(1)
 	h.cleanup = cleanupMock
 	mux := http.NewServeMux()
 	h.Register(mux)
 
 	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, doAuth(http.MethodGet, "/admin/api/cleanup-queue", ""))
+	mux.ServeHTTP(w, doAuth(t, http.MethodGet, "/admin/api/cleanup-queue", ""))
 
 	if w.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want 500; body=%s", w.Code, w.Body.String())
@@ -522,12 +528,12 @@ func TestHandleCleanupQueue_PendingError(t *testing.T) {
 }
 
 // TestHandleUsageFlush_Error covers the FlushUsage error branch in
-// handleUsageFlush. The fixture's BackendManager wraps a MockStore
+// handleUsageFlush. The fixture's stack wraps a MockStore
 // whose FlushUsageDeltas call honours FlushUsageErr.
 func TestHandleUsageFlush_Error(t *testing.T) {
 	t.Parallel()
 	h := newTestHandlerWithManager(t)
-	// h.backendOps is a *proxy.BackendManager backed by a MockStore.
+	// h.backendOps is a *usage.Service backed by a MockStore.
 	// We cannot easily inject an error through it, so swap the
 	// BackendOps interface with a stub that fails FlushUsage.
 	h.backendOps = &flushUsageFailingOps{inner: h.backendOps}
@@ -535,7 +541,7 @@ func TestHandleUsageFlush_Error(t *testing.T) {
 	h.Register(mux)
 
 	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, doAuth(http.MethodPost, "/admin/api/usage-flush", ""))
+	mux.ServeHTTP(w, doAuth(t, http.MethodPost, "/admin/api/usage-flush", ""))
 
 	if w.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want 500; body=%s", w.Code, w.Body.String())
@@ -549,20 +555,11 @@ type flushUsageFailingOps struct {
 	inner BackendOps
 }
 
-func (f *flushUsageFailingOps) GetDashboardData(ctx context.Context) (*dashboard.Data, error) {
-	return f.inner.GetDashboardData(ctx)
-}
 func (f *flushUsageFailingOps) FlushUsage(_ context.Context) error {
 	return errors.New("flush failed")
 }
 func (f *flushUsageFailingOps) ReconcileUsage(ctx context.Context) (map[string]int64, error) {
 	return f.inner.ReconcileUsage(ctx)
-}
-func (f *flushUsageFailingOps) RecordUsage(name string, req, in, out int64) {
-	f.inner.RecordUsage(name, req, in, out)
-}
-func (f *flushUsageFailingOps) IntegrityConfig() *config.IntegrityConfig {
-	return f.inner.IntegrityConfig()
 }
 
 // TestHandleReconcile_UsesContext is a smoke test that the handler threads
@@ -578,7 +575,7 @@ func TestHandleReconcile_CancelledContext(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	req := doAuth(http.MethodPost, "/admin/api/reconcile", "")
+	req := doAuth(t, http.MethodPost, "/admin/api/reconcile", "")
 	req = req.WithContext(ctx)
 
 	w := httptest.NewRecorder()
@@ -589,43 +586,17 @@ func TestHandleReconcile_CancelledContext(t *testing.T) {
 	}
 }
 
-// allFailingOps wraps the real BackendOps but errors on every method
-// that has an error return. Lets a single test exercise every
-// admin handler's "downstream call failed" branch without writing
-// per-handler error fixtures.
-type allFailingOps struct{}
-
-func (allFailingOps) GetDashboardData(_ context.Context) (*dashboard.Data, error) {
-	return nil, errors.New("dashboard down")
-}
-func (allFailingOps) FlushUsage(_ context.Context) error {
-	return errors.New("flush down")
-}
-func (allFailingOps) UpdateQuotaMetrics(_ context.Context) error {
-	return errors.New("quota down")
-}
-func (allFailingOps) ReconcileUsage(_ context.Context) (map[string]int64, error) {
-	return nil, errors.New("reconcile down")
-}
-func (allFailingOps) RecordUsage(_ string, _, _, _ int64) {}
-func (allFailingOps) GetBackend(_ string) (backend.ObjectBackend, error) {
-	return nil, errors.New("backend not found")
-}
-func (allFailingOps) IntegrityConfig() *config.IntegrityConfig {
-	return nil
-}
-
 // TestHandleStatus_DashboardError covers the error branch where the
 // backend ops dashboard call fails.
 func TestHandleStatus_DashboardError(t *testing.T) {
 	t.Parallel()
 	h := newTestHandlerWithManager(t)
-	h.backendOps = allFailingOps{}
+	h.dashboardOps = newDashboardOps(t, nil, errors.New("dashboard unavailable"))
 	mux := http.NewServeMux()
 	h.Register(mux)
 
 	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, doAuth(http.MethodGet, "/admin/api/status", ""))
+	mux.ServeHTTP(w, doAuth(t, http.MethodGet, "/admin/api/status", ""))
 
 	if w.Code < 500 {
 		t.Fatalf("status = %d, want 5xx; body=%s", w.Code, w.Body.String())
@@ -636,16 +607,16 @@ func TestHandleStatus_DashboardError(t *testing.T) {
 // the object store fails to fetch object locations.
 func TestHandleObjectLocations_StoreError(t *testing.T) {
 	t.Parallel()
-	mock := testutil.NewMockStore(t)
-	mock.GetAllLocationsErr = errors.New("query failed")
+	mock := storetest.NewMockObjectStore(gomock.NewController(t))
+	mock.EXPECT().GetAllObjectLocations(gomock.Any(), "foo").Return(nil, errors.New("query failed")).Times(1)
 	cb := store.NewDatabaseBreaker(config.CircuitBreakerConfig{FailureThreshold: 3})
 	var lv slog.LevelVar
-	h := &Handler{log: slog.Default().With(logfmt.Component("admin")), dbHealthy: cb.IsHealthy, objects: mock, cleanup: mock, token: "test-token", logLevel: &lv}
+	h := &Handler{log: slog.Default().With(logfmt.Component("admin")), dbHealthy: cb.IsHealthy, objects: objectsOver(t, mock), logLevel: &lv, registry: func() *auth.BucketRegistry { return rootRegistry(t) }}
 	mux := http.NewServeMux()
 	h.Register(mux)
 
 	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, doAuth(http.MethodGet, "/admin/api/object-locations?key=foo", ""))
+	mux.ServeHTTP(w, doAuth(t, http.MethodGet, "/admin/api/object-locations?key=foo", ""))
 
 	if w.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want 500; body=%s", w.Code, w.Body.String())
@@ -660,7 +631,7 @@ func TestHandleLogLevel_Get(t *testing.T) {
 	h.Register(mux)
 
 	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, doAuth(http.MethodGet, "/admin/api/log-level", ""))
+	mux.ServeHTTP(w, doAuth(t, http.MethodGet, "/admin/api/log-level", ""))
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
@@ -675,7 +646,7 @@ func TestHandleLogLevel_PutValid(t *testing.T) {
 	h.Register(mux)
 
 	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, doAuth(http.MethodPut, "/admin/api/log-level", `{"level":"debug"}`))
+	mux.ServeHTTP(w, doAuth(t, http.MethodPut, "/admin/api/log-level", `{"level":"debug"}`))
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
@@ -691,9 +662,152 @@ func TestHandleLogLevel_PutInvalidBody(t *testing.T) {
 	h.Register(mux)
 
 	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, doAuth(http.MethodPut, "/admin/api/log-level", `not json`))
+	mux.ServeHTTP(w, doAuth(t, http.MethodPut, "/admin/api/log-level", `not json`))
 
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400; body=%s", w.Code, w.Body.String())
+	}
+}
+
+// TestHandleDrainProgress_InactiveShape pins the drain-progress wire shape for
+// a backend that is not draining. The handler converts drain.Progress at its
+// boundary, so this is what keeps an internal field rename from reaching the
+// API.
+func TestHandleDrainProgress_InactiveShape(t *testing.T) {
+	t.Parallel()
+	h := newTestHandlerWithManager(t)
+	mux := http.NewServeMux()
+	h.Register(mux)
+
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, doAuth(t, http.MethodGet, "/admin/api/backends/b1/drain", ""))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	var resp adminapi.DrainProgressResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Active {
+		t.Errorf("active = true, want false for a backend with no drain")
+	}
+	if resp.ObjectsRemaining != 0 || resp.BytesRemaining != 0 || resp.ObjectsMoved != 0 {
+		t.Errorf("counters = %+v, want all zero", resp)
+	}
+	// Error is omitempty, so a clean snapshot must not carry the key at all.
+	if body := w.Body.String(); strings.Contains(body, "error") {
+		t.Errorf("clean progress emitted an error field: %s", body)
+	}
+}
+
+// TestHandleRemoveBackend_AcknowledgementShape pins the acknowledgement the
+// backend mutation endpoints share: the prose status plus the backend acted on.
+func TestHandleRemoveBackend_AcknowledgementShape(t *testing.T) {
+	t.Parallel()
+	h := newTestHandlerWithManager(t)
+	mux := http.NewServeMux()
+	h.Register(mux)
+
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, doAuth(t, http.MethodDelete, "/admin/api/backends/b1", ""))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	var resp adminapi.BackendOperationResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Status != "backend removed" || resp.Backend != "b1" {
+		t.Errorf("got status=%q backend=%q, want {backend removed b1}", resp.Status, resp.Backend)
+	}
+}
+
+// TestHandleRemoveBackend_PurgeTwoPhaseShapes walks the destructive purge flow
+// end to end: the preview returns a confirmation token, and replaying it
+// executes the purge. Both responses are typed, and the second reuses the same
+// acknowledgement DTO as every other backend mutation.
+func TestHandleRemoveBackend_PurgeTwoPhaseShapes(t *testing.T) {
+	t.Parallel()
+	h := newTestHandlerWithManager(t)
+	mux := http.NewServeMux()
+	h.Register(mux)
+
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, doAuth(t, http.MethodDelete, "/admin/api/backends/b1?purge=true", ""))
+	if w.Code != http.StatusOK {
+		t.Fatalf("preview status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	var preview adminapi.RemoveBackendPreview
+	if err := json.NewDecoder(w.Body).Decode(&preview); err != nil {
+		t.Fatalf("decode preview: %v", err)
+	}
+	if preview.Status != "confirmation required" || preview.Backend != "b1" {
+		t.Errorf("got status=%q backend=%q, want {confirmation required b1}", preview.Status, preview.Backend)
+	}
+	if preview.ConfirmToken == "" || preview.ExpiresIn <= 0 {
+		t.Fatalf("preview must carry a token and a TTL: %+v", preview)
+	}
+
+	w2 := httptest.NewRecorder()
+	mux.ServeHTTP(w2, doAuth(t, http.MethodDelete,
+		"/admin/api/backends/b1?purge=true&confirm="+preview.ConfirmToken, ""))
+	if w2.Code != http.StatusOK {
+		t.Fatalf("purge status = %d, want 200; body=%s", w2.Code, w2.Body.String())
+	}
+	var resp adminapi.BackendOperationResponse
+	if err := json.NewDecoder(w2.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode purge: %v", err)
+	}
+	if resp.Status != "backend purged" || resp.Backend != "b1" {
+		t.Errorf("got status=%q backend=%q, want {backend purged b1}", resp.Status, resp.Backend)
+	}
+}
+
+// TestHandleStartDrain_AcknowledgementShape covers the accepted branch, which
+// needs a manager that actually knows the backend -- the shared fixture
+// registers none, so StartDrain there always rejects. Cancels the drain on the
+// way out so the background pass does not outlive the test.
+func TestHandleStartDrain_AcknowledgementShape(t *testing.T) {
+	t.Parallel()
+	mock := storetest.NewMockMetadataStore(gomock.NewController(t))
+	storetest.Permissive(mock)
+	st := proxytest.New(t, mock, &proxytest.StackOptions{
+		Runtime: proxytest.NewRuntime(&proxytest.RuntimeOptions{
+			Backends:        map[string]backend.ObjectBackend{"b1": backendtest.NewInMemory()},
+			Order:           []string{"b1"},
+			RoutingStrategy: config.RoutingPack,
+			Metrics:         mock,
+		}),
+	})
+	var lv slog.LevelVar
+	lv.Set(slog.LevelInfo)
+	h := &Handler{
+		log:          slog.Default().With(logfmt.Component("admin")),
+		backendOps:   st.Usage,
+		dashboardOps: dashboard.New(mock, st.Runtime.Usage(), nil, st.Runtime, st.Drain),
+		drain:        st.Drain,
+		lifecycle:    mock,
+		logLevel:     &lv,
+		registry:     func() *auth.BucketRegistry { return rootRegistry(t) },
+	}
+	t.Cleanup(func() { _ = h.drain.CancelDrain("b1") })
+
+	mux := http.NewServeMux()
+	h.Register(mux)
+
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, doAuth(t, http.MethodPost, "/admin/api/backends/b1/drain", ""))
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202; body=%s", w.Code, w.Body.String())
+	}
+	var resp adminapi.BackendOperationResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Status != "drain started" || resp.Backend != "b1" {
+		t.Errorf("got status=%q backend=%q, want {drain started b1}", resp.Status, resp.Backend)
 	}
 }

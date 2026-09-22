@@ -1,3 +1,7 @@
+---
+description: "Recommended practices for production: TLS configuration, credential handling, network exposure, and restricting the admin API."
+---
+
 This guide covers recommended security practices for production deployments of the S3 Orchestrator.
 
 ## TLS Configuration
@@ -73,7 +77,7 @@ Clients without a valid certificate receive a TLS handshake error and cannot con
 
 ## Server-Side Encryption
 
-When encryption is enabled, all objects are encrypted with AES-256-GCM before being stored on backends. Backends never see plaintext — they only store ciphertext. This protects against data exposure if a backend is compromised or if storage media is improperly decommissioned.
+When encryption is enabled, all objects are encrypted with AES-256-GCM before being stored on backends. Backends never see plaintext - they only store ciphertext. This protects against data exposure if a backend is compromised or if storage media is improperly decommissioned.
 
 ### Key Management
 
@@ -107,7 +111,7 @@ encryption:
     mount_path: "transit"
 ```
 
-- The orchestrator calls Vault to wrap/unwrap DEKs — the master key never leaves Vault.
+- The orchestrator calls Vault to wrap/unwrap DEKs - the master key never leaves Vault.
 - Vault provides audit logging of all key operations.
 - Key rotation in Vault automatically versions the key; the orchestrator's `rotate-encryption-key` API re-wraps DEKs to the latest version.
 
@@ -127,7 +131,7 @@ Monitor encryption health with these Prometheus metrics:
 
 ### Nonce Safety
 
-Chunked encryption derives per-chunk nonces by XORing the chunk index into a random base nonce. AES-GCM security requires that the same (key, nonce) pair is never reused. This is guaranteed because each object gets a fresh random DEK and a fresh random base nonce — even re-uploads of identical content produce different ciphertext. The `SAFETY INVARIANT` comment block at `internal/encryption/chunk.go:258-280` captures the three-clause reasoning (fresh DEK per object, fresh base nonce per call, sequential chunk indices) and notes when this derivation must be replaced (e.g., if the DEK-per-object invariant is ever relaxed for performance).
+Chunked encryption derives per-chunk nonces by XORing the chunk index into a random base nonce. AES-GCM security requires that the same (key, nonce) pair is never reused. This is guaranteed because each object gets a fresh random DEK and a fresh random base nonce - even re-uploads of identical content produce different ciphertext. The `SAFETY INVARIANT` comment block at `internal/encryption/chunk.go:258-280` captures the three-clause reasoning (fresh DEK per object, fresh base nonce per call, sequential chunk indices) and notes when this derivation must be replaced (e.g., if the DEK-per-object invariant is ever relaxed for performance).
 
 ## SigV4 Path Handling
 
@@ -161,7 +165,7 @@ observing differing failure modes.
 
 ## Object Data Cache
 
-When the in-memory object data cache is enabled (`cache.enabled: true`), cached objects are stored as post-decryption plaintext in process memory. This has the same security properties as any other in-process data — the plaintext exists in the orchestrator's address space for the duration of the cache entry's TTL, just as it does transiently during a normal GET response stream. The cache does not persist data to disk. Standard process isolation and memory protection apply; if an attacker can read the orchestrator's memory, they can already intercept plaintext during streaming regardless of caching.
+When the in-memory object data cache is enabled (`cache.enabled: true`), cached objects are stored as post-decryption plaintext in process memory. This has the same security properties as any other in-process data - the plaintext exists in the orchestrator's address space for the duration of the cache entry's TTL, just as it does transiently during a normal GET response stream. The cache does not persist data to disk. Standard process isolation and memory protection apply; if an attacker can read the orchestrator's memory, they can already intercept plaintext during streaming regardless of caching.
 
 ## Data Integrity Verification
 
@@ -173,6 +177,7 @@ Integrity verification detects silent data corruption (bit rot, backend-side cor
 integrity:
   enabled: true
   verify_on_read: true
+  verify_on_replicate: false
   scrubber_interval: "6h"
   scrubber_batch_size: 100
 ```
@@ -180,23 +185,26 @@ integrity:
 ### How it protects your data
 
 - **Write path:** SHA-256 is computed on plaintext before encryption and stored in the database.
-- **Read path:** When `verify_on_read` is enabled, a `VerifyingReader` computes the hash as data streams to the client. On mismatch, the corrupted copy is automatically enqueued for cleanup.
-- **Background scrubber:** Periodically reads random objects from backends, decrypts if needed, and verifies their hash. Corrupted copies are removed and will be re-created by the replicator if replication is configured.
+- **Read path:** When `verify_on_read` is enabled, a `VerifyingReader` computes the hash as data streams to the client. On mismatch, the corrupted copy is automatically enqueued for cleanup. Range requests are not verified, since the stored hash covers the whole object and no slice of it can match; the scrubber covers those objects instead.
+- **Replication:** When `verify_on_replicate` is enabled, each new copy is read back from its target and hash-checked before it is recorded. A copy that disagrees with its source is deleted and another target is tried, so a corrupt copy never counts toward the replication factor.
+- **Background scrubber:** Works through the copies least recently verified, reads them from their backend, decrypts if needed, and checks the hash. A copy that fails is discarded, both its bytes and its ledger row, so the replicator re-creates it from a healthy copy when replication is configured.
 - **Backfill:** Objects written before integrity was enabled can be brought under hash management via `admin backfill-checksums`.
 
 ### Recommendations
 
-- **Enable `verify_on_read`** for production deployments. The overhead is minimal — SHA-256 is computed inline during streaming with no additional buffering.
+- **Enable `verify_on_read`** for production deployments. The overhead is minimal - SHA-256 is computed inline during streaming with no additional buffering.
 - **Enable the scrubber** to catch corruption in objects that haven't been read recently. A 6-hour interval with 100 objects per batch provides steady coverage without excessive backend API usage.
-- **Run backfill** after enabling integrity on an existing deployment. Unhashed objects are invisible to read-time verification and the scrubber.
+- **Weigh `verify_on_replicate` against your egress bill.** Unlike the other checks it is not close to free: reading each new copy back doubles what a replica costs to create. It is worth it where a silently corrupt replica counting toward the replication factor is the risk you care about, and hard to justify where the scrubber already reaches every copy often enough.
+- **Run backfill** after enabling integrity on an existing deployment. Unhashed objects are invisible to read-time verification, to replica verification, and to the scrubber.
 - **Monitor integrity metrics** for any non-zero `s3o_integrity_errors_total` rate, which indicates data corruption.
 
 ### Integrity Metrics
 
 | Metric | What to watch |
 |--------|---------------|
-| `s3o_integrity_checks_total{operation}` | Verification count by operation (read, scrub) |
+| `s3o_integrity_checks_total{operation}` | Verification count by operation (read, replicate, scrub) |
 | `s3o_integrity_errors_total{operation}` | Any non-zero rate indicates data corruption |
+| `s3o_integrity_usage_declined_total` | Copies left unverified for lack of backend egress headroom |
 
 ## Configuration File Security
 
@@ -204,7 +212,8 @@ The config file contains sensitive credentials:
 
 - Database password (`database.password`)
 - Backend S3 credentials (`backends[].access_key_id`, `backends[].secret_access_key`)
-- UI admin credentials (`ui.admin_key`, `ui.admin_secret`, `ui.admin_token`)
+- Root credential (`auth.root.access_key_id`, `auth.root.secret_access_key`)
+- Dashboard session key (`ui.session_secret`)
 - Client S3 credentials (`buckets[].credentials[]`)
 - Encryption master key (`encryption.master_key`, `encryption.previous_keys[]`)
 - Vault token (`encryption.vault.token`)
@@ -251,17 +260,17 @@ Provide the environment variables via systemd `EnvironmentFile`, Vault agent inj
 
   When `listen` is set, `/metrics` is not served on the main S3 port. Prometheus scrapes from the internal address instead.
 
-- **Pprof endpoints** (`/debug/pprof/*`) expose deep runtime state — stack frames, command-line flags, on-demand CPU profiles that double as DoS amplifiers (`/debug/pprof/profile?seconds=300`). They are **off by default** and only mounted when both `telemetry.metrics.listen` is set AND `telemetry.metrics.pprof: true`. Inline-metrics deployments (no dedicated listener) never get pprof regardless of the flag. Enable temporarily for profiling investigations only, and keep the metrics listener bound to an internal-only interface.
+- **Pprof endpoints** (`/debug/pprof/*`) expose deep runtime state - stack frames, command-line flags, on-demand CPU profiles that double as DoS amplifiers (`/debug/pprof/profile?seconds=300`). They are **off by default** and only mounted when both `telemetry.metrics.listen` is set AND `telemetry.metrics.pprof: true`. Inline-metrics deployments (no dedicated listener) never get pprof regardless of the flag. Enable temporarily for profiling investigations only, and keep the metrics listener bound to an internal-only interface. `/debug/pprof/goroutineleak` belongs in the amplifier category too: serving it runs repeated stop-the-world leak-detection garbage collections until they converge. See [Monitoring](monitoring.md#goroutine-leak-profile).
 
 ### Kubernetes Hardening
 
 The provided Kubernetes manifests include several security measures:
 
-- **seccompProfile: RuntimeDefault** — applies the default seccomp profile to restrict syscalls
-- **automountServiceAccountToken: false** — the orchestrator does not need Kubernetes API access
-- **NetworkPolicy** — restricts ingress to port 9000 (and the metrics port when `metrics.dedicatedListener.enabled` is set, scoped to the configured `scraperSelector`); egress is permissive since backend endpoints are config-driven
-- **Dedicated metrics Service** — when `metrics.dedicatedListener.enabled: true`, the chart renders a separate `*-metrics` ClusterIP Service that is forced to `ClusterIP` regardless of the public Service type. This prevents the metrics surface (and any opted-in pprof) from accidentally being exposed externally if the public Service is upgraded to LoadBalancer/NodePort.
-- **readOnlyRootFilesystem**, **runAsNonRoot**, **capabilities.drop: ALL** — standard container hardening (see `deploy/helm/s3-orchestrator/templates/deployment.yaml`)
+- **seccompProfile: RuntimeDefault** - applies the default seccomp profile to restrict syscalls
+- **automountServiceAccountToken: false** - the orchestrator does not need Kubernetes API access
+- **NetworkPolicy** - restricts ingress to port 9000 (and the metrics port when `metrics.dedicatedListener.enabled` is set, scoped to the configured `scraperSelector`); egress is permissive since backend endpoints are config-driven
+- **Dedicated metrics Service** - when `metrics.dedicatedListener.enabled: true`, the chart renders a separate `*-metrics` ClusterIP Service that is forced to `ClusterIP` regardless of the public Service type. This prevents the metrics surface (and any opted-in pprof) from accidentally being exposed externally if the public Service is upgraded to LoadBalancer/NodePort.
+- **readOnlyRootFilesystem**, **runAsNonRoot**, **capabilities.drop: ALL** - standard container hardening (see `deploy/helm/s3-orchestrator/templates/deployment.yaml`)
 
 ```
 Internet --> Reverse Proxy --> S3 Orchestrator --> PostgreSQL (private)
@@ -275,6 +284,22 @@ The orchestrator emits structured audit log entries with `"audit":true` for secu
 - Every S3 request (GET, PUT, DELETE, etc.)
 - Storage-level operations (backend reads, writes, deletes)
 - Background operations (rebalance, replication, cleanup)
+
+### Attributing an action to a caller
+
+Every entry from an authenticated request carries `user`, naming the identity behind the credential that proved it. This is what answers "which service deleted this object" when several share a bucket with independent keys, an arrangement [Authentication](authentication.md#several-credentials-on-one-bucket) recommends.
+
+The identity is recorded rather than the access key deliberately: a keypair rotates under one identity, so recording the key would break the trail at every rotation and leave two halves nothing joins. Secrets never appear in a log line at all.
+
+An entry with no `user` authenticated no caller. A request rejected before authentication succeeds is one; a background worker acting on its own schedule is the other.
+
+```
+# Everything one identity did
+jq 'select(.audit == true and .user == "user-abc123")'
+
+# Who deleted objects from a bucket
+jq 'select(.audit == true and .event == "s3.DeleteObject" and .bucket == "app2-files") | {time, user, key}'
+```
 
 ### Request ID Correlation
 
@@ -317,6 +342,18 @@ server:
 
 When the limit is reached, new requests receive `503 SlowDown` with a `Retry-After: 1` header. Split read/write pools prevent write storms from starving reads. Active load shedding provides smooth degradation before the hard limit. A good starting point for the global limit is 2-3x your `database.max_conns` value. See [Performance Tuning](performance-tuning.md#admission-control) for detailed guidance.
 
+### Request header limits
+
+Admission control bounds how many requests run at once; these bound how much a single request can cost before it gets that far:
+
+```yaml
+server:
+  max_header_bytes: 65536        # total header size (default: 1 MiB)
+  max_header_value_count: 100    # header values per request (default: 500)
+```
+
+Both default to the `net/http` values, which are generous - an S3 client sends on the order of 20 headers, not 500. Tightening them costs nothing in compatibility and rejects oversized header sets during parsing, before routing, authentication, or any database work. Neither is reloadable; they are applied to the listener at startup.
+
 ## Rate Limiting
 
 Protect against abuse and accidental overload:
@@ -349,6 +386,21 @@ rate_limit:
 Without this, all requests appear to come from the proxy IP and share a single rate limit bucket.
 
 The login throttle (brute-force protection on the dashboard login) also uses the same `trusted_proxies` configuration and IP extraction logic, so it correctly identifies real client IPs behind a reverse proxy.
+
+## Browser Access (CORS)
+
+CORS rules are declared per bucket (see [Configuration](configuration.md#browser-access-cors)) and default to empty, which refuses every cross-origin preflight. A bucket reached only by server-side clients should be left that way: a request with no `Origin` header is not cross-origin and is never affected by these rules.
+
+What a rule does and does not grant:
+
+- **A preflight is answered before authentication.** It has to be - a browser cannot sign one. The preflight grants no access on its own; it reports whether the request the browser intends to send is one the operator permits, and that request authenticates with SigV4 or a presigned signature exactly as any other does. A CORS rule is not a credential and never substitutes for one.
+- **A refused preflight reveals nothing.** The response is identical whether the bucket has no rules, has rules that do not admit the request, or does not exist at all, so the one endpoint reachable without a credential cannot be used to enumerate buckets.
+- **Preflights are rate-limited and admission-controlled.** The CORS middleware sits inside both, so an unsigned preflight is bounded by the same protections as any other request on the surface.
+- **`Access-Control-Allow-Credentials` is not supported.** Authentication travels in headers or a presigned query string, never in cookies, so credentialed mode adds nothing and would forbid wildcard origins.
+
+Scope each rule as narrowly as the application allows. `allowed_origins: ["*"]` lets any site on the internet make a browser read a response from the bucket, which is only appropriate for content that is genuinely public. Prefer naming the origins, and note that a wildcard entry like `https://*.example.com` matches any subdomain - including one an attacker controls if subdomain takeover is possible.
+
+Watch `s3o_cors_preflight_total{result="rejected"}`: a sustained climb from an origin you did not configure is either a misconfigured deployment of your own application or somebody probing the surface from a browser.
 
 ## Request Body Limits
 
@@ -405,16 +457,18 @@ signing key derived from the seed signature.
 
 ## Web UI Authentication
 
-### Admin Token Separation
+### Separating administrative credentials
 
-By default, the admin API (`/admin/api/`) uses the same `admin_key` as the dashboard login. For production deployments, set a separate `admin_token` so the dashboard login credential and the API token can be managed independently:
+The dashboard, the admin API and the S3 API all authenticate the same credential type, so separating administrative access is a matter of issuing separate credentials rather than of configuring separate mechanisms. Declare `auth.root` for break-glass, then issue each operator a credential of their own and grant it only the control-plane permissions their job needs:
 
-```yaml
-ui:
-  admin_key: "dashboard-login-key"
-  admin_secret: "dashboard-login-secret"
-  admin_token: "separate-api-token"    # falls back to admin_key if not set
+```bash
+# A monitoring credential that can read the control plane and nothing else.
+s3-orchestrator admin user create -name monitoring
+s3-orchestrator admin credential issue -user user-mon -label "prometheus sidecar"
+s3-orchestrator admin grant add -user user-mon -kind orchestrator -permissions admin-read
 ```
+
+Each credential is revoked on its own, and an audit entry names the user behind the action rather than a key several people share. `admin-provision` is worth withholding in particular: a grant carrying it can mint a grant carrying anything.
 
 The admin API returns operational metadata only. Object and backend responses never include secret material - the object-locations endpoint reports whether a copy is encrypted and the wrapping `key_id`, but never the wrapped or raw data-encryption key.
 
@@ -422,7 +476,7 @@ The admin API returns operational metadata only. Object and backend responses ne
 
 When the orchestrator sits behind a TLS-terminating reverse proxy (Traefik, nginx, ALB), the connection to the orchestrator itself is plaintext HTTP. The session and CSRF cookies still need the `Secure` flag so browsers only send them over HTTPS. There are two ways to get the `Secure` flag set in this layout.
 
-**Recommended: trust the proxy and honour `X-Forwarded-Proto`.** Configure `rate_limit.trusted_proxies` with the CIDR(s) the proxy connects from, and ensure the proxy forwards `X-Forwarded-Proto: https`. The orchestrator sets `Secure` on every cookie when the direct peer is in the trusted CIDR set and the header reads `https`. The check is spoof-resistant — requests from outside the trusted CIDR cannot claim TLS by setting the header themselves.
+**Recommended: trust the proxy and honour `X-Forwarded-Proto`.** Configure `rate_limit.trusted_proxies` with the CIDR(s) the proxy connects from, and ensure the proxy forwards `X-Forwarded-Proto: https`. The orchestrator sets `Secure` on every cookie when the direct peer is in the trusted CIDR set and the header reads `https`. The check is spoof-resistant - requests from outside the trusted CIDR cannot claim TLS by setting the header themselves.
 
 ```yaml
 rate_limit:
@@ -431,7 +485,7 @@ rate_limit:
     - "172.16.0.0/12"
 ```
 
-Most reverse proxies forward `X-Forwarded-Proto` automatically, but the option may be named differently or off by default depending on the implementation — consult the proxy's documentation.
+Most reverse proxies forward `X-Forwarded-Proto` automatically, but the option may be named differently or off by default depending on the implementation - consult the proxy's documentation.
 
 **Alternative: force the flag unconditionally.** When the proxy is not under your control, or you'd rather not depend on the header path, set `force_secure_cookies: true`. Cookies then ship with `Secure=true` regardless of the request's apparent scheme.
 
@@ -446,37 +500,32 @@ ui:
 
 State-changing UI API requests (POST to `/ui/api/*`) require a `X-CSRF-Token` header matching the `s3orch_csrf` cookie. This double-submit cookie pattern prevents cross-site request forgery attacks from same-site subdomains. The dashboard JavaScript handles this automatically. GET requests and non-UI endpoints (S3 API, admin API) are unaffected.
 
-### Bcrypt-Hashed Admin Secret
+### Keeping the root secret off disk
 
-For bare-metal deployments where the config file is stored on disk without external secret injection, use a bcrypt hash for `admin_secret` instead of plaintext:
-
-```bash
-# Generate a bcrypt hash
-htpasswd -nbBC 10 "" 'your-secret' | cut -d: -f2
-```
+The root secret is a signing key, so it has to be readable in full - there is no hashed form that would still verify a signature. Keep it out of the config file itself: every value supports `${ENV_VAR}` expansion, so a Vault template, a Nomad template or a Kubernetes secret can supply it without the secret ever touching disk.
 
 ```yaml
-ui:
-  enabled: true
-  admin_key: "ADMIN_ACCESS_KEY"
-  admin_secret: "$2y$10$..."   # bcrypt hash
+auth:
+  root:
+    access_key_id: "${ROOT_ACCESS_KEY_ID}"
+    secret_access_key: "${ROOT_SECRET_ACCESS_KEY}"
 ```
 
-The orchestrator detects bcrypt hashes automatically (any value starting with `$2`). Plaintext secrets continue to work — no migration is required.
-
-**Recommendation:** Use bcrypt for bare-metal and `.deb` installations. For container deployments with Vault, Nomad templates, or Kubernetes secrets, plaintext with `${ENV_VAR}` expansion is equally secure since the secret never touches disk.
+For a bare-metal or `.deb` installation where the file is at rest on disk, restrict it to the service account (`chmod 600`) and treat it like any other credential file. A deployment that would rather hold no administering secret at all can leave `auth.root` out entirely and administer itself through credentials the store holds, provided the dashboard is disabled.
 
 ### Session Portability
 
 Session keys are derived deterministically from the config (via HMAC-SHA256), so sessions survive restarts and are portable across instances sharing the same config. No session storage or shared state is required beyond the config file itself.
 
-For multi-instance deployments behind a load balancer, ensure all instances use the same `session_secret`. A session created on one instance will be accepted by any other instance with a matching value. `session_secret` is independent of `admin_secret` — rotating one does not affect the other.
+For multi-instance deployments behind a load balancer, ensure all instances use the same `session_secret`. A session created on one instance will be accepted by any other instance with a matching value. `session_secret` is independent of every credential - rotating one does not affect the other.
 
 ## Credential Rotation
 
-S3 client credentials can be rotated without downtime using the SIGHUP reload mechanism. See the [admin guide](operations.md#rotating-client-credentials) for the zero-downtime rotation procedure.
+Stored credentials rotate through the provisioning API with no restart and no reload: issue a replacement keypair for the user, move the client onto it, then revoke the old one. Several keypairs may name one user, which is what makes the overlap possible. See the [admin guide](operations.md#rotating-client-credentials) for the procedure.
 
-The admin API token (`ui.admin_token`, or `ui.admin_key` if `admin_token` is not set) requires a restart to change since the UI config section is not reloadable.
+Config-declared client credentials rotate through the SIGHUP reload mechanism instead, since the config file is their source of truth.
+
+The root credential rotates on `SIGHUP` like any config-declared credential: the registry is rebuilt from the file merged with the store, so the new keypair takes effect on the next request and the old one stops working at the same moment.
 
 ## Presigned URL Security
 

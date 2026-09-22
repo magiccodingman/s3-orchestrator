@@ -15,8 +15,10 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"github.com/afreidah/s3-orchestrator/internal/config"
@@ -50,11 +52,156 @@ func newTestStore(t *testing.T) *Store {
 	return s
 }
 
+// rewindToSchemaVersion returns a test database to the shape it had at an
+// earlier schema version, so the migration runner can be exercised against a
+// database that genuinely predates a migration.
+//
+// Stamping the version alone is not enough. newTestStore builds the database
+// from schema.sql, which carries every column the current version defines, so
+// a rewound-but-unaltered database is a state no deployment ever reaches: an
+// old version number over a current schema. Re-running an additive migration
+// against it fails on a column that is already there.
+//
+// Each additive migration therefore needs its columns undone here to be
+// rewound past.
+// unstripeQuotaCounter puts the byte counter back in backend_quotas and drops
+// the stripe table.
+//
+// schema.sql builds the post-migration shape directly, so a structural
+// migration has to be undone before it can be replayed; otherwise it runs
+// against a schema that already has the structure, which is a state no real
+// installation is ever in.
+func unstripeQuotaCounter(t *testing.T, s *Store) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := s.db.ExecContext(ctx,
+		`ALTER TABLE backend_quotas ADD COLUMN bytes_used INTEGER NOT NULL DEFAULT 0`); err != nil {
+		t.Fatalf("restore bytes_used column: %v", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `DROP TABLE IF EXISTS backend_quota_stripes`); err != nil {
+		t.Fatalf("drop quota stripes: %v", err)
+	}
+}
+
+func rewindToSchemaVersion(t *testing.T, s *Store, version int) {
+	t.Helper()
+	ctx := context.Background()
+
+	for _, step := range schemaRewindSteps(t, s) {
+		if version < step.version {
+			step.undo()
+		}
+	}
+
+	if _, err := s.db.ExecContext(ctx,
+		`DELETE FROM schema_version; INSERT INTO schema_version (version) VALUES (?)`,
+		version); err != nil {
+		t.Fatalf("rewind schema version to %d: %v", version, err)
+	}
+}
+
+// schemaRewindStep undoes what one migration added, so a store can be put back
+// the way an installation predating that version would look.
+type schemaRewindStep struct {
+	version int
+	undo    func()
+}
+
+// schemaRewindSteps lists every migration that left something behind, newest
+// first. Rewinding to a version runs the steps above it.
+func schemaRewindSteps(t *testing.T, s *Store) []schemaRewindStep {
+	t.Helper()
+	ctx := context.Background()
+	exec := func(what, query string) {
+		if _, err := s.db.ExecContext(ctx, query); err != nil {
+			t.Fatalf("rewind: %s: %v", what, err)
+		}
+	}
+	return []schemaRewindStep{
+		// Rebuilt rather than column-dropped: the primary key moved onto the
+		// resource, and SQLite cannot take it back off in place any more than
+		// the migration could put it on.
+		{17, func() {
+			exec("rewind grants to a bucket name", `
+				CREATE TABLE grants_old (
+				    user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+				    bucket_name TEXT NOT NULL,
+				    permissions TEXT NOT NULL DEFAULT '',
+				    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+				    PRIMARY KEY (user_id, bucket_name)
+				);
+				INSERT INTO grants_old (user_id, bucket_name, permissions, created_at)
+				SELECT user_id, resource_name, permissions, created_at
+				FROM grants WHERE resource_kind = 'bucket';
+				DROP TABLE grants;
+				ALTER TABLE grants_old RENAME TO grants;`)
+		}},
+		{16, func() { dropColumns(t, s, "grants", "permissions") }},
+		{14, func() {
+			exec("drop pending key index", `DROP INDEX IF EXISTS idx_pending_objects_key`)
+			dropColumns(t, s, "pending_objects", "role")
+		}},
+		{13, func() { unstripeQuotaCounter(t, s) }},
+		{11, func() {
+			for _, table := range []string{"object_locations", "pending_objects"} {
+				dropColumns(t, s, table, "etag", "content_type", "user_metadata")
+			}
+			dropColumns(t, s, "multipart_parts", "plaintext_etag")
+		}},
+		{10, func() { dropColumns(t, s, "multipart_uploads", "tagging") }},
+		{9, func() {
+			// A table rather than a column, so the rewind drops the whole
+			// thing: the migration under test creates it, and CREATE TABLE IF
+			// NOT EXISTS would otherwise be a no-op against the baseline schema.
+			exec("drop object_tags", `DROP TABLE IF EXISTS object_tags`)
+		}},
+		{8, func() {
+			dropColumns(t, s, "object_locations", "compression_probe_size", "compression_probe_level")
+		}},
+		{7, func() {
+			for _, table := range []string{"object_locations", "pending_objects"} {
+				dropColumns(t, s, table, "compression_algorithm", "compression_level",
+					"compression_format_version", "logical_size")
+			}
+		}},
+	}
+}
+
+// dropColumns removes columns schema.sql creates but an older database predates,
+// so a rewound store is one the migration under test has real work to do on.
+func dropColumns(t *testing.T, s *Store, table string, columns ...string) {
+	t.Helper()
+	for _, column := range columns {
+		if _, err := s.db.ExecContext(context.Background(),
+			`ALTER TABLE `+table+` DROP COLUMN `+column); err != nil {
+			t.Fatalf("drop %s.%s: %v", table, column, err)
+		}
+	}
+}
+
 // mustRecordObject records an object, failing the test on error.
 func mustRecordObject(t *testing.T, s *Store, key, backend string, size int64) {
 	t.Helper()
-	if _, err := s.RecordObject(context.Background(), key, backend, size, nil); err != nil {
+	if _, _, err := s.RecordObject(context.Background(), &core.RecordObjectRequest{Key: key, Copies: []core.ObjectCopy{{Backend: backend}}, Size: size}); err != nil {
 		t.Fatalf("RecordObject(%s, %s): %v", key, backend, err)
+	}
+}
+
+// seedBytesUsed writes a backend's counter directly, for the tests whose
+// subject is the SQL that reads or moves bytes_used. Recording an object no
+// longer touches it - a write reports its delta and the caller applies it to
+// the in-memory tracker - so a seed has to say what it means.
+func seedBytesUsed(t *testing.T, s *Store, backend string, used int64) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := s.db.ExecContext(ctx,
+		`DELETE FROM backend_quota_stripes WHERE backend_name = ?`, backend); err != nil {
+		t.Fatalf("clear stripes(%s): %v", backend, err)
+	}
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT INTO backend_quota_stripes (backend_name, stripe_id, bytes_used) VALUES (?, 0, ?)`,
+		backend, used); err != nil {
+		t.Fatalf("seed bytes_used(%s, %d): %v", backend, used, err)
 	}
 }
 
@@ -108,7 +255,7 @@ func TestRecordObject_And_GetAllLocations(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 
-	displaced, err := s.RecordObject(ctx, "bucket/key1", "backend-a", 1024, nil)
+	displaced, _, err := s.RecordObject(ctx, &core.RecordObjectRequest{Key: "bucket/key1", Copies: []core.ObjectCopy{{Backend: "backend-a"}}, Size: 1024})
 	if err != nil {
 		t.Fatalf("RecordObject: %v", err)
 	}
@@ -137,7 +284,7 @@ func TestRecordObject_Overwrite_DisplacesCopy(t *testing.T) {
 	mustRecordObject(t, s, "bucket/key1", "backend-a", 1024)
 
 	// Overwrite on a different backend
-	displaced, err := s.RecordObject(ctx, "bucket/key1", "backend-b", 2048, nil)
+	displaced, _, err := s.RecordObject(ctx, &core.RecordObjectRequest{Key: "bucket/key1", Copies: []core.ObjectCopy{{Backend: "backend-b"}}, Size: 2048})
 	if err != nil {
 		t.Fatalf("RecordObject overwrite: %v", err)
 	}
@@ -158,7 +305,7 @@ func TestDeleteObject(t *testing.T) {
 
 	mustRecordObject(t, s, "bucket/key1", "backend-a", 1024)
 
-	deleted, err := s.DeleteObject(ctx, "bucket/key1")
+	deleted, _, err := s.DeleteObject(ctx, "bucket/key1")
 	if err != nil {
 		t.Fatalf("DeleteObject: %v", err)
 	}
@@ -167,7 +314,7 @@ func TestDeleteObject(t *testing.T) {
 	}
 
 	_, err = s.GetAllObjectLocations(ctx, "bucket/key1")
-	if err != core.ErrObjectNotFound {
+	if !errors.Is(err, core.ErrObjectNotFound) {
 		t.Errorf("expected ErrObjectNotFound, got %v", err)
 	}
 }
@@ -178,8 +325,8 @@ func TestDeleteObject_NotFound(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 
-	_, err := s.DeleteObject(ctx, "bucket/nonexistent")
-	if err != core.ErrObjectNotFound {
+	_, _, err := s.DeleteObject(ctx, "bucket/nonexistent")
+	if !errors.Is(err, core.ErrObjectNotFound) {
 		t.Errorf("expected ErrObjectNotFound, got %v", err)
 	}
 }
@@ -348,21 +495,111 @@ func TestImportObject(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 
-	imported, err := s.ImportObject(ctx, "bucket/new", "backend-a", 500)
+	outcome, err := s.ImportObject(ctx, &core.ImportObjectRequest{Key: "bucket/new", Backend: "backend-a", Size: 500})
 	if err != nil {
 		t.Fatalf("ImportObject: %v", err)
 	}
-	if !imported {
-		t.Error("expected imported=true for new object")
+	if outcome != core.ImportInserted {
+		t.Errorf("outcome = %s, want inserted for a new object", outcome)
 	}
 
 	// Import again should be a no-op
-	imported, err = s.ImportObject(ctx, "bucket/new", "backend-a", 500)
+	outcome, err = s.ImportObject(ctx, &core.ImportObjectRequest{Key: "bucket/new", Backend: "backend-a", Size: 500})
 	if err != nil {
 		t.Fatalf("ImportObject duplicate: %v", err)
 	}
-	if imported {
-		t.Error("expected imported=false for duplicate")
+	if outcome != core.ImportSkippedExisting {
+		t.Errorf("outcome = %s, want skipped_existing for a duplicate", outcome)
+	}
+}
+
+// TestImportObject_SuppressedByPendingCleanup verifies a key whose delete is
+// still outstanding is not imported back. Without this, a delete that could
+// not reach a backend is undone the next time reconcile walks it: the object
+// returns live, the replicator spreads it, and its created_at restarts so a
+// lifecycle rule that expired it waits another full window.
+func TestImportObject_SuppressedByPendingCleanup(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	const (
+		key     = "bucket/deleted"
+		backend = "backend-a"
+	)
+
+	if err := s.EnqueueCleanup(ctx, backend, key, "delete_failed", 500); err != nil {
+		t.Fatalf("EnqueueCleanup: %v", err)
+	}
+
+	outcome, err := s.ImportObject(ctx, &core.ImportObjectRequest{Key: key, Backend: backend, Size: 500})
+	if err != nil {
+		t.Fatalf("ImportObject: %v", err)
+	}
+	if outcome != core.ImportSkippedPendingCleanup {
+		t.Errorf("outcome = %s, want skipped_pending_cleanup", outcome)
+	}
+
+	if _, err := s.GetAllObjectLocations(ctx, key); !errors.Is(err, core.ErrObjectNotFound) {
+		t.Errorf("ledger error = %v, want ErrObjectNotFound for a suppressed import", err)
+	}
+}
+
+// TestImportObject_SuppressedByDeadLetteredCleanup verifies the suppression
+// also covers a cleanup that exhausted its retries. Retrying stopped because
+// the backend would not take the delete, not because the delete was withdrawn,
+// so the bytes are still an orphan awaiting an operator.
+func TestImportObject_SuppressedByDeadLetteredCleanup(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	const (
+		key     = "bucket/dead-lettered"
+		backend = "backend-a"
+	)
+
+	if err := s.EnqueueCleanup(ctx, backend, key, "delete_failed", 500); err != nil {
+		t.Fatalf("EnqueueCleanup: %v", err)
+	}
+	items, err := s.GetPendingCleanups(ctx, 10)
+	if err != nil || len(items) == 0 {
+		t.Fatalf("GetPendingCleanups: %v (got %d)", err, len(items))
+	}
+	if _, err := s.MoveCleanupToDLQ(ctx, items[0].ID, "gave up"); err != nil {
+		t.Fatalf("MoveCleanupToDLQ: %v", err)
+	}
+
+	outcome, err := s.ImportObject(ctx, &core.ImportObjectRequest{Key: key, Backend: backend, Size: 500})
+	if err != nil {
+		t.Fatalf("ImportObject: %v", err)
+	}
+	if outcome != core.ImportSkippedPendingCleanup {
+		t.Errorf("outcome = %s, want skipped_pending_cleanup", outcome)
+	}
+}
+
+// TestImportObject_OtherBackendUnaffected verifies suppression is scoped to
+// the backend the delete is outstanding on. A copy that was removed cleanly
+// elsewhere must still be importable, or one stuck cleanup would block the
+// whole key from ever being reconciled.
+func TestImportObject_OtherBackendUnaffected(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	const key = "bucket/partial"
+
+	if err := s.EnqueueCleanup(ctx, "backend-a", key, "delete_failed", 500); err != nil {
+		t.Fatalf("EnqueueCleanup: %v", err)
+	}
+
+	outcome, err := s.ImportObject(ctx, &core.ImportObjectRequest{Key: key, Backend: "backend-b", Size: 500})
+	if err != nil {
+		t.Fatalf("ImportObject: %v", err)
+	}
+	if outcome != core.ImportInserted {
+		t.Errorf("outcome = %s, want inserted on a backend with no pending delete", outcome)
 	}
 }
 
@@ -437,7 +674,7 @@ func TestRecordObject_Overwrite_SameBackend(t *testing.T) {
 
 	mustRecordObject(t, s, "bucket/k", "backend-a", 500)
 
-	displaced, err := s.RecordObject(ctx, "bucket/k", "backend-a", 700, nil)
+	displaced, _, err := s.RecordObject(ctx, &core.RecordObjectRequest{Key: "bucket/k", Copies: []core.ObjectCopy{{Backend: "backend-a"}}, Size: 700})
 	if err != nil {
 		t.Fatalf("RecordObject: %v", err)
 	}
@@ -446,53 +683,46 @@ func TestRecordObject_Overwrite_SameBackend(t *testing.T) {
 	}
 }
 
-// TestMoveObjectLocation_QuotaExceeded covers the ErrNoSpaceAvailable
-// branch in moveObjectRows  -  the destination quota update touches zero
-// rows when the move would exceed bytes_limit.
-func TestMoveObjectLocation_QuotaExceeded(t *testing.T) {
+// TestRecordObject_ReportsDeltaForTheWrite pins what replaced the in-transaction
+// quota guard: the write reports the bytes it added, and the caller applies them
+// to the counter the limit is enforced against.
+func TestRecordObject_ReportsDeltaForTheWrite(t *testing.T) {
 	t.Parallel()
+	s := newTestStore(t)
 	ctx := context.Background()
-	s, err := NewStore(ctx, &config.DatabaseConfig{Driver: "sqlite", Path: ":memory:"}, nil)
-	if err != nil {
-		t.Fatalf("NewStore: %v", err)
-	}
-	t.Cleanup(func() { s.Close() })
 
-	if err := s.SyncQuotaLimits(ctx, []config.BackendConfig{
-		{Name: "big", QuotaBytes: 10_000},
-		{Name: "small", QuotaBytes: 100}, // tiny  -  cannot hold 500-byte object
-	}); err != nil {
-		t.Fatalf("SyncQuotaLimits: %v", err)
-	}
-	if _, err := s.RecordObject(ctx, "bucket/huge", "big", 500, nil); err != nil {
+	_, deltas, err := s.RecordObject(ctx, &core.RecordObjectRequest{
+		Key: "bucket/new", Copies: []core.ObjectCopy{{Backend: "backend-a"}}, Size: 500,
+	})
+	if err != nil {
 		t.Fatalf("RecordObject: %v", err)
 	}
-	_, err = s.MoveObjectLocation(ctx, "bucket/huge", "big", "small")
-	if err != core.ErrNoSpaceAvailable {
-		t.Errorf("expected ErrNoSpaceAvailable, got %v", err)
+	if deltas["backend-a"] != 500 {
+		t.Errorf("delta = %d, want 500", deltas["backend-a"])
 	}
 }
 
-// TestRecordObject_QuotaExceeded covers the ErrNoSpaceAvailable branch
-// in incrementSQLiteQuota  -  the guarded UPDATE touches zero rows when
-// the quota ceiling would be exceeded.
-func TestRecordObject_QuotaExceeded(t *testing.T) {
+// TestRecordObject_OverwriteNetsTheDelta covers the overwrite arithmetic the
+// caller depends on: the replaced copy's bytes come off in the same map the new
+// copy's go on, so a same-size overwrite moves the counter by nothing.
+func TestRecordObject_OverwriteNetsTheDelta(t *testing.T) {
 	t.Parallel()
+	s := newTestStore(t)
 	ctx := context.Background()
-	s, err := NewStore(ctx, &config.DatabaseConfig{Driver: "sqlite", Path: ":memory:"}, nil)
-	if err != nil {
-		t.Fatalf("NewStore: %v", err)
-	}
-	t.Cleanup(func() { s.Close() })
 
-	if err := s.SyncQuotaLimits(ctx, []config.BackendConfig{
-		{Name: "tight", QuotaBytes: 100},
+	if _, _, err := s.RecordObject(ctx, &core.RecordObjectRequest{
+		Key: "bucket/k", Copies: []core.ObjectCopy{{Backend: "backend-a"}}, Size: 500,
 	}); err != nil {
-		t.Fatalf("SyncQuotaLimits: %v", err)
+		t.Fatalf("seed RecordObject: %v", err)
 	}
-	_, err = s.RecordObject(ctx, "bucket/over", "tight", 500, nil)
-	if err != core.ErrNoSpaceAvailable {
-		t.Errorf("expected ErrNoSpaceAvailable, got %v", err)
+	_, deltas, err := s.RecordObject(ctx, &core.RecordObjectRequest{
+		Key: "bucket/k", Copies: []core.ObjectCopy{{Backend: "backend-a"}}, Size: 800,
+	})
+	if err != nil {
+		t.Fatalf("overwrite RecordObject: %v", err)
+	}
+	if deltas["backend-a"] != 300 {
+		t.Errorf("delta = %d, want 300 (800 written less 500 replaced)", deltas["backend-a"])
 	}
 }
 
@@ -549,14 +779,14 @@ func TestRecordObject_WithEncryption(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 
-	enc := &core.EncryptionMeta{
+	form := &core.StoredForm{
 		Encrypted:     true,
 		EncryptionKey: []byte("wrapped-dek"),
 		KeyID:         "key-1",
 		PlaintextSize: 1024,
 		ContentHash:   "abc123",
 	}
-	_, err := s.RecordObject(ctx, "bucket/encrypted", "backend-a", 1100, enc)
+	_, _, err := s.RecordObject(ctx, &core.RecordObjectRequest{Key: "bucket/encrypted", Copies: []core.ObjectCopy{{Backend: "backend-a"}}, Size: 1100, Form: form})
 	if err != nil {
 		t.Fatalf("RecordObject with encryption: %v", err)
 	}
@@ -577,72 +807,79 @@ func TestRecordObject_WithEncryption(t *testing.T) {
 // QUOTA OPERATIONS
 // -------------------------------------------------------------------------
 
-// TestGetBackendWithSpace verifies the get backend with space contract.
-// Asserts that GetBackendWithSpace:.
-func TestGetBackendWithSpace(t *testing.T) {
+// TestListBackendQuotaUsage_ReportsCeilingAndOccupancy verifies the baseline
+// read the quota tracker is primed from: the limit, the counter, and the bytes
+// on the backend that the counter does not carry. Placement is judged against
+// these three, so a column missing here is a backend that reads emptier than it
+// is.
+func TestListBackendQuotaUsage_ReportsCeilingAndOccupancy(t *testing.T) {
 	t.Parallel()
 	s := newTestStore(t)
 	ctx := context.Background()
 
-	name, err := s.GetBackendWithSpace(ctx, 100, []string{"backend-a", "backend-b"})
-	if err != nil {
-		t.Fatalf("GetBackendWithSpace: %v", err)
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE backend_quotas SET orphan_bytes = 100, bytes_limit = 1000
+		 WHERE backend_name = 'backend-a'`); err != nil {
+		t.Fatalf("seed quota row: %v", err)
 	}
-	if name != "backend-a" {
-		t.Errorf("expected backend-a (first with space), got %q", name)
+	seedBytesUsed(t, s, "backend-a", 400)
+
+	usage, err := s.ListBackendQuotaUsage(ctx)
+	if err != nil {
+		t.Fatalf("ListBackendQuotaUsage: %v", err)
+	}
+	var got core.BackendQuotaUsage
+	for _, u := range usage {
+		if u.BackendName == "backend-a" {
+			got = u
+		}
+	}
+	if got.BytesLimit != 1000 || got.BytesUsed != 400 || got.OrphanBytes != 100 {
+		t.Fatalf("usage = %+v, want limit 1000, used 400, orphan 100", got)
+	}
+	if got.Occupied() != 500 {
+		t.Errorf("Occupied() = %d, want 500 (used + orphan + inflight)", got.Occupied())
 	}
 }
 
-// TestGetLeastUtilizedBackend verifies the get least utilized backend contract.
-// Asserts that GetLeastUtilizedBackend:.
-func TestGetLeastUtilizedBackend(t *testing.T) {
+// TestListBackendQuotaUsage_CountsInflightParts asserts the parts of an upload
+// that has not completed are reported as occupancy. They are on the backend
+// without being in bytes_used, and a baseline that ignored them would admit
+// writes into space already spoken for.
+func TestListBackendQuotaUsage_CountsInflightParts(t *testing.T) {
 	t.Parallel()
 	s := newTestStore(t)
 	ctx := context.Background()
 
-	// Put some data on backend-a
-	mustRecordObject(t, s, "bucket/big", "backend-a", 500<<20)
+	if err := s.CreateMultipartUpload(ctx, &core.CreateMultipartUploadParams{
+		UploadID:    "upload-inflight",
+		ObjectKey:   "bucket/big",
+		BackendName: "backend-a",
+	}); err != nil {
+		t.Fatalf("CreateMultipartUpload: %v", err)
+	}
+	if err := s.RecordPart(ctx, &core.RecordPartParams{
+		UploadID:   "upload-inflight",
+		PartNumber: 1,
+		ETag:       `"p1"`,
+		SizeBytes:  777,
+	}); err != nil {
+		t.Fatalf("RecordPart: %v", err)
+	}
 
-	name, err := s.GetLeastUtilizedBackend(ctx, 100, []string{"backend-a", "backend-b"})
+	usage, err := s.ListBackendQuotaUsage(ctx)
 	if err != nil {
-		t.Fatalf("GetLeastUtilizedBackend: %v", err)
+		t.Fatalf("ListBackendQuotaUsage: %v", err)
 	}
-	if name != "backend-b" {
-		t.Errorf("expected backend-b (less utilized), got %q", name)
+	for _, u := range usage {
+		if u.BackendName == "backend-a" {
+			if u.InflightBytes != 777 {
+				t.Errorf("InflightBytes = %d, want 777", u.InflightBytes)
+			}
+			return
+		}
 	}
-}
-
-// TestGetLeastUtilizedBackend_FiltersByEligibleList confirms the IN clause
-// genuinely filters: backend-a has more free space than backend-b, but
-// the eligible list contains only backend-b, so backend-b must win.
-func TestGetLeastUtilizedBackend_FiltersByEligibleList(t *testing.T) {
-	t.Parallel()
-	s := newTestStore(t)
-	ctx := context.Background()
-
-	mustRecordObject(t, s, "bucket/big", "backend-b", 500<<20)
-
-	name, err := s.GetLeastUtilizedBackend(ctx, 100, []string{"backend-b"})
-	if err != nil {
-		t.Fatalf("GetLeastUtilizedBackend: %v", err)
-	}
-	if name != "backend-b" {
-		t.Errorf("eligible=[backend-b] forced selection failed, got %q", name)
-	}
-}
-
-// TestGetLeastUtilizedBackend_RejectsUnknownEligibleNames asserts the IN
-// filter does not silently fall back to a registered-but-not-eligible
-// backend when the caller's list contains only unknown names.
-func TestGetLeastUtilizedBackend_RejectsUnknownEligibleNames(t *testing.T) {
-	t.Parallel()
-	s := newTestStore(t)
-	ctx := context.Background()
-
-	_, err := s.GetLeastUtilizedBackend(ctx, 100, []string{"never-registered"})
-	if !errors.Is(err, core.ErrNoSpaceAvailable) {
-		t.Errorf("err = %v, want ErrNoSpaceAvailable", err)
-	}
+	t.Fatal("backend-a absent from the usage listing")
 }
 
 // TestGetQuotaStats verifies per-backend quota statistics retrieval.
@@ -718,6 +955,106 @@ func TestFlushUsageDeltas_And_GetUsage(t *testing.T) {
 	}
 }
 
+// TestFlushPoolDeltas_And_GetPoolUsage covers the per-pool counters admission
+// is judged against: deltas accumulate additively into the row for their
+// (backend, period, pool), and a read returns every pool keyed by backend.
+func TestFlushPoolDeltas_And_GetPoolUsage(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := context.Background()
+	period := "2026-03"
+
+	if err := s.FlushPoolDeltas(ctx, "backend-a", period, core.PoolUsage{"class_a": 10, "class_b": 3}); err != nil {
+		t.Fatalf("FlushPoolDeltas: %v", err)
+	}
+	// A second flush of the same period must add to the row, not replace it,
+	// so two instances flushing concurrently converge.
+	if err := s.FlushPoolDeltas(ctx, "backend-a", period, core.PoolUsage{"class_a": 5}); err != nil {
+		t.Fatalf("FlushPoolDeltas second: %v", err)
+	}
+	if err := s.FlushPoolDeltas(ctx, "backend-b", period, core.PoolUsage{"class_a": 1}); err != nil {
+		t.Fatalf("FlushPoolDeltas backend-b: %v", err)
+	}
+
+	usage, err := s.GetPoolUsageForPeriod(ctx, period)
+	if err != nil {
+		t.Fatalf("GetPoolUsageForPeriod: %v", err)
+	}
+	if got := usage["backend-a"]["class_a"]; got != 15 {
+		t.Errorf("backend-a class_a = %d, want 15", got)
+	}
+	if got := usage["backend-a"]["class_b"]; got != 3 {
+		t.Errorf("backend-a class_b = %d, want 3", got)
+	}
+	if got := usage["backend-b"]["class_a"]; got != 1 {
+		t.Errorf("backend-b class_a = %d, want 1", got)
+	}
+}
+
+// TestFlushPoolDeltas_SkipsZeroAndEmpty keeps a flush from writing rows for
+// pools nothing charged, which would otherwise report every configured pool as
+// active from the first tick of a period.
+func TestFlushPoolDeltas_SkipsZeroAndEmpty(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := context.Background()
+	period := "2026-04"
+
+	if err := s.FlushPoolDeltas(ctx, "backend-a", period, nil); err != nil {
+		t.Fatalf("FlushPoolDeltas(nil): %v", err)
+	}
+	if err := s.FlushPoolDeltas(ctx, "backend-a", period, core.PoolUsage{"class_a": 0}); err != nil {
+		t.Fatalf("FlushPoolDeltas(zero): %v", err)
+	}
+
+	usage, err := s.GetPoolUsageForPeriod(ctx, period)
+	if err != nil {
+		t.Fatalf("GetPoolUsageForPeriod: %v", err)
+	}
+	if len(usage) != 0 {
+		t.Errorf("usage = %v, want no rows written for zero deltas", usage)
+	}
+}
+
+// TestPoolUsageQueries_SurfaceDatabaseErrors keeps a failing database from
+// reading as an unused budget. A silent zero here would seed the admission
+// baseline at nothing and let a spent backend accept work all month.
+func TestPoolUsageQueries_SurfaceDatabaseErrors(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := context.Background()
+	if err := s.db.Close(); err != nil {
+		t.Fatalf("closing the test database: %v", err)
+	}
+
+	if err := s.FlushPoolDeltas(ctx, "backend-a", "2026-03", core.PoolUsage{"class_a": 1}); err == nil {
+		t.Error("FlushPoolDeltas should surface a closed database")
+	}
+	if _, err := s.GetPoolUsageForPeriod(ctx, "2026-03"); err == nil {
+		t.Error("GetPoolUsageForPeriod should surface a closed database")
+	}
+}
+
+// TestGetPoolUsageForPeriod_ScopedToPeriod pins the monthly rollover: a new
+// period starts empty rather than inheriting the previous month's counts.
+func TestGetPoolUsageForPeriod_ScopedToPeriod(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	if err := s.FlushPoolDeltas(ctx, "backend-a", "2026-03", core.PoolUsage{"class_a": 9}); err != nil {
+		t.Fatalf("FlushPoolDeltas: %v", err)
+	}
+
+	usage, err := s.GetPoolUsageForPeriod(ctx, "2026-04")
+	if err != nil {
+		t.Fatalf("GetPoolUsageForPeriod: %v", err)
+	}
+	if len(usage) != 0 {
+		t.Errorf("usage = %v, want the next period to start empty", usage)
+	}
+}
+
 // -------------------------------------------------------------------------
 // MULTIPART UPLOADS
 // -------------------------------------------------------------------------
@@ -741,10 +1078,10 @@ func TestMultipartUpload_Lifecycle(t *testing.T) {
 	}
 
 	// Record parts
-	if err := s.RecordPart(ctx, "upload-1", 1, "etag1", 1024, nil); err != nil {
+	if err := s.RecordPart(ctx, &core.RecordPartParams{UploadID: "upload-1", PartNumber: 1, ETag: "etag1", SizeBytes: 1024, Form: nil}); err != nil {
 		t.Fatalf("RecordPart 1: %v", err)
 	}
-	if err := s.RecordPart(ctx, "upload-1", 2, "etag2", 2048, nil); err != nil {
+	if err := s.RecordPart(ctx, &core.RecordPartParams{UploadID: "upload-1", PartNumber: 2, ETag: "etag2", SizeBytes: 2048, Form: nil}); err != nil {
 		t.Fatalf("RecordPart 2: %v", err)
 	}
 
@@ -777,7 +1114,7 @@ func TestMultipartUpload_Lifecycle(t *testing.T) {
 	}
 
 	_, err = s.GetMultipartUpload(ctx, "upload-1")
-	if err != core.ErrMultipartUploadNotFound {
+	if !errors.Is(err, core.ErrMultipartUploadNotFound) {
 		t.Errorf("expected ErrMultipartUploadNotFound, got %v", err)
 	}
 }
@@ -921,7 +1258,7 @@ func TestRemoveExcessCopy(t *testing.T) {
 	mustRecordObject(t, s, "bucket/key1", "backend-a", 1024)
 	mustRecordReplica(t, s, "bucket/key1", "backend-b", "backend-a", 1024)
 
-	removed, err := s.RemoveExcessCopy(ctx, "bucket/key1", "backend-b", 1)
+	_, removed, err := s.RemoveExcessCopy(ctx, "bucket/key1", "backend-b", 1)
 	if err != nil {
 		t.Fatalf("RemoveExcessCopy: %v", err)
 	}
@@ -948,7 +1285,7 @@ func TestRemoveExcessCopy_NoOpWhenAtFactor(t *testing.T) {
 
 	mustRecordObject(t, s, "bucket/k-atfactor", "backend-a", 1024)
 
-	removed, err := s.RemoveExcessCopy(ctx, "bucket/k-atfactor", "backend-a", 1)
+	_, removed, err := s.RemoveExcessCopy(ctx, "bucket/k-atfactor", "backend-a", 1)
 	if err != nil {
 		t.Fatalf("RemoveExcessCopy: %v", err)
 	}
@@ -977,11 +1314,11 @@ func TestRemoveExcessCopy_NoOpWhenVictimGone(t *testing.T) {
 
 	// Simulate a parallel client landing the delete on backend-b
 	// before the cleaner's per-victim tx executes.
-	if err := s.DeleteObjectLocation(ctx, "bucket/k-vgone", "backend-b"); err != nil {
+	if _, err := s.DeleteObjectLocation(ctx, "bucket/k-vgone", "backend-b"); err != nil {
 		t.Fatalf("setup DeleteObjectLocation: %v", err)
 	}
 
-	removed, err := s.RemoveExcessCopy(ctx, "bucket/k-vgone", "backend-b", 1)
+	_, removed, err := s.RemoveExcessCopy(ctx, "bucket/k-vgone", "backend-b", 1)
 	if err != nil {
 		t.Fatalf("RemoveExcessCopy: %v", err)
 	}
@@ -1009,8 +1346,18 @@ func TestReconcileUsage_CorrectsDrift(t *testing.T) {
 	mustRecordObject(t, s, "bucket/k1", "backend-a", 100)
 	mustRecordObject(t, s, "bucket/k2", "backend-a", 250)
 
+	// Spread the corruption across two stripes so the reconcile has to collapse
+	// them, not just overwrite the one it happens to read. The stripes the
+	// records charged are cleared first, so the corrupted figure is the whole
+	// of what the counter reports.
 	if _, err := s.rawDB.ExecContext(ctx,
-		`UPDATE backend_quotas SET bytes_used = 99999 WHERE backend_name = 'backend-a'`); err != nil {
+		`DELETE FROM backend_quota_stripes WHERE backend_name = 'backend-a'`); err != nil {
+		t.Fatalf("clear stripes: %v", err)
+	}
+	if _, err := s.rawDB.ExecContext(ctx,
+		`INSERT INTO backend_quota_stripes (backend_name, stripe_id, bytes_used)
+		 VALUES ('backend-a', 0, 99999), ('backend-a', 7, 12345)`,
+	); err != nil {
 		t.Fatalf("corrupt bytes_used: %v", err)
 	}
 
@@ -1019,16 +1366,11 @@ func TestReconcileUsage_CorrectsDrift(t *testing.T) {
 		t.Fatalf("ReconcileUsage: %v", err)
 	}
 
-	var got int64
-	if err := s.rawDB.QueryRowContext(ctx,
-		`SELECT bytes_used FROM backend_quotas WHERE backend_name = 'backend-a'`).Scan(&got); err != nil {
-		t.Fatalf("read bytes_used: %v", err)
-	}
-	if got != 350 {
+	if got := quotaBytesUsed(t, s, "backend-a"); got != 350 {
 		t.Errorf("bytes_used = %d, want 350 (ledger truth)", got)
 	}
-	if adj["backend-a"] != 350-99999 {
-		t.Errorf("adjustment = %d, want %d", adj["backend-a"], 350-99999)
+	if want := int64(350 - (99999 + 12345)); adj["backend-a"] != want {
+		t.Errorf("adjustment = %d, want %d (both corrupted stripes collapsed)", adj["backend-a"], want)
 	}
 }
 
@@ -1211,7 +1553,7 @@ func TestIntegrity_HashOperations(t *testing.T) {
 	mustRecordObject(t, s, "bucket/b", "backend-a", 200)
 
 	// Both should be without hash
-	unhashed, err := s.GetObjectsWithoutHash(ctx, 10, 0)
+	unhashed, err := s.GetObjectsWithoutHash(ctx, 10, 0, "")
 	if err != nil {
 		t.Fatalf("GetObjectsWithoutHash: %v", err)
 	}
@@ -1225,13 +1567,13 @@ func TestIntegrity_HashOperations(t *testing.T) {
 	}
 
 	// Now only 1 without hash
-	unhashed, _ = s.GetObjectsWithoutHash(ctx, 10, 0)
+	unhashed, _ = s.GetObjectsWithoutHash(ctx, 10, 0, "")
 	if len(unhashed) != 1 {
 		t.Errorf("expected 1 unhashed, got %d", len(unhashed))
 	}
 
 	// GetRandomHashedObjects should return the hashed one
-	hashed, err := s.GetRandomHashedObjects(ctx, 10)
+	hashed, err := s.GetLeastRecentlyScrubbedObjects(ctx, 10, []string{"backend-a"})
 	if err != nil {
 		t.Fatalf("GetRandomHashedObjects: %v", err)
 	}
@@ -1421,7 +1763,9 @@ func TestListExpiredObjects(t *testing.T) {
 
 	// Everything is "new" (just created)  -  none should be expired
 	cutoff := time.Now().Add(-time.Hour)
-	expired, err := s.ListExpiredObjects(ctx, "bucket/", cutoff, 10)
+	expired, err := s.ListExpiredObjects(ctx, core.ExpiredObjectsQuery{
+		Prefix: "bucket/", Cutoff: cutoff, Limit: 10,
+	})
 	if err != nil {
 		t.Fatalf("ListExpiredObjects: %v", err)
 	}
@@ -1430,10 +1774,98 @@ func TestListExpiredObjects(t *testing.T) {
 	}
 
 	// Use a future cutoff  -  everything should be expired
-	expired, _ = s.ListExpiredObjects(ctx, "bucket/", time.Now().Add(time.Hour), 10)
+	expired, _ = s.ListExpiredObjects(ctx, core.ExpiredObjectsQuery{
+		Prefix: "bucket/", Cutoff: time.Now().Add(time.Hour), Limit: 10,
+	})
 	if len(expired) != 2 {
 		t.Errorf("expected 2 expired with future cutoff, got %d", len(expired))
 	}
+}
+
+// expiredKeys runs one query and returns the keys it selected, sorted, so a
+// test can compare against a literal without depending on row order.
+func expiredKeys(t *testing.T, s *Store, q core.ExpiredObjectsQuery) []string {
+	t.Helper()
+	rows, err := s.ListExpiredObjects(context.Background(), q)
+	if err != nil {
+		t.Fatalf("ListExpiredObjects: %v", err)
+	}
+	keys := make([]string, 0, len(rows))
+	for i := range rows {
+		keys = append(keys, rows[i].ObjectKey)
+	}
+	slices.Sort(keys)
+	return keys
+}
+
+// TestListExpiredObjects_TagFilter verifies that a tag filter selects the
+// intersection: an object has to carry every tag asked for, matching on the
+// value and not the key alone.
+func TestListExpiredObjects_TagFilter(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	for _, key := range []string{"bucket/both", "bucket/one", "bucket/other", "bucket/none"} {
+		mustRecordObject(t, s, key, "backend-a", 100)
+	}
+	tagged := map[string][]core.Tag{
+		"bucket/both":  {{Key: "env", Value: "staging"}, {Key: "team", Value: "infra"}},
+		"bucket/one":   {{Key: "env", Value: "staging"}},
+		"bucket/other": {{Key: "env", Value: "prod"}, {Key: "team", Value: "infra"}},
+	}
+	for key, tags := range tagged {
+		if err := s.ReplaceObjectTags(ctx, key, tags); err != nil {
+			t.Fatalf("tag %s: %v", key, err)
+		}
+	}
+
+	future := time.Now().Add(time.Hour)
+	base := core.ExpiredObjectsQuery{Prefix: "bucket/", Cutoff: future, Limit: 10}
+
+	t.Run("no filter selects every object", func(t *testing.T) {
+		got := expiredKeys(t, s, base)
+		if len(got) != 4 {
+			t.Errorf("got %v, want all four keys", got)
+		}
+	})
+
+	t.Run("one tag", func(t *testing.T) {
+		q := base
+		q.Tags = map[string]string{"env": "staging"}
+		got := expiredKeys(t, s, q)
+		want := []string{"bucket/both", "bucket/one"}
+		if !slices.Equal(got, want) {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	})
+
+	t.Run("two tags select the intersection", func(t *testing.T) {
+		q := base
+		q.Tags = map[string]string{"env": "staging", "team": "infra"}
+		got := expiredKeys(t, s, q)
+		want := []string{"bucket/both"}
+		if !slices.Equal(got, want) {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	})
+
+	t.Run("value must match, not just the key", func(t *testing.T) {
+		q := base
+		q.Tags = map[string]string{"env": "nonexistent"}
+		if got := expiredKeys(t, s, q); len(got) != 0 {
+			t.Errorf("got %v, want nothing", got)
+		}
+	})
+
+	t.Run("cutoff still applies alongside the tags", func(t *testing.T) {
+		q := base
+		q.Tags = map[string]string{"env": "staging"}
+		q.Cutoff = time.Now().Add(-time.Hour)
+		if got := expiredKeys(t, s, q); len(got) != 0 {
+			t.Errorf("got %v, want nothing for a past cutoff", got)
+		}
+	})
 }
 
 // -------------------------------------------------------------------------
@@ -1449,7 +1881,7 @@ func TestEncryptionAdmin_MarkAndList(t *testing.T) {
 	mustRecordObject(t, s, "bucket/plain", "backend-a", 1024)
 
 	// List unencrypted
-	unenc, err := s.ListUnencryptedLocations(ctx, 10, 0)
+	unenc, err := s.ListUnencryptedLocations(ctx, 10, core.Cursor{}, "")
 	if err != nil {
 		t.Fatalf("ListUnencryptedLocations: %v", err)
 	}
@@ -1458,7 +1890,10 @@ func TestEncryptionAdmin_MarkAndList(t *testing.T) {
 	}
 
 	// Mark encrypted
-	if err := s.MarkObjectEncrypted(ctx, "bucket/plain", "backend-a", []byte("dek"), "key-1", 1024, 1100); err != nil {
+	if err := s.MarkObjectEncrypted(ctx, &core.EncryptedUpdate{
+		ObjectKey: "bucket/plain", BackendName: "backend-a", EncryptionKey: []byte("dek"),
+		KeyID: "key-1", PlaintextSize: 1024, CiphertextSize: 1100,
+	}); err != nil {
 		t.Fatalf("MarkObjectEncrypted: %v", err)
 	}
 
@@ -1483,7 +1918,7 @@ func TestEncryptionAdmin_MarkAndList(t *testing.T) {
 	}
 
 	// Decrypt
-	if err := s.MarkObjectDecrypted(ctx, "bucket/plain", "backend-a", 1024); err != nil {
+	if err := s.MarkObjectDecrypted(ctx, &core.DecryptedUpdate{ObjectKey: "bucket/plain", BackendName: "backend-a", PlaintextSize: 1024}); err != nil {
 		t.Fatalf("MarkObjectDecrypted: %v", err)
 	}
 
@@ -1739,7 +2174,7 @@ func TestCorruptTimestamp_GetParts(t *testing.T) {
 	ctx := context.Background()
 
 	mustCreateUpload(t, s, "up-parts", "bucket/mp", "backend-a")
-	if err := s.RecordPart(ctx, "up-parts", 1, "etag1", 100, nil); err != nil {
+	if err := s.RecordPart(ctx, &core.RecordPartParams{UploadID: "up-parts", PartNumber: 1, ETag: "etag1", SizeBytes: 100, Form: nil}); err != nil {
 		t.Fatalf("RecordPart: %v", err)
 	}
 
@@ -1813,7 +2248,9 @@ func TestCorruptTimestamp_ListExpiredObjects(t *testing.T) {
 		t.Fatalf("corrupt timestamp: %v", err)
 	}
 
-	_, err = s.ListExpiredObjects(ctx, "bucket/", time.Now().Add(time.Hour), 100)
+	_, err = s.ListExpiredObjects(ctx, core.ExpiredObjectsQuery{
+		Prefix: "bucket/", Cutoff: time.Now().Add(time.Hour), Limit: 100,
+	})
 	if err == nil {
 		t.Fatal("expected error from corrupt expired object timestamp, got nil")
 	}
@@ -1946,29 +2383,93 @@ func TestVerifySchemaVersion_TableMissing(t *testing.T) {
 	}
 }
 
-// TestRunMigrations_VersionMismatchReturnsError verifies the schema-
-// mismatch branch in RunMigrations: an existing schema_version row whose
-// value differs from expectedSchemaVersion must surface the "manual
-// migration required" diagnostic rather than silently re-applying the
-// schema on top of stale state.
-func TestRunMigrations_VersionMismatchReturnsError(t *testing.T) {
+// TestRunMigrations_NewerSchemaReturnsError covers the one mismatch that is
+// still fatal. A database written by a later release may contain changes this
+// binary knows nothing about, so running against it is refused rather than
+// guessed at.
+func TestRunMigrations_NewerSchemaReturnsError(t *testing.T) {
 	t.Parallel()
 	s := newTestStore(t)
 	ctx := context.Background()
 
-	// newTestStore already ran RunMigrations, so schema_version is at the
-	// current expected value. Bump it so the next RunMigrations call hits
-	// the mismatch branch.
 	if _, err := s.db.ExecContext(ctx, `UPDATE schema_version SET version = version + 100`); err != nil {
 		t.Fatalf("bump schema version: %v", err)
 	}
 
 	err := s.RunMigrations(ctx)
 	if err == nil {
-		t.Fatal("expected mismatch error from RunMigrations, got nil")
+		t.Fatal("expected an error for a schema newer than the binary, got nil")
 	}
-	if !strings.Contains(err.Error(), "does not match expected") {
+	if !strings.Contains(err.Error(), "newer than expected") {
 		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+// TestRunMigrations_UpgradesAnOlderDatabase is the behaviour the numbered
+// migrations exist for: a database left at an earlier version is brought up to
+// the current one rather than refused. Before this, any mismatch was fatal and
+// every schema change demanded hand-migration by the operator.
+func TestRunMigrations_UpgradesAnOlderDatabase(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	// Rewind to the version before the newest migration, as an installation
+	// predating it would be.
+	rewindToSchemaVersion(t, s, expectedSchemaVersion-1)
+
+	if err := s.RunMigrations(ctx); err != nil {
+		t.Fatalf("RunMigrations on an older database: %v", err)
+	}
+
+	version, exists, err := s.currentSchemaVersion(ctx)
+	if err != nil || !exists {
+		t.Fatalf("read schema version: %v (exists=%v)", err, exists)
+	}
+	if version != expectedSchemaVersion {
+		t.Errorf("schema version = %d after upgrade, want %d", version, expectedSchemaVersion)
+	}
+
+	// Running again is a no-op: an applied migration is recorded, so it is not
+	// replayed on the next start.
+	if err := s.RunMigrations(ctx); err != nil {
+		t.Fatalf("second RunMigrations: %v", err)
+	}
+	var rows int
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT count(*) FROM schema_version WHERE version = ?`, expectedSchemaVersion).Scan(&rows); err != nil {
+		t.Fatalf("count version rows: %v", err)
+	}
+	if rows != 1 {
+		t.Errorf("version %d recorded %d times, want once", expectedSchemaVersion, rows)
+	}
+}
+
+// TestMigrations_AreNumberedAndReachExpectedVersion guards the pairing between
+// the embedded files and expectedSchemaVersion. A migration added without
+// bumping the constant would never run; a constant bumped without a migration
+// would leave every database reporting a version it never reached.
+func TestMigrations_AreNumberedAndReachExpectedVersion(t *testing.T) {
+	t.Parallel()
+
+	migrations, err := loadMigrations()
+	if err != nil {
+		t.Fatalf("loadMigrations: %v", err)
+	}
+	if len(migrations) == 0 {
+		t.Fatal("no embedded migrations found")
+	}
+
+	for i, m := range migrations {
+		if i > 0 && m.version <= migrations[i-1].version {
+			t.Errorf("migration %d (%s) does not sort after %d", m.version, m.name, migrations[i-1].version)
+		}
+		if m.version > expectedSchemaVersion {
+			t.Errorf("migration %d (%s) is above expectedSchemaVersion %d", m.version, m.name, expectedSchemaVersion)
+		}
+	}
+	if highest := migrations[len(migrations)-1].version; highest != expectedSchemaVersion {
+		t.Errorf("highest migration is %d but expectedSchemaVersion is %d", highest, expectedSchemaVersion)
 	}
 }
 
@@ -1986,12 +2487,12 @@ func TestDeleteObjectLocation(t *testing.T) {
 	mustRecordObject(t, s, "bucket/key1", "backend-a", 100)
 	mustRecordReplica(t, s, "bucket/key1", "backend-b", "backend-a", 100)
 
-	if stats, _ := s.GetQuotaStats(ctx); stats["backend-b"].BytesUsed != 100 {
-		t.Fatalf("backend-b bytes_used before delete = %d, want 100", stats["backend-b"].BytesUsed)
-	}
-
-	if err := s.DeleteObjectLocation(ctx, "bucket/key1", "backend-b"); err != nil {
+	removed, err := s.DeleteObjectLocation(ctx, "bucket/key1", "backend-b")
+	if err != nil {
 		t.Fatalf("DeleteObjectLocation: %v", err)
+	}
+	if removed != 100 {
+		t.Errorf("removed = %d, want the copy's 100 bytes reported for the debit", removed)
 	}
 
 	locs, _ := s.GetAllObjectLocations(ctx, "bucket/key1")
@@ -1999,24 +2500,26 @@ func TestDeleteObjectLocation(t *testing.T) {
 		t.Errorf("expected only backend-a, got %+v", locs)
 	}
 
-	// The removed copy's bytes must be debited so bytes_used stays equal to
-	// SUM(object_locations.size_bytes) - the ledger invariant #1084 broke.
-	if stats, _ := s.GetQuotaStats(ctx); stats["backend-b"].BytesUsed != 0 {
-		t.Errorf("backend-b bytes_used after delete = %d, want 0", stats["backend-b"].BytesUsed)
-	}
-
-	// With the counter kept honest, usage-reconcile finds no drift to correct.
-	adjustments, err := s.ReconcileUsage(ctx)
-	if err != nil {
+	// Reconcile recomputes the counter from the rows that survived, which is
+	// what the reported delta has to agree with: the backend that lost its copy
+	// holds nothing, and the one that kept it holds the object.
+	if _, err := s.ReconcileUsage(ctx); err != nil {
 		t.Fatalf("ReconcileUsage: %v", err)
 	}
-	if len(adjustments) != 0 {
-		t.Errorf("reconcile should find no drift, got %v", adjustments)
+	stats, err := s.GetQuotaStats(ctx)
+	if err != nil {
+		t.Fatalf("GetQuotaStats: %v", err)
+	}
+	if stats["backend-b"].BytesUsed != 0 {
+		t.Errorf("backend-b bytes_used = %d, want 0 after its copy was removed", stats["backend-b"].BytesUsed)
+	}
+	if stats["backend-a"].BytesUsed != 100 {
+		t.Errorf("backend-a bytes_used = %d, want the 100 bytes it still holds", stats["backend-a"].BytesUsed)
 	}
 
 	// Deleting a copy that is already gone is a benign no-op: no error and no
 	// spurious debit against the backend that still holds the object.
-	if err := s.DeleteObjectLocation(ctx, "bucket/key1", "backend-b"); err != nil {
+	if _, err := s.DeleteObjectLocation(ctx, "bucket/key1", "backend-b"); err != nil {
 		t.Fatalf("DeleteObjectLocation (already gone): %v", err)
 	}
 	if stats, _ := s.GetQuotaStats(ctx); stats["backend-a"].BytesUsed != 100 {
@@ -2057,8 +2560,8 @@ func TestGetUnverifiedObjectCounts(t *testing.T) {
 
 	// One object on backend-a has no content hash (NULL); one does.
 	mustRecordObject(t, s, "bucket/a", "backend-a", 100)
-	hashed := &core.EncryptionMeta{ContentHash: "deadbeef"}
-	if _, err := s.RecordObject(ctx, "bucket/b", "backend-a", 200, hashed); err != nil {
+	hashed := &core.StoredForm{ContentHash: "deadbeef"}
+	if _, _, err := s.RecordObject(ctx, &core.RecordObjectRequest{Key: "bucket/b", Copies: []core.ObjectCopy{{Backend: "backend-a"}}, Size: 200, Form: hashed}); err != nil {
 		t.Fatalf("RecordObject hashed: %v", err)
 	}
 	// One object on backend-b has no content hash.
@@ -2224,7 +2727,7 @@ func TestGetObjectBackendsForKeys_GroupsByKey(t *testing.T) {
 func TestDeleteObjectsBatch_EmptyInput(t *testing.T) {
 	t.Parallel()
 	s := newTestStore(t)
-	got, err := s.DeleteObjectsBatch(context.Background(), nil)
+	got, _, err := s.DeleteObjectsBatch(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("DeleteObjectsBatch(nil): %v", err)
 	}
@@ -2245,7 +2748,7 @@ func TestDeleteObjectsBatch_RemovesRowsAndDecrementsQuotas(t *testing.T) {
 	mustRecordReplica(t, s, "bucket/k1", "backend-b", "backend-a", 100)
 	mustRecordObject(t, s, "bucket/k2", "backend-a", 50)
 
-	got, err := s.DeleteObjectsBatch(ctx, []string{"bucket/k1", "bucket/k2", "bucket/missing"})
+	got, _, err := s.DeleteObjectsBatch(ctx, []string{"bucket/k1", "bucket/k2", "bucket/missing"})
 	if err != nil {
 		t.Fatalf("DeleteObjectsBatch: %v", err)
 	}
@@ -2286,17 +2789,17 @@ func TestListAllEncryptedLocations(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 
-	enc := &core.EncryptionMeta{
+	form := &core.StoredForm{
 		Encrypted:     true,
 		EncryptionKey: []byte("dek"),
 		KeyID:         "key-1",
 		PlaintextSize: 1024,
 	}
-	if _, err := s.RecordObject(ctx, "bucket/enc", "backend-a", 1100, enc); err != nil {
+	if _, _, err := s.RecordObject(ctx, &core.RecordObjectRequest{Key: "bucket/enc", Copies: []core.ObjectCopy{{Backend: "backend-a"}}, Size: 1100, Form: form}); err != nil {
 		t.Fatalf("RecordObject: %v", err)
 	}
 
-	locs, err := s.ListAllEncryptedLocations(ctx, 10, 0)
+	locs, err := s.ListAllEncryptedLocations(ctx, 10, core.Cursor{}, "")
 	if err != nil {
 		t.Fatalf("ListAllEncryptedLocations: %v", err)
 	}
@@ -2454,5 +2957,905 @@ func TestStore_CleanupDLQDepth_CountsRows(t *testing.T) {
 	}
 	if depth != 2 {
 		t.Errorf("depth=%d, want 2", depth)
+	}
+}
+
+// TestImportObject_UnmanagedCountsForQuotaButNotForWork pins the two halves of
+// the managed flag. A stray object sitting outside every configured bucket
+// prefix occupies real backend capacity, so placement has to see it in the
+// quota totals; but the orchestrator did not put it there, so no worker may
+// pick it up and start copying or moving it.
+func TestImportObject_UnmanagedCountsForQuotaButNotForWork(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	if _, err := s.ImportObject(ctx, &core.ImportObjectRequest{Key: "bucket/owned", Backend: "backend-a", Size: 100}); err != nil {
+		t.Fatalf("ImportObject(managed): %v", err)
+	}
+	if _, err := s.ImportObject(ctx, &core.ImportObjectRequest{Key: "stray.txt", Backend: "backend-a", Size: 400, Unmanaged: true}); err != nil {
+		t.Fatalf("ImportObject(unmanaged): %v", err)
+	}
+
+	// Quota counts both: the bytes are on the backend either way.
+	count, bytes, err := s.BackendObjectStats(ctx, "backend-a")
+	if err != nil {
+		t.Fatalf("BackendObjectStats: %v", err)
+	}
+	if count != 2 || bytes != 500 {
+		t.Errorf("stats = %d objects / %d bytes, want 2 / 500", count, bytes)
+	}
+
+	// The rebalance, placement and drain candidate scan sees only the owned one.
+	movable, err := s.ListObjectsByBackend(ctx, "backend-a", 10)
+	if err != nil {
+		t.Fatalf("ListObjectsByBackend: %v", err)
+	}
+	if len(movable) != 1 || movable[0].ObjectKey != "bucket/owned" {
+		t.Errorf("movable = %+v, want only bucket/owned", movable)
+	}
+
+	// Neither does the replicator (a stray with one copy is not a job), nor
+	// checksum backfill, which would spend egress reading the body.
+	under, err := s.GetUnderReplicatedObjects(ctx, 2, 10)
+	if err != nil {
+		t.Fatalf("GetUnderReplicatedObjects: %v", err)
+	}
+	assertNoStray(t, "replication", under)
+
+	unhashed, err := s.GetObjectsWithoutHash(ctx, 10, 0, "")
+	if err != nil {
+		t.Fatalf("GetObjectsWithoutHash: %v", err)
+	}
+	assertNoStray(t, "checksum backfill", unhashed)
+}
+
+// assertNoStray fails when a worker candidate scan surfaced the unmanaged row.
+func assertNoStray(t *testing.T, scan string, locs []core.ObjectLocation) {
+	t.Helper()
+	for i := range locs {
+		if locs[i].ObjectKey == "stray.txt" {
+			t.Errorf("unmanaged object queued for %s", scan)
+		}
+	}
+}
+
+// TestScrubQueue_OrdersByLeastRecentlyScrubbed verifies the sweep is a queue
+// rather than a sample: never-verified copies come first, then the oldest
+// stamp, so repeated cycles reach every copy instead of resampling one slice.
+func TestScrubQueue_OrdersByLeastRecentlyScrubbed(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	for _, key := range []string{"bucket/a", "bucket/b", "bucket/c"} {
+		mustRecordObject(t, s, key, "backend-a", 100)
+		if err := s.UpdateContentHash(ctx, key, "backend-a", "sha256:"+key); err != nil {
+			t.Fatalf("UpdateContentHash(%s): %v", key, err)
+		}
+	}
+
+	// Stamp two of them, leaving bucket/c never verified.
+	if err := s.MarkObjectScrubbed(ctx, "bucket/a", "backend-a"); err != nil {
+		t.Fatalf("MarkObjectScrubbed(a): %v", err)
+	}
+	time.Sleep(2 * time.Millisecond)
+	if err := s.MarkObjectScrubbed(ctx, "bucket/b", "backend-a"); err != nil {
+		t.Fatalf("MarkObjectScrubbed(b): %v", err)
+	}
+
+	got, err := s.GetLeastRecentlyScrubbedObjects(ctx, 10, []string{"backend-a"})
+	if err != nil {
+		t.Fatalf("GetLeastRecentlyScrubbedObjects: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("expected 3 copies, got %d", len(got))
+	}
+	want := []string{"bucket/c", "bucket/a", "bucket/b"}
+	for i, w := range want {
+		if got[i].ObjectKey != w {
+			t.Errorf("position %d = %q, want %q (order: %v)", i, got[i].ObjectKey, w, keysOf(got))
+		}
+	}
+}
+
+// TestScrubQueue_FreshWritesDoNotJumpTheQueue is the property that keeps the
+// sweep alive on a busy fleet. A never-verified copy written moments ago must
+// sort behind an old copy verified long ago; ordering purely on the verified
+// timestamp put every new write at the head, and once writes outpaced the
+// scrubber nothing older was ever reached.
+func TestScrubQueue_FreshWritesDoNotJumpTheQueue(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	for _, key := range []string{"bucket/old", "bucket/fresh"} {
+		mustRecordObject(t, s, key, "backend-a", 100)
+		if err := s.UpdateContentHash(ctx, key, "backend-a", "sha256:"+key); err != nil {
+			t.Fatalf("UpdateContentHash(%s): %v", key, err)
+		}
+	}
+
+	// bucket/old was written a year ago and verified a month ago.
+	// bucket/fresh was written just now and never verified.
+	backdate := func(key, created, scrubbed string) {
+		t.Helper()
+		if _, err := s.db.ExecContext(ctx,
+			`UPDATE object_locations SET created_at = ?, last_scrubbed_at = ?
+			 WHERE object_key = ? AND backend_name = 'backend-a'`,
+			created, scrubbed, key,
+		); err != nil {
+			t.Fatalf("backdating %s: %v", key, err)
+		}
+	}
+	now := time.Now().UTC()
+	backdate("bucket/old",
+		now.Add(-365*24*time.Hour).Format(time.RFC3339Nano),
+		now.Add(-30*24*time.Hour).Format(time.RFC3339Nano))
+
+	got, err := s.GetLeastRecentlyScrubbedObjects(ctx, 10, []string{"backend-a"})
+	if err != nil {
+		t.Fatalf("GetLeastRecentlyScrubbedObjects: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 copies, got %d", len(got))
+	}
+	if got[0].ObjectKey != "bucket/old" {
+		t.Errorf("queue head = %q, want bucket/old: a fresh write must not "+
+			"outrank a copy last verified a month ago (order: %v)", got[0].ObjectKey, keysOf(got))
+	}
+}
+
+// keysOf extracts object keys for a readable ordering assertion failure.
+func keysOf(locs []core.ObjectLocation) []string {
+	keys := make([]string, len(locs))
+	for i := range locs {
+		keys[i] = locs[i].ObjectKey
+	}
+	return keys
+}
+
+// TestIntegrityCoverage_ReportsCoverage verifies the figures the dashboard and
+// the alerting rule read: how long the most overdue reachable copy has gone
+// unverified, and how many reachable copies have never been verified.
+func TestIntegrityCoverage_ReportsCoverage(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := context.Background()
+	reachable := []string{"backend-a"}
+
+	// No hashed copies at all: nothing to report.
+	stat, err := s.IntegrityCoverage(ctx, reachable)
+	if err != nil {
+		t.Fatalf("IntegrityCoverage on an empty ledger: %v", err)
+	}
+	if stat != (core.CoverageStat{}) {
+		t.Errorf("empty ledger reported %+v, want the zero value", stat)
+	}
+
+	for _, key := range []string{"bucket/a", "bucket/b"} {
+		mustRecordObject(t, s, key, "backend-a", 100)
+		hashAtWrite(t, s, key, "backend-a")
+	}
+
+	// Hashed but unverified: both count, and the age reports the backlog from
+	// when they were written rather than reading as zero for want of a stamp.
+	backdateCreatedAt(t, s, "bucket/a", "backend-a", 48*time.Hour)
+	stat, err = s.IntegrityCoverage(ctx, reachable)
+	if err != nil {
+		t.Fatalf("IntegrityCoverage: %v", err)
+	}
+	if stat.NeverVerified != 2 {
+		t.Errorf("never verified = %d, want 2", stat.NeverVerified)
+	}
+	if stat.OldestUnverifiedAge < 47*time.Hour {
+		t.Errorf("age = %s, want at least the 48h-old never-verified copy", stat.OldestUnverifiedAge)
+	}
+
+	// Verifying the backlogged copy retires it from both figures, so the age
+	// falls back to the copy still outstanding.
+	if err := s.MarkObjectScrubbed(ctx, "bucket/a", "backend-a"); err != nil {
+		t.Fatalf("MarkObjectScrubbed: %v", err)
+	}
+	stat, err = s.IntegrityCoverage(ctx, reachable)
+	if err != nil {
+		t.Fatalf("IntegrityCoverage after stamping: %v", err)
+	}
+	if stat.NeverVerified != 1 {
+		t.Errorf("never verified = %d, want 1", stat.NeverVerified)
+	}
+	if stat.OldestUnverifiedAge >= 47*time.Hour {
+		t.Errorf("age = %s, want the stamped copy to have left the head of the queue", stat.OldestUnverifiedAge)
+	}
+}
+
+// TestIntegrityCoverage_UnreachableBackendIsDeferred pins the property the
+// figures exist for: a copy the sweep may not read is reported as deferred
+// rather than inflating an age no amount of scrubbing could bring down.
+func TestIntegrityCoverage_UnreachableBackendIsDeferred(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	// backend-b stands in for the over-limit backend: the sweep is told it may
+	// read backend-a only, which is what affordableBackends produces.
+	mustRecordObject(t, s, "bucket/old", "backend-b", 100)
+	hashAtWrite(t, s, "bucket/old", "backend-b")
+	backdateCreatedAt(t, s, "bucket/old", "backend-b", 720*time.Hour)
+
+	mustRecordObject(t, s, "bucket/new", "backend-a", 100)
+	hashAtWrite(t, s, "bucket/new", "backend-a")
+
+	stat, err := s.IntegrityCoverage(ctx, []string{"backend-a"})
+	if err != nil {
+		t.Fatalf("IntegrityCoverage: %v", err)
+	}
+	if stat.Deferred != 1 {
+		t.Errorf("deferred = %d, want the copy on the over-limit backend", stat.Deferred)
+	}
+	if stat.NeverVerified != 1 {
+		t.Errorf("never verified = %d, want only the reachable copy", stat.NeverVerified)
+	}
+	if stat.OldestUnverifiedAge >= 720*time.Hour {
+		t.Errorf("age = %s, want the unreachable 30-day copy excluded", stat.OldestUnverifiedAge)
+	}
+}
+
+// TestUpdateContentHash_StampsAsVerified pins that the backfill pass does not
+// leave behind a copy the very next sweep would re-read. The pass hashed the
+// bytes it downloaded, so the copy is verified at that moment.
+func TestUpdateContentHash_StampsAsVerified(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	mustRecordObject(t, s, "bucket/a", "backend-a", 100)
+	backdateCreatedAt(t, s, "bucket/a", "backend-a", 48*time.Hour)
+	if err := s.UpdateContentHash(ctx, "bucket/a", "backend-a", "sha256:a"); err != nil {
+		t.Fatalf("UpdateContentHash: %v", err)
+	}
+
+	stat, err := s.IntegrityCoverage(ctx, []string{"backend-a"})
+	if err != nil {
+		t.Fatalf("IntegrityCoverage: %v", err)
+	}
+	if stat.NeverVerified != 0 {
+		t.Errorf("never verified = %d, want the backfilled copy stamped", stat.NeverVerified)
+	}
+	if stat.OldestUnverifiedAge >= 47*time.Hour {
+		t.Errorf("age = %s, want the copy measured from the backfill, not its write", stat.OldestUnverifiedAge)
+	}
+}
+
+// hashAtWrite gives a copy a content hash without stamping it, which is what
+// the write path leaves behind. UpdateContentHash cannot stand in for it: that
+// is the backfill pass, and it stamps.
+func hashAtWrite(t *testing.T, s *Store, key, backend string) {
+	t.Helper()
+	if _, err := s.db.ExecContext(context.Background(),
+		`UPDATE object_locations SET content_hash = ? WHERE object_key = ? AND backend_name = ?`,
+		"sha256:"+key, key, backend,
+	); err != nil {
+		t.Fatalf("hashing %s/%s at write: %v", key, backend, err)
+	}
+}
+
+// backdateCreatedAt ages one copy's write timestamp so a test can assert on a
+// backlog without waiting for one.
+func backdateCreatedAt(t *testing.T, s *Store, key, backend string, by time.Duration) {
+	t.Helper()
+	if _, err := s.db.ExecContext(context.Background(),
+		`UPDATE object_locations SET created_at = ? WHERE object_key = ? AND backend_name = ?`,
+		formatTime(time.Now().Add(-by)), key, backend,
+	); err != nil {
+		t.Fatalf("backdating created_at for %s/%s: %v", key, backend, err)
+	}
+}
+
+// TestMarkObjectScrubbed_UnknownCopyIsNoOp verifies stamping a row that is not
+// there fails silently rather than erroring, so a copy deleted mid-cycle does
+// not fail the sweep.
+func TestMarkObjectScrubbed_UnknownCopyIsNoOp(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	if err := s.MarkObjectScrubbed(context.Background(), "bucket/missing", "backend-a"); err != nil {
+		t.Errorf("stamping an absent copy should be a no-op, got %v", err)
+	}
+}
+
+// TestScrubQueries_SurfaceDatabaseErrors verifies the scrub-queue reads and
+// writes report a failing database rather than reporting an empty or zeroed
+// result, which would read as "nothing to verify" and stall the sweep silently.
+func TestScrubQueries_SurfaceDatabaseErrors(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := context.Background()
+	if err := s.db.Close(); err != nil {
+		t.Fatalf("closing the test database: %v", err)
+	}
+
+	if _, err := s.GetLeastRecentlyScrubbedObjects(ctx, 10, []string{"backend-a"}); err == nil {
+		t.Error("GetLeastRecentlyScrubbedObjects should surface a closed database")
+	}
+	// A zero count from a failing database would read as "nothing deferred",
+	// hiding exactly the backlog this figure exists to report.
+	// A zero from a failing database would read as a fully encrypted fleet.
+	if _, err := s.CountUnencryptedLocations(ctx); err == nil {
+		t.Error("CountUnencryptedLocations should surface a closed database")
+	}
+	if _, err := s.CountScrubCandidatesOnBackends(ctx, []string{"backend-a"}); err == nil {
+		t.Error("CountScrubCandidatesOnBackends should surface a closed database")
+	}
+	if err := s.MarkObjectScrubbed(ctx, "bucket/a", "backend-a"); err == nil {
+		t.Error("MarkObjectScrubbed should surface a closed database")
+	}
+	if _, err := s.IntegrityCoverage(ctx, []string{"backend-a"}); err == nil {
+		t.Error("IntegrityCoverage should surface a closed database")
+	}
+}
+
+// TestSqlite_ScrubQueue_BackendFilterExcludesUnaffordableBackends proves the
+// filter is applied in SQL rather than by the caller. A copy on an excluded
+// backend must not appear in the batch at all: if it did, the scrubber would
+// have to either stamp it without reading it or leave it at the head of the
+// queue forever.
+func TestSqlite_ScrubQueue_BackendFilterExcludesUnaffordableBackends(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	for backend, key := range map[string]string{"backend-a": "bucket/a", "backend-b": "bucket/b"} {
+		if _, _, err := s.RecordObject(ctx, &core.RecordObjectRequest{Key: key, Copies: []core.ObjectCopy{{Backend: backend}}, Size: 10}); err != nil {
+			t.Fatalf("RecordObject(%s): %v", key, err)
+		}
+		if err := s.UpdateContentHash(ctx, key, backend, "sha256:"+key); err != nil {
+			t.Fatalf("UpdateContentHash(%s): %v", key, err)
+		}
+	}
+
+	got, err := s.GetLeastRecentlyScrubbedObjects(ctx, 10, []string{"backend-a"})
+	if err != nil {
+		t.Fatalf("GetLeastRecentlyScrubbedObjects: %v", err)
+	}
+	if len(got) != 1 || got[0].BackendName != "backend-a" {
+		t.Fatalf("got %d copies %+v, want only the one on backend-a", len(got), got)
+	}
+
+	// An empty affordable set means nothing may be read, not everything.
+	none, err := s.GetLeastRecentlyScrubbedObjects(ctx, 10, nil)
+	if err != nil {
+		t.Fatalf("GetLeastRecentlyScrubbedObjects(nil): %v", err)
+	}
+	if len(none) != 0 {
+		t.Errorf("an empty backend list returned %d copies, want 0", len(none))
+	}
+}
+
+// TestSqlite_CountScrubCandidatesOnBackends counts the queue behind the
+// backends a cycle declined, which is what lets a scrub report how much it left
+// undone rather than only what it happened to sample.
+func TestSqlite_CountScrubCandidatesOnBackends(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	for _, key := range []string{"bucket/x", "bucket/y"} {
+		if _, _, err := s.RecordObject(ctx, &core.RecordObjectRequest{Key: key, Copies: []core.ObjectCopy{{Backend: "backend-b"}}, Size: 10}); err != nil {
+			t.Fatalf("RecordObject(%s): %v", key, err)
+		}
+		if err := s.UpdateContentHash(ctx, key, "backend-b", "sha256:"+key); err != nil {
+			t.Fatalf("UpdateContentHash(%s): %v", key, err)
+		}
+	}
+	// Hashless copies are not scrub candidates and must not be counted.
+	if _, _, err := s.RecordObject(ctx, &core.RecordObjectRequest{Key: "bucket/z", Copies: []core.ObjectCopy{{Backend: "backend-b"}}, Size: 10}); err != nil {
+		t.Fatalf("RecordObject(z): %v", err)
+	}
+
+	n, err := s.CountScrubCandidatesOnBackends(ctx, []string{"backend-b"})
+	if err != nil {
+		t.Fatalf("CountScrubCandidatesOnBackends: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("count = %d, want 2 (the hashed copies only)", n)
+	}
+
+	if n, err := s.CountScrubCandidatesOnBackends(ctx, nil); err != nil || n != 0 {
+		t.Errorf("empty backend list: count=%d err=%v, want 0/nil", n, err)
+	}
+}
+
+// -------------------------------------------------------------------------
+// TIMESTAMP ORDERING
+// -------------------------------------------------------------------------
+
+// TestTimestampFormat_TextOrderMatchesChronologicalOrder is the property the
+// canonical format exists for. These columns are TEXT, so ORDER BY compares
+// them lexicographically; if the two orders can disagree, every queue and
+// cutoff built on them is unreliable.
+//
+// The instants below are the shape that broke RFC3339Nano: one is a prefix of
+// the other once trailing zeros are stripped, and 'Z' sorts above '0'.
+func TestTimestampFormat_TextOrderMatchesChronologicalOrder(t *testing.T) {
+	t.Parallel()
+
+	base := time.Date(2026, 8, 11, 6, 0, 0, 0, time.UTC)
+	instants := []time.Time{
+		base,
+		base.Add(1),                      // 1ns  - forces a nine-digit fraction
+		base.Add(10 * time.Nanosecond),   // trailing zero
+		base.Add(500 * time.Millisecond), // ".5" under RFC3339Nano
+		base.Add(500*time.Millisecond + 10*time.Nanosecond),
+		base.Add(time.Second),
+	}
+
+	for i := 1; i < len(instants); i++ {
+		earlier, later := instants[i-1], instants[i]
+		a, b := formatTime(earlier), formatTime(later)
+		if a >= b {
+			t.Errorf("text order disagrees with time order:\n  earlier %q\n  later   %q", a, b)
+		}
+		if len(a) != canonicalTimestampLen || len(b) != canonicalTimestampLen {
+			t.Errorf("timestamps are not fixed width: %q (%d), %q (%d)", a, len(a), b, len(b))
+		}
+	}
+}
+
+// TestMigration0006_NormalizesLegacyTimestamps proves the migration repairs
+// rows already on disk. Writing new rows correctly is not enough on its own: a
+// padded value and an unpadded one are not mutually orderable, so a fleet
+// upgraded mid-life would keep mis-ordering until the old rows were brought up.
+func TestMigration0006_NormalizesLegacyTimestamps(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	// Write rows in the pre-canonical shape, exactly as RFC3339Nano rendered
+	// them: variable fraction, and one with no fraction at all.
+	legacy := map[string]string{
+		"bucket/none":  "2026-08-11T06:00:00Z",
+		"bucket/short": "2026-08-11T06:00:00.5Z",
+		"bucket/long":  "2026-08-11T06:00:00.50000001Z",
+	}
+	for key, ts := range legacy {
+		mustRecordObject(t, s, key, "backend-a", 100)
+		if _, err := s.db.ExecContext(ctx,
+			`UPDATE object_locations SET created_at = ?, last_scrubbed_at = NULL
+			 WHERE object_key = ?`, ts, key); err != nil {
+			t.Fatalf("seed legacy timestamp for %s: %v", key, err)
+		}
+	}
+
+	// Rewind past 0006 and re-run so it applies to the seeded rows. Pinned to
+	// the version before that migration rather than to whatever is newest, so
+	// this keeps testing 0006 as later migrations land.
+	rewindToSchemaVersion(t, s, 5)
+	if err := s.RunMigrations(ctx); err != nil {
+		t.Fatalf("RunMigrations: %v", err)
+	}
+
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT object_key, created_at FROM object_locations
+		 WHERE object_key LIKE 'bucket/%' ORDER BY created_at`)
+	if err != nil {
+		t.Fatalf("read normalized rows: %v", err)
+	}
+	defer rows.Close()
+
+	var order []string
+	for rows.Next() {
+		var key, ts string
+		if err := rows.Scan(&key, &ts); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		if len(ts) != canonicalTimestampLen {
+			t.Errorf("%s kept a non-canonical timestamp %q (%d chars)", key, ts, len(ts))
+		}
+		order = append(order, key)
+	}
+
+	// Chronologically: none < short < long. Before the migration the text
+	// comparison put "…00.5Z" after "…00.50000001Z".
+	want := []string{"bucket/none", "bucket/short", "bucket/long"}
+	for i := range want {
+		if i >= len(order) || order[i] != want[i] {
+			t.Fatalf("ORDER BY created_at gave %v, want %v", order, want)
+		}
+	}
+}
+
+// -------------------------------------------------------------------------
+// MIGRATION LOADING
+// -------------------------------------------------------------------------
+
+// TestLoadMigrations_RejectsMalformedNames pins the naming rules the runner
+// depends on. The version comes from the file name, so a name it cannot parse
+// has to stop startup: guessing an order, or silently skipping the file, would
+// leave a database that reports a version it never reached.
+func TestLoadMigrations_RejectsMalformedNames(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name    string
+		file    string
+		wantErr string
+	}{
+		{"no separator", "0006.sql", "is not named"},
+		{"non-numeric version", "abc_thing.sql", "non-numeric version prefix"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			fsys := fstest.MapFS{
+				migrationDir + "/" + tc.file: &fstest.MapFile{Data: []byte("SELECT 1;")},
+			}
+			_, err := loadMigrationsFrom(fsys)
+			if err == nil {
+				t.Fatalf("expected an error for %q, got nil", tc.file)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("error = %v, want it to mention %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestLoadMigrations_OrdersByVersionAndIgnoresNonSQL checks the two things the
+// runner assumes: ascending order regardless of directory listing order, and
+// that unrelated files in the directory are skipped rather than parsed.
+func TestLoadMigrations_OrdersByVersionAndIgnoresNonSQL(t *testing.T) {
+	t.Parallel()
+
+	fsys := fstest.MapFS{
+		migrationDir + "/0010_ten.sql":   &fstest.MapFile{Data: []byte("SELECT 10;")},
+		migrationDir + "/0002_two.sql":   &fstest.MapFile{Data: []byte("SELECT 2;")},
+		migrationDir + "/0001_one.sql":   &fstest.MapFile{Data: []byte("SELECT 1;")},
+		migrationDir + "/README.md":      &fstest.MapFile{Data: []byte("not a migration")},
+		migrationDir + "/notes.sql.orig": &fstest.MapFile{Data: []byte("not a migration")},
+	}
+
+	got, err := loadMigrationsFrom(fsys)
+	if err != nil {
+		t.Fatalf("loadMigrationsFrom: %v", err)
+	}
+	want := []int{1, 2, 10}
+	if len(got) != len(want) {
+		t.Fatalf("loaded %d migrations, want %d: %+v", len(got), len(want), got)
+	}
+	for i, v := range want {
+		if got[i].version != v {
+			t.Errorf("position %d = version %d, want %d", i, got[i].version, v)
+		}
+	}
+	// 10 must sort after 2, which string ordering on the file name would not do.
+	if got[2].name != "ten" {
+		t.Errorf("last migration name = %q, want %q", got[2].name, "ten")
+	}
+}
+
+// TestLoadMigrations_MissingDirectoryIsAnError covers the read failure. An
+// empty or absent migration set is not something to shrug at: it means the
+// binary cannot bring a database to the version it claims to expect.
+func TestLoadMigrations_MissingDirectoryIsAnError(t *testing.T) {
+	t.Parallel()
+
+	if _, err := loadMigrationsFrom(fstest.MapFS{}); err == nil {
+		t.Fatal("expected an error when the migrations directory is absent")
+	}
+}
+
+// TestRunMigrations_SurfacesDatabaseErrors keeps a failing database from
+// reading as a successful migration. Returning nil here would let the process
+// start against a database that was never brought up to date.
+func TestRunMigrations_SurfacesDatabaseErrors(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	if err := s.db.Close(); err != nil {
+		t.Fatalf("closing the test database: %v", err)
+	}
+	if err := s.RunMigrations(ctx); err == nil {
+		t.Error("RunMigrations should surface a closed database")
+	}
+}
+
+// TestApplyMigration_FailedStatementRecordsNothing is the transactional
+// guarantee. A migration whose SQL fails must leave no version row behind, or
+// the next start would skip it and treat a database as migrated when it is not.
+func TestApplyMigration_FailedStatementRecordsNothing(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	bad := migration{version: expectedSchemaVersion + 1, name: "broken", sql: "THIS IS NOT SQL;"}
+	if err := s.applyMigration(ctx, bad); err == nil {
+		t.Fatal("expected an error from a migration with invalid SQL")
+	}
+
+	var rows int
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT count(*) FROM schema_version WHERE version = ?`, bad.version).Scan(&rows); err != nil {
+		t.Fatalf("count version rows: %v", err)
+	}
+	if rows != 0 {
+		t.Errorf("a failed migration recorded %d version rows, want 0", rows)
+	}
+}
+
+// TestCountUnencryptedLocations counts what encrypt-existing would process, so
+// the figure an operator sees matches the work the command would actually do.
+func TestCountUnencryptedLocations(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	if n, err := s.CountUnencryptedLocations(ctx); err != nil || n != 0 {
+		t.Fatalf("empty store: count=%d err=%v, want 0/nil", n, err)
+	}
+
+	mustRecordObject(t, s, "bucket/plain-a", "backend-a", 100)
+	mustRecordObject(t, s, "bucket/plain-b", "backend-a", 100)
+	mustRecordObject(t, s, "bucket/secret", "backend-a", 100)
+	if err := s.MarkObjectEncrypted(ctx, &core.EncryptedUpdate{
+		ObjectKey: "bucket/secret", BackendName: "backend-a", EncryptionKey: []byte("wrapped"),
+		KeyID: "key-0", PlaintextSize: 100, CiphertextSize: 132,
+	}); err != nil {
+		t.Fatalf("MarkObjectEncrypted: %v", err)
+	}
+
+	n, err := s.CountUnencryptedLocations(ctx)
+	if err != nil {
+		t.Fatalf("CountUnencryptedLocations: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("count = %d, want 2 (the encrypted copy must not be counted)", n)
+	}
+
+	// The count and the list agree, so the dashboard figure and the work
+	// encrypt-existing performs cannot drift apart.
+	listed, err := s.ListUnencryptedLocations(ctx, 100, core.Cursor{}, "")
+	if err != nil {
+		t.Fatalf("ListUnencryptedLocations: %v", err)
+	}
+	if int64(len(listed)) != n {
+		t.Errorf("count = %d but list returned %d rows", n, len(listed))
+	}
+}
+
+// TestGetAllObjectLocations_ReportsVerifiedTimestamp pins the distinction the
+// field exists for. A copy that has never been verified must stay
+// distinguishable from one verified long ago: having a content hash only says a
+// hash was recorded, not that the bytes were ever compared to it.
+func TestGetAllObjectLocations_ReportsVerifiedTimestamp(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	const key = "bucket/replicated"
+	mustRecordObject(t, s, key, "backend-a", 100)
+	if _, _, err := s.RecordReplica(ctx, key, "backend-b", "backend-a"); err != nil {
+		t.Fatalf("RecordReplica: %v", err)
+	}
+	// Hashed at write rather than by backfill, which stamps: the point here is
+	// a copy that carries a hash and has still never been verified.
+	for _, backend := range []string{"backend-a", "backend-b"} {
+		hashAtWrite(t, s, key, backend)
+	}
+
+	// Verify one copy, leaving the other untouched. Per-copy is the point: a
+	// replicated object can have one copy checked and another never looked at.
+	if err := s.MarkObjectScrubbed(ctx, key, "backend-a"); err != nil {
+		t.Fatalf("MarkObjectScrubbed: %v", err)
+	}
+
+	locs, err := s.GetAllObjectLocations(ctx, key)
+	if err != nil {
+		t.Fatalf("GetAllObjectLocations: %v", err)
+	}
+	if len(locs) != 2 {
+		t.Fatalf("expected 2 copies, got %d", len(locs))
+	}
+
+	byBackend := map[string]core.ObjectLocation{}
+	for _, l := range locs {
+		byBackend[l.BackendName] = l
+	}
+
+	verified := byBackend["backend-a"]
+	if verified.LastScrubbedAt == nil {
+		t.Error("the verified copy reports no timestamp")
+	} else if verified.LastScrubbedAt.IsZero() {
+		t.Error("the verified copy reports a zero timestamp")
+	}
+
+	if never := byBackend["backend-b"]; never.LastScrubbedAt != nil {
+		t.Errorf("the never-verified copy reports %v, want nil", never.LastScrubbedAt)
+	}
+	// Both carry a hash, so the hash alone cannot tell the two apart.
+	if byBackend["backend-a"].ContentHash == "" || byBackend["backend-b"].ContentHash == "" {
+		t.Error("both copies should carry a content hash for this distinction to matter")
+	}
+}
+
+// quotaBytesUsed reads a backend's byte total, summed across its stripes and
+// clamped the way every production read of the counter clamps it.
+func quotaBytesUsed(t *testing.T, s *Store, backend string) int64 {
+	t.Helper()
+	var used int64
+	if err := s.db.QueryRowContext(context.Background(),
+		`SELECT COALESCE(MAX(0, SUM(bytes_used)), 0) FROM backend_quota_stripes WHERE backend_name = ?`,
+		backend,
+	).Scan(&used); err != nil {
+		t.Fatalf("read bytes_used: %v", err)
+	}
+	return used
+}
+
+// TestMarkObjectDecrypted_DoesNotDriveQuotaNegative asserts a shrink larger
+// than the counter holds clamps at zero instead of underflowing. bytes_used is
+// per backend while the delta is per object, so an object whose recorded size
+// outruns the counter - a stale size, or a second pass over an already
+// decrypted copy - would otherwise leave a negative counter that over-admits
+// every later write until ReconcileUsage runs.
+func TestMarkObjectDecrypted_DoesNotDriveQuotaNegative(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	mustRecordObject(t, s, "bucket/secret", "backend-a", 100)
+	if err := s.MarkObjectEncrypted(ctx, &core.EncryptedUpdate{
+		ObjectKey: "bucket/secret", BackendName: "backend-a", EncryptionKey: []byte("dek"),
+		KeyID: "key-1", PlaintextSize: 100, CiphertextSize: 900,
+	}); err != nil {
+		t.Fatalf("MarkObjectEncrypted: %v", err)
+	}
+
+	// Drop the counter below what decryption is about to subtract, standing in
+	// for a ledger that drifted from the recorded object sizes.
+	seedBytesUsed(t, s, "backend-a", 50)
+
+	// 900 -> 100 is a -800 delta against a counter holding 50.
+	if err := s.MarkObjectDecrypted(ctx, &core.DecryptedUpdate{ObjectKey: "bucket/secret", BackendName: "backend-a", PlaintextSize: 100}); err != nil {
+		t.Fatalf("MarkObjectDecrypted: %v", err)
+	}
+	if used := quotaBytesUsed(t, s, "backend-a"); used != 0 {
+		t.Errorf("bytes_used = %d, want 0 - a negative counter over-admits later writes", used)
+	}
+}
+
+// TestMarkObjectEncrypted_DoesNotDriveQuotaNegative asserts the encrypt path
+// carries the same clamp. Encryption usually grows a copy, but the delta is
+// signed and nothing in the schema forbids a ciphertext smaller than its
+// plaintext.
+func TestMarkObjectEncrypted_DoesNotDriveQuotaNegative(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	mustRecordObject(t, s, "bucket/plain", "backend-a", 900)
+	seedBytesUsed(t, s, "backend-a", 50)
+
+	// 900 plaintext -> 100 ciphertext is a -800 delta against a counter of 50.
+	if err := s.MarkObjectEncrypted(ctx, &core.EncryptedUpdate{
+		ObjectKey: "bucket/plain", BackendName: "backend-a", EncryptionKey: []byte("dek"),
+		KeyID: "key-1", PlaintextSize: 900, CiphertextSize: 100,
+	}); err != nil {
+		t.Fatalf("MarkObjectEncrypted: %v", err)
+	}
+	if used := quotaBytesUsed(t, s, "backend-a"); used != 0 {
+		t.Errorf("bytes_used = %d, want 0", used)
+	}
+}
+
+// TestMarkObjectEncrypted_ChargesTheCiphertextGrowth pins the ordinary case,
+// so the clamp above cannot be mistaken for permission to lose real bytes.
+func TestMarkObjectEncrypted_ChargesTheCiphertextGrowth(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	mustRecordObject(t, s, "bucket/plain", "backend-a", 1000)
+	before := quotaBytesUsed(t, s, "backend-a")
+
+	if err := s.MarkObjectEncrypted(ctx, &core.EncryptedUpdate{
+		ObjectKey: "bucket/plain", BackendName: "backend-a", EncryptionKey: []byte("dek"),
+		KeyID: "key-1", PlaintextSize: 1000, CiphertextSize: 1100,
+	}); err != nil {
+		t.Fatalf("MarkObjectEncrypted: %v", err)
+	}
+	if got := quotaBytesUsed(t, s, "backend-a") - before; got != 100 {
+		t.Errorf("bytes_used moved by %d, want the 100 bytes encryption added", got)
+	}
+}
+
+// collationSensitiveKeys sort differently under byte order than under a locale
+// collation: mixed case, punctuation and digits all sit on the boundary a
+// locale ordering reshuffles. Mirrors the set the Postgres collation tests use,
+// so both engines are pinned to one contract.
+var collationSensitiveKeys = []string{
+	"A", "a", "B", "b", "Zoo", "zoo",
+	"a/b", "a-b", "a.b", "a_b",
+	"A1", "a1", "ab", "Ab",
+}
+
+// TestListObjects_ByteOrder asserts the flat listing answers in UTF-8 byte
+// order, which is what S3 ListObjectsV2 specifies. SQLite's BINARY collation
+// gives this for free; the test exists so the contract is stated on both
+// engines rather than only on the one that had to be corrected for it.
+func TestListObjects_ByteOrder(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	for _, k := range collationSensitiveKeys {
+		mustRecordObject(t, s, k, "backend-a", 1)
+	}
+
+	var got []string
+	cursor := ""
+	for {
+		res, err := s.ListObjects(ctx, "", cursor, 3)
+		if err != nil {
+			t.Fatalf("ListObjects(startAfter=%q): %v", cursor, err)
+		}
+		if len(res.Objects) == 0 {
+			break
+		}
+		for i := range res.Objects {
+			got = append(got, res.Objects[i].ObjectKey)
+		}
+		cursor = res.Objects[len(res.Objects)-1].ObjectKey
+		if !res.IsTruncated {
+			break
+		}
+	}
+
+	want := slices.Clone(collationSensitiveKeys)
+	slices.Sort(want) // Go string sort is byte order.
+	if !slices.Equal(got, want) {
+		t.Errorf("listing order mismatch:\n got  %q\n want %q", got, want)
+	}
+}
+
+// TestListObjects_PaginationCoversEveryKeyOnce asserts paging over a
+// collation-sensitive key set neither skips nor repeats.
+func TestListObjects_PaginationCoversEveryKeyOnce(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	for _, k := range collationSensitiveKeys {
+		mustRecordObject(t, s, k, "backend-a", 1)
+	}
+
+	seen := map[string]int{}
+	cursor := ""
+	for {
+		res, err := s.ListObjects(ctx, "", cursor, 2)
+		if err != nil {
+			t.Fatalf("ListObjects(startAfter=%q): %v", cursor, err)
+		}
+		if len(res.Objects) == 0 {
+			break
+		}
+		for i := range res.Objects {
+			seen[res.Objects[i].ObjectKey]++
+		}
+		cursor = res.Objects[len(res.Objects)-1].ObjectKey
+		if !res.IsTruncated {
+			break
+		}
+	}
+
+	for _, k := range collationSensitiveKeys {
+		switch seen[k] {
+		case 1: // covered exactly once, as intended
+		case 0:
+			t.Errorf("key %q was skipped across pages", k)
+		default:
+			t.Errorf("key %q was returned %d times across pages", k, seen[k])
+		}
 	}
 }

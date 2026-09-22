@@ -14,9 +14,14 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"io"
 	"testing"
 )
+
+// -------------------------------------------------------------------------
+// INTERNALS
+// -------------------------------------------------------------------------
 
 // testDEK returns a fixed 256-bit key for deterministic tests.
 func testDEK() []byte {
@@ -27,17 +32,26 @@ func testDEK() []byte {
 	return dek
 }
 
-// TestChunkNonce_UniquePerIndex verifies the chunk nonce unique per index path by exercising bytes.Equal.
-func TestChunkNonce_UniquePerIndex(t *testing.T) {
+// -------------------------------------------------------------------------
+// PUBLIC API
+// -------------------------------------------------------------------------
+
+// TestDeriveNonce_UniquePerIndex asserts each chunk index yields a distinct
+// nonce. Reusing a nonce under one DEK is a confidentiality break, so this is
+// the property the whole chunked format rests on.
+func TestDeriveNonce_UniquePerIndex(t *testing.T) {
 	t.Parallel()
 	base := make([]byte, NonceSize)
 	for i := range base {
 		base[i] = 0xff
 	}
 
-	n0 := chunkNonce(base, 0)
-	n1 := chunkNonce(base, 1)
-	n2 := chunkNonce(base, 2)
+	n0 := make([]byte, NonceSize)
+	n1 := make([]byte, NonceSize)
+	n2 := make([]byte, NonceSize)
+	deriveNonce(n0, base, 0)
+	deriveNonce(n1, base, 1)
+	deriveNonce(n2, base, 2)
 
 	if bytes.Equal(n0, n1) {
 		t.Error("nonce 0 and 1 should differ")
@@ -47,18 +61,20 @@ func TestChunkNonce_UniquePerIndex(t *testing.T) {
 	}
 }
 
-// TestChunkNonce_DoesNotMutateBase verifies the chunk nonce does not mutate base path by exercising bytes.Equal.
-func TestChunkNonce_DoesNotMutateBase(t *testing.T) {
+// TestDeriveNonce_DoesNotMutateBase asserts the base nonce survives derivation.
+// The base is reused for every chunk of an object, so mutating it would make
+// each derivation depend on the last and silently repeat nonces.
+func TestDeriveNonce_DoesNotMutateBase(t *testing.T) {
 	t.Parallel()
 	base := make([]byte, NonceSize)
 	copy(base, "base-nonce!!")
 	original := make([]byte, NonceSize)
 	copy(original, base)
 
-	_ = chunkNonce(base, 42)
+	deriveNonce(make([]byte, NonceSize), base, 42)
 
 	if !bytes.Equal(base, original) {
-		t.Error("chunkNonce mutated the base nonce")
+		t.Error("deriveNonce mutated the base nonce")
 	}
 }
 
@@ -119,6 +135,10 @@ func TestRoundTrip_MultipleFullChunks(t *testing.T) {
 	testRoundTrip(t, 256, 256*5)
 }
 
+// -------------------------------------------------------------------------
+// INTERNALS
+// -------------------------------------------------------------------------
+
 // testRoundTrip is the shared body of the encrypt/decrypt round-trip
 // table tests. Encrypts the plaintext, decrypts the ciphertext, and
 // asserts byte-for-byte equality plus the size invariants.
@@ -166,6 +186,10 @@ func testRoundTrip(t *testing.T, chunkSize, inputSize int) {
 		t.Errorf("decrypted len = %d, want %d", len(got), len(plaintext))
 	}
 }
+
+// -------------------------------------------------------------------------
+// PUBLIC API
+// -------------------------------------------------------------------------
 
 // TestChunkParseHeader_InvalidMagic verifies the chunk parse header invalid magic path by exercising bytes.NewReader.
 func TestChunkParseHeader_InvalidMagic(t *testing.T) {
@@ -390,6 +414,10 @@ func TestEncryptDecryptReaders_ZeroAllocsOnChunkHotPath(t *testing.T) {
 	assertAllocsBelow(t, "decrypt", decOpen, scratch, allocsUpperBound)
 }
 
+// -------------------------------------------------------------------------
+// INTERNALS
+// -------------------------------------------------------------------------
+
 // encryptAllForBench encrypts plaintext once with the given DEK/chunk
 // size and returns the chunk body (after stripping the header) plus
 // the parsed header fields. Helper extracted to keep
@@ -443,6 +471,10 @@ func drainReader(t *testing.T, r io.Reader, scratch []byte) {
 	}
 }
 
+// -------------------------------------------------------------------------
+// PUBLIC API
+// -------------------------------------------------------------------------
+
 // TestEncryptReader_ReleaseFiresExactlyOnce verifies the pool-return
 // contract for the encrypt reader: the release closure must fire on
 // io.EOF and must not fire again on any subsequent Read. A double
@@ -474,7 +506,7 @@ func TestEncryptReader_ReleaseFiresExactlyOnce(t *testing.T) {
 
 	// Extra Read after EOF must be a no-op for the release counter.
 	buf := make([]byte, 16)
-	if _, err := er.Read(buf); err != io.EOF {
+	if _, err := er.Read(buf); !errors.Is(err, io.EOF) {
 		t.Fatalf("post-EOF Read err = %v, want io.EOF", err)
 	}
 	if releases != 1 {
@@ -523,7 +555,7 @@ func TestDecryptReader_ReleaseFiresExactlyOnce(t *testing.T) {
 	}
 
 	buf := make([]byte, 16)
-	if _, err := dr.Read(buf); err != io.EOF {
+	if _, err := dr.Read(buf); !errors.Is(err, io.EOF) {
 		t.Fatalf("post-EOF Read err = %v, want io.EOF", err)
 	}
 	if releases != 1 {

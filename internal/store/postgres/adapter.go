@@ -47,6 +47,28 @@ func (a *pgTxAdapter) AcquireKeyLock(ctx context.Context, objectKey string) erro
 // PENDING TX OPERATIONS
 // -------------------------------------------------------------------------
 
+// ClearPendingForKey removes the key's intents apart from the ones the caller
+// is committing, reporting each so its bytes can be cleaned off the backend
+// after the transaction commits.
+func (a *pgTxAdapter) ClearPendingForKey(ctx context.Context, objectKey string, keep []string) ([]core.SupersededIntent, error) {
+	if keep == nil {
+		keep = []string{}
+	}
+	rows, err := a.q.ClearPendingForKey(ctx, db.ClearPendingForKeyParams{ObjectKey: objectKey, Keep: keep})
+	if err != nil {
+		return nil, fmt.Errorf("clear pending intents for key: %w", err)
+	}
+	cleared := make([]core.SupersededIntent, len(rows))
+	for i, row := range rows {
+		cleared[i] = core.SupersededIntent{
+			IntentID:    row.IntentID,
+			BackendName: row.BackendName,
+			SizeBytes:   row.SizeBytes,
+		}
+	}
+	return cleared, nil
+}
+
 // ClaimPending returns true if the pending row exists and was locked
 // FOR UPDATE; false if it has already been resolved.
 func (a *pgTxAdapter) ClaimPending(ctx context.Context, intentID string) (bool, error) {
@@ -59,28 +81,10 @@ func (a *pgTxAdapter) ClaimPending(ctx context.Context, intentID string) (bool, 
 	return true, nil
 }
 
-// InsertPending inserts a new pending intent.
-func (a *pgTxAdapter) InsertPending(ctx context.Context, p *core.PendingObject) error {
-	if err := a.q.InsertPendingObject(ctx, pendingInsertParams(p)); err != nil {
-		return fmt.Errorf("insert pending object: %w", err)
-	}
-	return nil
-}
-
 // DeletePending removes a pending intent.
 func (a *pgTxAdapter) DeletePending(ctx context.Context, intentID string) error {
 	if err := a.q.DeletePendingObject(ctx, intentID); err != nil {
 		return fmt.Errorf("delete pending object: %w", err)
-	}
-	return nil
-}
-
-// DeletePendingByBackend removes every pending intent for a backend.
-// Used during backend drain finalization so abandoned intents do not
-// outlive their backend's row in backend_quotas (FK cascade safety).
-func (a *pgTxAdapter) DeletePendingByBackend(ctx context.Context, backendName string) error {
-	if err := a.q.DeletePendingObjectsByBackend(ctx, backendName); err != nil {
-		return fmt.Errorf("delete pending objects by backend: %w", err)
 	}
 	return nil
 }
@@ -144,15 +148,24 @@ func (a *pgTxAdapter) LockObjectOnBackend(ctx context.Context, objectKey, backen
 		return nil, false, fmt.Errorf("lock object on backend: %w", err)
 	}
 	loc := &core.ObjectLocation{
-		ObjectKey:     objectKey,
-		BackendName:   backend,
-		SizeBytes:     row.SizeBytes,
-		Encrypted:     row.Encrypted,
-		EncryptionKey: row.EncryptionKey,
-		KeyID:         derefStr(row.KeyID),
-		PlaintextSize: derefInt64(row.PlaintextSize),
-		ContentHash:   derefStr(row.ContentHash),
+		ObjectKey:                objectKey,
+		BackendName:              backend,
+		SizeBytes:                row.SizeBytes,
+		Encrypted:                row.Encrypted,
+		EncryptionKey:            row.EncryptionKey,
+		KeyID:                    derefStr(row.KeyID),
+		PlaintextSize:            derefInt64(row.PlaintextSize),
+		ContentHash:              derefStr(row.ContentHash),
+		CompressionAlgorithm:     derefStr(row.CompressionAlgorithm),
+		CompressionLevel:         derefStr(row.CompressionLevel),
+		CompressionFormatVersion: int(derefInt16(row.CompressionFormatVersion)),
+		LogicalSize:              derefInt64(row.LogicalSize),
+		CompressionProbeSize:     derefInt64(row.CompressionProbeSize),
+		CompressionProbeLevel:    derefStr(row.CompressionProbeLevel),
 	}
+	// Carried so a move keeps the object's identity: the bytes are the same
+	// bytes, so the client-facing answer does not change with their address.
+	loc.Identity, _ = core.IdentityFromColumns(derefStr(row.Etag), derefStr(row.ContentType), row.UserMetadata)
 	return loc, true, nil
 }
 
@@ -168,15 +181,57 @@ func (a *pgTxAdapter) DeleteObjectFromBackend(ctx context.Context, objectKey, ba
 	return nil
 }
 
+// RecordCompressionProbe stores what the encoder measured for a copy it
+// declined to store compressed.
+func (a *pgTxAdapter) RecordCompressionProbe(ctx context.Context, probe *core.CompressionProbe) error {
+	if err := a.q.RecordCompressionProbe(ctx, db.RecordCompressionProbeParams{
+		ObjectKey:             probe.ObjectKey,
+		BackendName:           probe.BackendName,
+		CompressionProbeSize:  int64Ptr(probe.Size),
+		CompressionProbeLevel: strPtr(probe.Level),
+	}); err != nil {
+		return fmt.Errorf("record compression probe: %w", err)
+	}
+	return nil
+}
+
+// -------------------------------------------------------------------------
+// OBJECT TAGS
+// -------------------------------------------------------------------------
+
+// InsertObjectTag adds one tag row for an object.
+func (a *pgTxAdapter) InsertObjectTag(ctx context.Context, objectKey, tagKey, tagValue string) error {
+	if err := a.q.InsertObjectTag(ctx, db.InsertObjectTagParams{
+		ObjectKey: objectKey,
+		TagKey:    tagKey,
+		TagValue:  tagValue,
+	}); err != nil {
+		return fmt.Errorf("insert object tag: %w", err)
+	}
+	return nil
+}
+
+// DeleteObjectTags removes every tag row for one object key.
+func (a *pgTxAdapter) DeleteObjectTags(ctx context.Context, objectKey string) error {
+	if err := a.q.DeleteObjectTags(ctx, objectKey); err != nil {
+		return fmt.Errorf("delete object tags: %w", err)
+	}
+	return nil
+}
+
+// DeleteObjectTagsForKeys removes every tag row for any of the given keys.
+func (a *pgTxAdapter) DeleteObjectTagsForKeys(ctx context.Context, objectKeys []string) error {
+	if err := a.q.DeleteObjectTagsForKeys(ctx, objectKeys); err != nil {
+		return fmt.Errorf("delete object tags for keys: %w", err)
+	}
+	return nil
+}
+
 // InsertObjectLocationIfNotExists inserts a row only when one does not
 // already exist for (key, backend). Returns true when the row was newly
 // inserted.
 func (a *pgTxAdapter) InsertObjectLocationIfNotExists(ctx context.Context, loc *core.ObjectLocation) (bool, error) {
-	inserted, err := a.q.InsertObjectLocationIfNotExists(ctx, db.InsertObjectLocationIfNotExistsParams{
-		ObjectKey:   loc.ObjectKey,
-		BackendName: loc.BackendName,
-		SizeBytes:   loc.SizeBytes,
-	})
+	inserted, err := a.q.InsertObjectLocationIfNotExists(ctx, objectInsertIfNotExistsParams(loc))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil
 	}
@@ -229,8 +284,8 @@ func (a *pgTxAdapter) DeleteObjectsByKeys(ctx context.Context, keys []string) er
 func (a *pgTxAdapter) InsertReplicaConditional(ctx context.Context, objectKey, targetBackend, sourceBackend string) (int64, bool, error) {
 	size, err := a.q.InsertReplicaConditional(ctx, db.InsertReplicaConditionalParams{
 		ObjectKey:     objectKey,
-		BackendName:   targetBackend,
-		BackendName_2: sourceBackend,
+		TargetBackend: targetBackend,
+		SourceBackend: sourceBackend,
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return 0, false, nil
@@ -328,34 +383,32 @@ func (a *pgTxAdapter) DeleteCleanupItem(ctx context.Context, id int64) error {
 	return nil
 }
 
+// HasPendingCleanup reports whether a delete for (objectKey, backend) is still
+// outstanding in either the retry queue or the dead-letter table.
+func (a *pgTxAdapter) HasPendingCleanup(ctx context.Context, objectKey, backend string) (bool, error) {
+	pending, err := a.q.HasPendingCleanup(ctx, db.HasPendingCleanupParams{
+		ObjectKey:   objectKey,
+		BackendName: backend,
+	})
+	if err != nil {
+		return false, fmt.Errorf("check pending cleanup: %w", err)
+	}
+	return pending, nil
+}
+
 // -------------------------------------------------------------------------
 // QUOTA TX OPERATIONS
 // -------------------------------------------------------------------------
 
-// IncrementBackendQuota credits delta bytes to backendName. Returns
-// core.ErrNoSpaceAvailable when the quota row reports zero rows updated
-// (insufficient quota).
-func (a *pgTxAdapter) IncrementBackendQuota(ctx context.Context, backendName string, delta int64) error {
-	n, err := a.q.IncrementQuota(ctx, db.IncrementQuotaParams{
-		Amount:      delta,
+// AdjustQuotaStripe applies a signed delta to one of a backend's byte-counter
+// stripes, materializing the row on first use.
+func (a *pgTxAdapter) AdjustQuotaStripe(ctx context.Context, backendName string, stripe int16, delta int64) error {
+	if err := a.q.AdjustQuotaStripe(ctx, db.AdjustQuotaStripeParams{
 		BackendName: backendName,
-	})
-	if err != nil {
-		return fmt.Errorf("increment quota: %w", err)
-	}
-	if n == 0 {
-		return core.ErrNoSpaceAvailable
-	}
-	return nil
-}
-
-// DecrementBackendQuota debits delta bytes from backendName.
-func (a *pgTxAdapter) DecrementBackendQuota(ctx context.Context, backendName string, delta int64) error {
-	if err := a.q.DecrementQuota(ctx, db.DecrementQuotaParams{
-		Amount:      delta,
-		BackendName: backendName,
+		StripeID:    stripe,
+		Delta:       delta,
 	}); err != nil {
-		return fmt.Errorf("decrement quota for %s: %w", backendName, err)
+		return fmt.Errorf("adjust quota stripe for %s: %w", backendName, err)
 	}
 	return nil
 }
@@ -379,11 +432,21 @@ func (a *pgTxAdapter) AllBackendBytesUsed(ctx context.Context) (map[string]int64
 	if err != nil {
 		return nil, fmt.Errorf("read all quota stats: %w", err)
 	}
+	return totalsByBackend(rows, func(r db.GetAllQuotaStatsRow) (string, int64) {
+		return r.BackendName, r.BytesUsed
+	}), nil
+}
+
+// totalsByBackend folds a per-backend result set into the map its caller
+// returns, so the two callers state only which columns carry the name and the
+// total.
+func totalsByBackend[T any](rows []T, split func(T) (string, int64)) map[string]int64 {
 	out := make(map[string]int64, len(rows))
-	for _, r := range rows {
-		out[r.BackendName] = r.BytesUsed
+	for i := range rows {
+		name, total := split(rows[i])
+		out[name] = total
 	}
-	return out, nil
+	return out
 }
 
 // SumObjectSizesByBackend returns SUM(size_bytes) per backend from the
@@ -393,11 +456,9 @@ func (a *pgTxAdapter) SumObjectSizesByBackend(ctx context.Context) (map[string]i
 	if err != nil {
 		return nil, fmt.Errorf("sum object sizes by backend: %w", err)
 	}
-	out := make(map[string]int64, len(rows))
-	for _, r := range rows {
-		out[r.BackendName] = r.TotalBytes
-	}
-	return out, nil
+	return totalsByBackend(rows, func(r db.SumObjectSizesByBackendRow) (string, int64) {
+		return r.BackendName, r.TotalBytes
+	}), nil
 }
 
 // SetBackendBytesUsed overwrites bytes_used with the authoritative value.
@@ -409,6 +470,85 @@ func (a *pgTxAdapter) SetBackendBytesUsed(ctx context.Context, backendName strin
 		return fmt.Errorf("set backend bytes_used: %w", err)
 	}
 	return nil
+}
+
+// -------------------------------------------------------------------------
+// STORED-FORM REWRITES
+// -------------------------------------------------------------------------
+
+// UpdateCompressedForm records the stored form a recompression pass left on
+// one copy.
+func (a *pgTxAdapter) UpdateCompressedForm(ctx context.Context, u *core.CompressedUpdate) error {
+	rows, err := a.q.MarkObjectCompressed(ctx, db.MarkObjectCompressedParams{
+		ObjectKey:                u.ObjectKey,
+		BackendName:              u.BackendName,
+		CompressionAlgorithm:     strPtr(u.Algorithm),
+		CompressionLevel:         strPtr(u.Level),
+		CompressionFormatVersion: int16Ptr(u.FormatVersion),
+		LogicalSize:              int64Ptr(u.LogicalSize),
+		SizeBytes:                u.SizeBytes,
+		PlaintextSize:            int64Ptr(u.PlaintextSize),
+		EncryptionKey:            u.EncryptionKey,
+		KeyID:                    strPtr(u.KeyID),
+		ExpectedEtag:             strPtr(u.ExpectedEtag),
+	})
+	if err != nil {
+		return fmt.Errorf("update compressed form: %w", err)
+	}
+	return changedIfNoRows(rows)
+}
+
+// MarkCopyEncrypted records the envelope columns for a copy encrypted in place.
+func (a *pgTxAdapter) MarkCopyEncrypted(ctx context.Context, u *core.EncryptedUpdate) error {
+	rows, err := a.q.MarkObjectEncrypted(ctx, db.MarkObjectEncryptedParams{
+		ObjectKey:     u.ObjectKey,
+		BackendName:   u.BackendName,
+		EncryptionKey: u.EncryptionKey,
+		KeyID:         &u.KeyID,
+		PlaintextSize: &u.PlaintextSize,
+		SizeBytes:     u.CiphertextSize,
+		ExpectedEtag:  strPtr(u.ExpectedEtag),
+	})
+	if err != nil {
+		return fmt.Errorf("mark copy encrypted: %w", err)
+	}
+	return changedIfNoRows(rows)
+}
+
+// MarkCopyDecrypted clears the envelope columns for a copy decrypted in place.
+func (a *pgTxAdapter) MarkCopyDecrypted(ctx context.Context, u *core.DecryptedUpdate) error {
+	rows, err := a.q.MarkObjectDecrypted(ctx, db.MarkObjectDecryptedParams{
+		ObjectKey:    u.ObjectKey,
+		BackendName:  u.BackendName,
+		SizeBytes:    u.PlaintextSize,
+		ExpectedEtag: strPtr(u.ExpectedEtag),
+	})
+	if err != nil {
+		return fmt.Errorf("mark copy decrypted: %w", err)
+	}
+	return changedIfNoRows(rows)
+}
+
+// changedIfNoRows turns a stored-form write that matched nothing into the
+// sentinel the passes skip on. The statements are keyed on the copy and its
+// etag, so no match means a client wrote the key after the pass read it.
+func changedIfNoRows(rows int64) error {
+	if rows == 0 {
+		return core.ErrCopyChanged
+	}
+	return nil
+}
+
+// GetCopySizeBytes reads the size a copy currently reports.
+func (a *pgTxAdapter) GetCopySizeBytes(ctx context.Context, objectKey, backendName string) (int64, error) {
+	size, err := a.q.GetObjectSizeBytes(ctx, db.GetObjectSizeBytesParams{
+		ObjectKey:   objectKey,
+		BackendName: backendName,
+	})
+	if err != nil {
+		return 0, fmt.Errorf("get copy size_bytes: %w", err)
+	}
+	return size, nil
 }
 
 // Compile-time check that *pgTxAdapter satisfies core.TxAdapter.

@@ -19,12 +19,15 @@ import (
 	"errors"
 	"testing"
 
+	"go.uber.org/mock/gomock"
+
 	"github.com/afreidah/s3-orchestrator/internal/backend"
 	"github.com/afreidah/s3-orchestrator/internal/backend/backendtest"
 	"github.com/afreidah/s3-orchestrator/internal/config"
+	"github.com/afreidah/s3-orchestrator/internal/counter"
 	"github.com/afreidah/s3-orchestrator/internal/proxy/writepath"
+	"github.com/afreidah/s3-orchestrator/internal/s3op"
 	"github.com/afreidah/s3-orchestrator/internal/store/core"
-	"go.uber.org/mock/gomock"
 )
 
 // TestRebalancer_SetConfig_RoundTrip verifies the rebalancer set config round trip contract.
@@ -32,7 +35,7 @@ import (
 func TestRebalancer_SetConfig_RoundTrip(t *testing.T) {
 	t.Parallel()
 	ctrl := gomock.NewController(t)
-	r := NewRebalancer(NewMockOps(ctrl), NewMockPlacement(ctrl), &mockMetadataStore{})
+	r := NewRebalancer(newMockOps(ctrl), NewMockPlacement(ctrl), &mockMetadataStore{})
 	if r.Config() != nil {
 		t.Fatal("expected nil config before set")
 	}
@@ -91,11 +94,12 @@ func TestExceedsThreshold_EmptyStats(t *testing.T) {
 func TestPlanSpreadEven_BalancedSkipped(t *testing.T) {
 	t.Parallel()
 	ctrl := gomock.NewController(t)
-	ops := NewMockOps(ctrl)
+	ops := newMockOps(ctrl)
 	pl := NewMockPlacement(ctrl)
 	ms := &mockMetadataStore{}
 
 	ops.EXPECT().BackendOrder().Return([]string{"b1", "b2"}).AnyTimes()
+	ops.EXPECT().Usage().Return(unlimitedUsage()).AnyTimes()
 
 	r := NewRebalancer(ops, pl, ms)
 	// Equal utilization: no moves needed
@@ -117,7 +121,7 @@ func TestPlanSpreadEven_BalancedSkipped(t *testing.T) {
 func TestPlanSpreadEven_ImbalancedPlansMoves(t *testing.T) {
 	t.Parallel()
 	ctrl := gomock.NewController(t)
-	ops := NewMockOps(ctrl)
+	ops := newMockOps(ctrl)
 	pl := NewMockPlacement(ctrl)
 	ms := &mockMetadataStore{
 		objectsByBackend: map[string][]core.ObjectLocation{
@@ -126,6 +130,7 @@ func TestPlanSpreadEven_ImbalancedPlansMoves(t *testing.T) {
 	}
 
 	ops.EXPECT().BackendOrder().Return([]string{"b1", "b2"}).AnyTimes()
+	ops.EXPECT().Usage().Return(unlimitedUsage()).AnyTimes()
 
 	r := NewRebalancer(ops, pl, ms)
 	// b1 at 80%, b2 at 20% -> target ~50%, b1 has excess
@@ -155,7 +160,7 @@ func TestPlanSpreadEven_ImbalancedPlansMoves(t *testing.T) {
 func TestPlanSpreadEven_BatchesBackendLookup(t *testing.T) {
 	t.Parallel()
 	ctrl := gomock.NewController(t)
-	ops := NewMockOps(ctrl)
+	ops := newMockOps(ctrl)
 	pl := NewMockPlacement(ctrl)
 	objs := []core.ObjectLocation{
 		{ObjectKey: "k1", BackendName: "b1", SizeBytes: 50},
@@ -176,6 +181,7 @@ func TestPlanSpreadEven_BatchesBackendLookup(t *testing.T) {
 		},
 	}
 	ops.EXPECT().BackendOrder().Return([]string{"b1", "b2"}).AnyTimes()
+	ops.EXPECT().Usage().Return(unlimitedUsage()).AnyTimes()
 
 	r := NewRebalancer(ops, pl, ms)
 	stats := map[string]core.QuotaStat{
@@ -202,7 +208,7 @@ func TestPlanSpreadEven_BatchesBackendLookup(t *testing.T) {
 func TestPlanPackTight_BatchesBackendLookup(t *testing.T) {
 	t.Parallel()
 	ctrl := gomock.NewController(t)
-	ops := NewMockOps(ctrl)
+	ops := newMockOps(ctrl)
 	pl := NewMockPlacement(ctrl)
 	objs := []core.ObjectLocation{
 		{ObjectKey: "k1", BackendName: "b2", SizeBytes: 50},
@@ -220,6 +226,7 @@ func TestPlanPackTight_BatchesBackendLookup(t *testing.T) {
 		},
 	}
 	ops.EXPECT().BackendOrder().Return([]string{"b1", "b2"}).AnyTimes()
+	ops.EXPECT().Usage().Return(unlimitedUsage()).AnyTimes()
 
 	r := NewRebalancer(ops, pl, ms)
 	// b1 is the most-full destination, b2 is the source.
@@ -248,7 +255,7 @@ func TestPlanPackTight_BatchesBackendLookup(t *testing.T) {
 func TestExecuteOneMove_Success(t *testing.T) {
 	t.Parallel()
 	ctrl := gomock.NewController(t)
-	ops := NewMockOps(ctrl)
+	ops := newMockOps(ctrl)
 	pl := NewMockPlacement(ctrl)
 
 	srcBe := backendtest.NewMockObjectBackend(ctrl)
@@ -283,7 +290,7 @@ func TestExecuteOneMove_Success(t *testing.T) {
 func TestExecuteOneMove_MoveObjectFails(t *testing.T) {
 	t.Parallel()
 	ctrl := gomock.NewController(t)
-	ops := NewMockOps(ctrl)
+	ops := newMockOps(ctrl)
 	pl := NewMockPlacement(ctrl)
 	ms := &mockMetadataStore{}
 
@@ -308,7 +315,7 @@ func TestExecuteOneMove_MoveObjectFails(t *testing.T) {
 func TestExecuteOneMove_MoveObjectStale(t *testing.T) {
 	t.Parallel()
 	ctrl := gomock.NewController(t)
-	ops := NewMockOps(ctrl)
+	ops := newMockOps(ctrl)
 	pl := NewMockPlacement(ctrl)
 	ms := &mockMetadataStore{}
 
@@ -331,7 +338,7 @@ func TestExecuteOneMove_MoveObjectStale(t *testing.T) {
 func TestExecuteOneMove_SourceBackendNotFound(t *testing.T) {
 	t.Parallel()
 	ctrl := gomock.NewController(t)
-	ops := NewMockOps(ctrl)
+	ops := newMockOps(ctrl)
 	pl := NewMockPlacement(ctrl)
 	ms := &mockMetadataStore{}
 
@@ -350,19 +357,261 @@ func TestExecuteOneMove_SourceBackendNotFound(t *testing.T) {
 func TestRebalance_UnknownStrategy(t *testing.T) {
 	t.Parallel()
 	ctrl := gomock.NewController(t)
-	ops := NewMockOps(ctrl)
+	ops := newMockOps(ctrl)
 	pl := NewMockPlacement(ctrl)
 	ms := &mockMetadataStore{quotaStats: map[string]core.QuotaStat{
 		"b1": {BytesUsed: 900, BytesLimit: 1000},
 		"b2": {BytesUsed: 100, BytesLimit: 1000},
 	}}
 	ops.EXPECT().BackendOrder().Return([]string{"b1", "b2"}).AnyTimes()
+	ops.EXPECT().Usage().Return(unlimitedUsage()).AnyTimes()
 
 	r := NewRebalancer(ops, pl, ms)
 	_, err := r.Rebalance(context.Background(), config.RebalanceConfig{
 		Strategy: "bogus", Threshold: 0.01, BatchSize: 10,
-	})
+	}, nil)
 	if err == nil {
 		t.Error("expected error for unknown strategy")
+	}
+}
+
+// TestRebalanceMove_ProgressLabel pins the streamed line's shape: a move is
+// only meaningful as the object plus where it travelled between.
+func TestRebalanceMove_ProgressLabel(t *testing.T) {
+	t.Parallel()
+	mv := RebalanceMove{ObjectKey: "photos/a.jpg", FromBackend: "oci", ToBackend: "e2", SizeBytes: 4096}
+	if got, want := mv.progressLabel(), "photos/a.jpg  oci -> e2"; got != want {
+		t.Errorf("progressLabel() = %q, want %q", got, want)
+	}
+}
+
+// TestRebalance_SkipsWithinThreshold asserts a balanced fleet reports why it
+// did nothing rather than a zero move count, which reads as a completed pass.
+func TestRebalance_SkipsWithinThreshold(t *testing.T) {
+	t.Parallel()
+	ctrl := gomock.NewController(t)
+	ops := newMockOps(ctrl)
+	ms := &mockMetadataStore{quotaStats: map[string]core.QuotaStat{
+		"b1": {BytesUsed: 500, BytesLimit: 1000},
+		"b2": {BytesUsed: 500, BytesLimit: 1000},
+	}}
+	ops.EXPECT().BackendOrder().Return([]string{"b1", "b2"}).AnyTimes()
+	ops.EXPECT().Usage().Return(unlimitedUsage()).AnyTimes()
+
+	r := NewRebalancer(ops, NewMockPlacement(ctrl), ms)
+	sum, err := r.Rebalance(context.Background(), config.RebalanceConfig{
+		Strategy: "spread", Threshold: 0.1, BatchSize: 10,
+	}, nil)
+	if err != nil {
+		t.Fatalf("Rebalance: %v", err)
+	}
+	if sum.SkipReason != SkipReasonWithinThreshold {
+		t.Errorf("SkipReason = %q, want the threshold reason", sum.SkipReason)
+	}
+	if sum.Succeeded != 0 {
+		t.Errorf("Succeeded = %d, want 0 on a skip", sum.Succeeded)
+	}
+}
+
+// unlimitedUsage returns a tracker with no configured limits, so WithinLimits
+// always passes. Planner tests that are not about budgets use it so the usage
+// check never changes their outcome.
+func unlimitedUsage() *counter.UsageTracker {
+	return counter.NewUsageTracker(counter.NewLocalCounterBackend(nil), nil)
+}
+
+// -------------------------------------------------------------------------
+// USAGE BUDGET
+// -------------------------------------------------------------------------
+
+// TestUsageBudget_ChecksEgressOnSourceAndIngressOnDestination pins the
+// asymmetry a move has: reading the object spends the source's egress, writing
+// it spends the destination's ingress. A backend can have headroom in one and
+// none in the other, so a single combined check would be wrong in both
+// directions.
+func TestUsageBudget_ChecksEgressOnSourceAndIngressOnDestination(t *testing.T) {
+	t.Parallel()
+
+	cb := counter.NewLocalCounterBackend([]string{"src", "dst"})
+	tracker := counter.NewUsageTracker(cb, map[string]core.UsageLimits{
+		"src": {EgressByteLimit: 100},
+		"dst": {IngressByteLimit: 100},
+	})
+	b := newUsageBudget(tracker)
+
+	if !b.allows("src", "dst", 50) {
+		t.Fatal("a move inside both allowances should be permitted")
+	}
+
+	// Exhaust the source's egress only. The destination still has ingress
+	// headroom, so a combined check would wrongly permit this.
+	tracker.Record("src", s3op.GetObject, 100, 0)
+	if b.allows("src", "dst", 50) {
+		t.Error("a source over its egress allowance must not be read from")
+	}
+
+	// And the mirror: destination ingress exhausted, source egress free.
+	b2 := newUsageBudget(counter.NewUsageTracker(
+		counter.NewLocalCounterBackend([]string{"src2", "dst2"}),
+		map[string]core.UsageLimits{"dst2": {IngressByteLimit: 10}},
+	))
+	b2.usage.Record("dst2", s3op.PutObject, 0, 100)
+	if b2.allows("src2", "dst2", 5) {
+		t.Error("a destination over its ingress allowance must not be written to")
+	}
+}
+
+// TestUsageBudget_AccumulatesAcrossAPlan is the case a per-move check alone
+// gets wrong: fifty moves that each fit inside the remaining allowance can
+// still exceed it together, because none of them has been executed yet when the
+// plan is built.
+func TestUsageBudget_AccumulatesAcrossAPlan(t *testing.T) {
+	t.Parallel()
+
+	cb := counter.NewLocalCounterBackend([]string{"src", "dst"})
+	tracker := counter.NewUsageTracker(cb, map[string]core.UsageLimits{
+		"src": {EgressByteLimit: 100},
+	})
+	b := newUsageBudget(tracker)
+
+	var planned int
+	for range 10 {
+		if !b.allows("src", "dst", 30) {
+			break
+		}
+		b.commit("src", "dst", 30)
+		planned++
+	}
+
+	// 3 x 30 fits inside 100; a fourth would not.
+	if planned != 3 {
+		t.Errorf("planned %d moves of 30 bytes against a 100-byte allowance, want 3", planned)
+	}
+}
+
+// TestUsageBudget_UnlimitedWhenNoTracker keeps the budget inert for callers
+// that have no usage tracking wired, rather than blocking every move.
+func TestUsageBudget_UnlimitedWhenNoTracker(t *testing.T) {
+	t.Parallel()
+
+	var nilBudget *usageBudget
+	if !nilBudget.allows("a", "b", 1<<40) {
+		t.Error("a nil budget must not block moves")
+	}
+	if !newUsageBudget(nil).allows("a", "b", 1<<40) {
+		t.Error("a budget with no tracker must not block moves")
+	}
+	// commit on a nil budget is a no-op rather than a panic, so a planner
+	// wired without usage tracking still runs.
+	nilBudget.commit("a", "b", 10)
+}
+
+// exhaustedIngress builds a tracker where dest has already spent its ingress
+// allowance, so no further bytes may be written to it.
+func exhaustedIngress(dest string, names ...string) *counter.UsageTracker {
+	tracker := counter.NewUsageTracker(counter.NewLocalCounterBackend(names),
+		map[string]core.UsageLimits{dest: {IngressByteLimit: 10}})
+	tracker.Record(dest, s3op.PutObject, 0, 1000)
+	return tracker
+}
+
+// TestPlanPackTight_DeclinesMovesIntoAnOverBudgetDestination proves the pack
+// planner consults the budget, not merely that the budget works. Byte quota
+// alone would happily plan these moves: the destination has plenty of free
+// space and is the more-utilized backend pack pulls toward. Only the usage
+// limit stops them.
+func TestPlanPackTight_DeclinesMovesIntoAnOverBudgetDestination(t *testing.T) {
+	t.Parallel()
+	ctrl := gomock.NewController(t)
+	ops := newMockOps(ctrl)
+	ms := &mockMetadataStore{
+		objectsByBackend: map[string][]core.ObjectLocation{"b2": {
+			{ObjectKey: "k1", BackendName: "b2", SizeBytes: 50},
+			{ObjectKey: "k2", BackendName: "b2", SizeBytes: 50},
+		}},
+		getBackendsForKeysResp: map[string][]string{"k1": {"b2"}, "k2": {"b2"}},
+	}
+	ops.EXPECT().BackendOrder().Return([]string{"b1", "b2"}).AnyTimes()
+	ops.EXPECT().Usage().Return(exhaustedIngress("b1", "b1", "b2")).AnyTimes()
+
+	r := NewRebalancer(ops, NewMockPlacement(ctrl), ms)
+	stats := map[string]core.QuotaStat{
+		"b1": {BytesUsed: 800, BytesLimit: 1000}, // room for both objects
+		"b2": {BytesUsed: 100, BytesLimit: 1000},
+	}
+
+	plan, err := r.PlanPackTight(context.Background(), stats, 10)
+	if err != nil {
+		t.Fatalf("PlanPackTight: %v", err)
+	}
+	if len(plan) != 0 {
+		t.Errorf("planned %d moves into a destination over its ingress allowance, want 0: %+v",
+			len(plan), plan)
+	}
+}
+
+// TestPlanSpreadEven_DeclinesMovesIntoAnOverBudgetDestination is the same
+// assertion for the spread planner, which selects destinations by a different
+// route and so needs its own proof that the budget is consulted.
+func TestPlanSpreadEven_DeclinesMovesIntoAnOverBudgetDestination(t *testing.T) {
+	t.Parallel()
+	ctrl := gomock.NewController(t)
+	ops := newMockOps(ctrl)
+	ms := &mockMetadataStore{
+		objectsByBackend: map[string][]core.ObjectLocation{"b1": {
+			{ObjectKey: "k1", BackendName: "b1", SizeBytes: 100},
+			{ObjectKey: "k2", BackendName: "b1", SizeBytes: 100},
+		}},
+		getBackendsForKeysResp: map[string][]string{"k1": {"b1"}, "k2": {"b1"}},
+	}
+	ops.EXPECT().BackendOrder().Return([]string{"b1", "b2"}).AnyTimes()
+	ops.EXPECT().Usage().Return(exhaustedIngress("b2", "b1", "b2")).AnyTimes()
+
+	r := NewRebalancer(ops, NewMockPlacement(ctrl), ms)
+	// b1 heavily over-utilized, b2 empty: spread wants to move into b2.
+	stats := map[string]core.QuotaStat{
+		"b1": {BytesUsed: 900, BytesLimit: 1000},
+		"b2": {BytesUsed: 0, BytesLimit: 1000},
+	}
+
+	plan, err := r.PlanSpreadEven(context.Background(), stats, 10)
+	if err != nil {
+		t.Fatalf("PlanSpreadEven: %v", err)
+	}
+	if len(plan) != 0 {
+		t.Errorf("planned %d moves into a destination over its ingress allowance, want 0: %+v",
+			len(plan), plan)
+	}
+}
+
+// TestPlanSpreadEven_StillPlansWhenBudgetAllows is the control for the two
+// tests above: with the same fleet and no usage limits the planner does produce
+// moves, so their empty plans are the budget's doing and not a broken fixture.
+func TestPlanSpreadEven_StillPlansWhenBudgetAllows(t *testing.T) {
+	t.Parallel()
+	ctrl := gomock.NewController(t)
+	ops := newMockOps(ctrl)
+	ms := &mockMetadataStore{
+		objectsByBackend: map[string][]core.ObjectLocation{"b1": {
+			{ObjectKey: "k1", BackendName: "b1", SizeBytes: 100},
+			{ObjectKey: "k2", BackendName: "b1", SizeBytes: 100},
+		}},
+		getBackendsForKeysResp: map[string][]string{"k1": {"b1"}, "k2": {"b1"}},
+	}
+	ops.EXPECT().BackendOrder().Return([]string{"b1", "b2"}).AnyTimes()
+	ops.EXPECT().Usage().Return(unlimitedUsage()).AnyTimes()
+
+	r := NewRebalancer(ops, NewMockPlacement(ctrl), ms)
+	stats := map[string]core.QuotaStat{
+		"b1": {BytesUsed: 900, BytesLimit: 1000},
+		"b2": {BytesUsed: 0, BytesLimit: 1000},
+	}
+
+	plan, err := r.PlanSpreadEven(context.Background(), stats, 10)
+	if err != nil {
+		t.Fatalf("PlanSpreadEven: %v", err)
+	}
+	if len(plan) == 0 {
+		t.Fatal("expected moves with no usage limits configured; the budget tests prove nothing otherwise")
 	}
 }

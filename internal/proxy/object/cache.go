@@ -20,6 +20,10 @@ import (
 	"github.com/afreidah/s3-orchestrator/internal/util/syncutil"
 )
 
+// -------------------------------------------------------------------------
+// TYPES
+// -------------------------------------------------------------------------
+
 // LocationCache is a TTL-based cache mapping object keys to backend names.
 // It delegates storage and eviction to a generic TTLCache and applies random
 // jitter (+/-20%) on each Set to stagger expiry times.
@@ -36,6 +40,10 @@ func NewLocationCache(ttl time.Duration) *LocationCache {
 		ttl:   ttl,
 	}
 }
+
+// -------------------------------------------------------------------------
+// PUBLIC API
+// -------------------------------------------------------------------------
 
 // Get returns the cached backend for a key, or false if not cached or expired.
 func (c *LocationCache) Get(key string) (string, bool) {

@@ -24,28 +24,53 @@ import (
 	"testing"
 	"time"
 
+	"go.uber.org/mock/gomock"
+
 	"github.com/afreidah/s3-orchestrator/internal/config"
+	"github.com/afreidah/s3-orchestrator/internal/provisioning"
+	"github.com/afreidah/s3-orchestrator/internal/testutil/testx"
+
 	"github.com/afreidah/s3-orchestrator/internal/store/core"
+	"github.com/afreidah/s3-orchestrator/internal/store/storetest"
+	"github.com/afreidah/s3-orchestrator/internal/transport/auth"
 	"github.com/afreidah/s3-orchestrator/internal/transport/httputil"
 
 	"github.com/afreidah/s3-orchestrator/internal/backend"
 	"github.com/afreidah/s3-orchestrator/internal/observe/telemetry"
-	"github.com/afreidah/s3-orchestrator/internal/proxy"
 	"github.com/afreidah/s3-orchestrator/internal/proxy/dashboard"
 	"github.com/afreidah/s3-orchestrator/internal/proxy/proxytest"
-	"github.com/afreidah/s3-orchestrator/internal/testutil"
-	"golang.org/x/crypto/bcrypt"
+	"github.com/afreidah/s3-orchestrator/internal/proxy/reconcile"
 	// newTestHandler builds a Handler wired to mock data for testing.
 )
 
-// testAdminKey and related constants used by this package.
+// The credentials every handler test signs and logs in with.
 const (
-	testAdminKey      = "test-admin"
-	testAdminSecret   = "test-secret-key"
+	testRootKey       = "AKIAUITESTROOT"
+	testRootSecret    = "test-secret-key" //nolint:gosec // G101: test credential
 	testSessionSecret = "test-session-secret"
 )
 
+// testRootAuth is the root credential the handler under test logs in against.
+func testRootAuth() config.AuthConfig {
+	return config.AuthConfig{
+		Root: config.RootCredential{AccessKeyID: testRootKey, SecretAccessKey: testRootSecret},
+	}
+}
+
 // newTestHandler constructs a new test handler.
+// testDashboard builds the aggregator the UI now reads directly, wired to the
+// same mock store and live fleet the handler under test uses.
+// testSync builds the reconcile manager the UI's sync action invokes.
+func testSync(st *proxytest.Stack, store reconcile.Stores) *reconcile.Manager {
+	return reconcile.NewManager(&reconcile.Deps{
+		Backends: st.Runtime, Stores: store, Usage: st.Runtime.Acct(), Quota: st.Runtime.Quota(),
+	})
+}
+
+func testDashboard(st *proxytest.Stack, store core.DashboardStore) *dashboard.Aggregator {
+	return dashboard.New(store, st.Runtime.Usage(), st.Runtime.BackendOrder(), st.Runtime, st.Drain)
+}
+
 func newTestHandler(t *testing.T) (*Handler, *http.ServeMux) {
 	t.Helper()
 	h, mux, _ := newTestHandlerWithMock(t)
@@ -53,41 +78,41 @@ func newTestHandler(t *testing.T) (*Handler, *http.ServeMux) {
 }
 
 // newTestHandlerWithMock builds a Handler and also returns the underlying mock
-// store so tests can configure per-test error/response behaviour.
-func newTestHandlerWithMock(t *testing.T) (*Handler, *http.ServeMux, *testutil.MockStore) {
+// store. Each opt registers expectations before the fixture's own, so a test
+// that cares about one call can override just that one and inherit the rest.
+func newTestHandlerWithMock(t *testing.T, opts ...func(*storetest.MockMetadataStore)) (*Handler, *http.ServeMux, *storetest.MockMetadataStore) {
 	t.Helper()
 
-	mockStore := testutil.NewMockStore(t)
-	mockStore.GetQuotaStatsResp = map[string]core.QuotaStat{
+	mockStore := storetest.NewMockMetadataStore(gomock.NewController(t))
+	for _, opt := range opts {
+		opt(mockStore)
+	}
+	mockStore.EXPECT().GetQuotaStats(gomock.Any()).Return(map[string]core.QuotaStat{
 		"b1": {BackendName: "b1", BytesUsed: 500, BytesLimit: 1000},
-	}
-	mockStore.GetObjectCountsResp = map[string]int64{"b1": 42}
-	mockStore.GetActiveMultipartResp = map[string]int64{"b1": 0}
-	mockStore.GetUsageForPeriodResp = map[string]core.UsageStat{"b1": {APIRequests: 100}}
-	mockStore.ListDirChildrenResp = &core.DirectoryListResult{
-		Entries: []core.DirEntry{
-			{Name: "bucket1/", IsDir: true, FileCount: 10, TotalSize: 4096},
-		},
-	}
+	}, nil).AnyTimes()
+	mockStore.EXPECT().GetObjectCounts(gomock.Any()).Return(map[string]int64{"b1": 42}, nil).AnyTimes()
+	mockStore.EXPECT().GetActiveMultipartCounts(gomock.Any()).Return(map[string]int64{"b1": 0}, nil).AnyTimes()
+	mockStore.EXPECT().GetUsageForPeriod(gomock.Any(), gomock.Any()).
+		Return(map[string]core.UsageStat{"b1": {APIRequests: 100}}, nil).AnyTimes()
+	mockStore.EXPECT().GetPoolUsageForPeriod(gomock.Any(), gomock.Any()).
+		Return(map[string]core.PoolUsage{"b1": {core.PoolAll: 100}}, nil).AnyTimes()
+	mockStore.EXPECT().ListDirectoryChildren(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+		Return(&core.DirectoryListResult{
+			Entries: []core.DirEntry{
+				{Name: "bucket1/", IsDir: true, FileCount: 10, TotalSize: 4096},
+			},
+		}, nil).AnyTimes()
+	storetest.Permissive(mockStore)
 
-	mgr := proxytest.NewManager(t, &proxy.BackendManagerConfig{
-		Storage: proxy.StorageDeps{
-			Backends: map[string]backend.ObjectBackend{},
-			Order:    []string{"b1"},
-		},
-		Stores: proxy.StoreDeps{
-			Metadata:  mockStore,
-			Dashboard: mockStore,
-		},
-		Policies: proxy.PolicyConfig{
+	st := proxytest.New(t, mockStore, &proxytest.StackOptions{
+		Runtime: proxytest.NewRuntime(&proxytest.RuntimeOptions{
+			Backends:        map[string]backend.ObjectBackend{},
+			Order:           []string{"b1"},
 			RoutingStrategy: config.RoutingPack,
-		},
-		Operations: proxy.OperationalDeps{
-			Metrics: mockStore,
-		},
+			Metrics:         mockStore,
+		}),
 	})
-	workers := proxytest.BuildWorkers(mgr, mockStore)
-	t.Cleanup(mgr.Close)
+	svc := testOps(st, proxytest.BuildWorkers(st, mockStore), mockStore)
 
 	cfg := &config.Config{
 		Buckets: []config.BucketConfig{
@@ -100,15 +125,14 @@ func newTestHandlerWithMock(t *testing.T) (*Handler, *http.ServeMux, *testutil.M
 		RoutingStrategy: config.RoutingPack,
 		Replication:     config.ReplicationConfig{Factor: 1},
 		RateLimit:       config.RateLimitConfig{Enabled: false},
+		Auth:            testRootAuth(),
 		UI: config.UIConfig{
 			Enabled:       true,
-			AdminKey:      testAdminKey,
-			AdminSecret:   testAdminSecret,
 			SessionSecret: testSessionSecret,
 		},
 	}
 
-	h := New(&Deps{BackendOps: mgr, Objects: mgr.Objects(), Rebalancer: workers.Rebalancer, OverRep: workers.OverReplicationCleaner, AdminHandler: newSkippedAdminHandler(t), DBHealthy: func() bool { return true }, Cfg: cfg, LogBuffer: telemetry.NewLogBuffer()})
+	h := New(&Deps{Dashboard: testDashboard(st, mockStore), Sync: testSync(st, mockStore), Objects: svc.Objects, Integrity: svc.Integrity, Replication: svc.Replication, Rebalance: svc.Rebalance, Encryption: svc.Encryption, Compression: svc.Compression, DBHealthy: func() bool { return true }, Buckets: declaredFrom(cfg), Cfg: cfg, LogBuffer: telemetry.NewLogBuffer(), Registry: registryFrom(cfg)})
 
 	mux := http.NewServeMux()
 	h.Register(mux, "/ui")
@@ -124,8 +148,8 @@ func loginCookies(t *testing.T, _ *Handler, mux *http.ServeMux) (session *http.C
 	t.Helper()
 
 	form := url.Values{
-		"access_key": {testAdminKey},
-		"secret_key": {testAdminSecret},
+		"access_key": {testRootKey},
+		"secret_key": {testRootSecret},
 	}
 	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/ui/login", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -298,8 +322,8 @@ func TestLogin_ValidCredentials(t *testing.T) {
 	_, mux := newTestHandler(t)
 
 	form := url.Values{
-		"access_key": {testAdminKey},
-		"secret_key": {testAdminSecret},
+		"access_key": {testRootKey},
+		"secret_key": {testRootSecret},
 	}
 	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/ui/login", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -423,93 +447,6 @@ func TestLogout_ClearsCookie(t *testing.T) {
 	t.Error("logout should clear session cookie")
 }
 
-// TestCheckSecret_Plaintext verifies the check secret plaintext behaviour described by the test name.
-func TestCheckSecret_Plaintext(t *testing.T) {
-	t.Parallel()
-	if !checkSecret("mysecret", "mysecret") {
-		t.Error("identical plaintext should match")
-	}
-	if checkSecret("mysecret", "wrong") {
-		t.Error("different plaintext should not match")
-	}
-}
-
-// TestCheckSecret_Bcrypt verifies the check secret bcrypt path by exercising bcrypt.GenerateFromPassword.
-func TestCheckSecret_Bcrypt(t *testing.T) {
-	t.Parallel()
-	hash, err := bcrypt.GenerateFromPassword([]byte("bcrypt-pass"), bcrypt.MinCost)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if !checkSecret(string(hash), "bcrypt-pass") {
-		t.Error("correct password should match bcrypt hash")
-	}
-	if checkSecret(string(hash), "wrong") {
-		t.Error("wrong password should not match bcrypt hash")
-	}
-}
-
-// TestLogin_BcryptSecret verifies the login bcrypt secret contract.
-// Asserts that bcrypt login: status = , want 303.
-func TestLogin_BcryptSecret(t *testing.T) {
-	t.Parallel()
-	hash, err := bcrypt.GenerateFromPassword([]byte(testAdminSecret), bcrypt.MinCost)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	mockStore := testutil.NewMockStore(t)
-	mockStore.GetQuotaStatsResp = map[string]core.QuotaStat{}
-	mockStore.GetObjectCountsResp = map[string]int64{}
-	mockStore.GetActiveMultipartResp = map[string]int64{}
-	mockStore.GetUsageForPeriodResp = map[string]core.UsageStat{}
-	mockStore.ListDirChildrenResp = &core.DirectoryListResult{}
-	mgr := proxytest.NewManager(t, &proxy.BackendManagerConfig{
-		Storage: proxy.StorageDeps{
-			Backends: map[string]backend.ObjectBackend{},
-			Order:    []string{},
-		},
-		Stores: proxy.StoreDeps{
-			Metadata:  mockStore,
-			Dashboard: mockStore,
-		},
-		Operations: proxy.OperationalDeps{
-			Metrics: mockStore,
-		},
-	})
-	workers := proxytest.BuildWorkers(mgr, mockStore)
-	t.Cleanup(mgr.Close)
-
-	cfg := &config.Config{
-		Buckets:  []config.BucketConfig{{Name: "b"}},
-		Backends: []config.BackendConfig{{Name: "b1", Endpoint: "e", Bucket: "b", AccessKeyID: "a", SecretAccessKey: "s"}},
-		UI: config.UIConfig{
-			Enabled:       true,
-			AdminKey:      testAdminKey,
-			AdminSecret:   string(hash),
-			SessionSecret: testSessionSecret,
-		},
-	}
-
-	h := New(&Deps{BackendOps: mgr, Objects: mgr.Objects(), Rebalancer: workers.Rebalancer, OverRep: workers.OverReplicationCleaner, AdminHandler: newSkippedAdminHandler(t), DBHealthy: func() bool { return true }, Cfg: cfg, LogBuffer: telemetry.NewLogBuffer()})
-	mux := http.NewServeMux()
-	h.Register(mux, "/ui")
-
-	form := url.Values{
-		"access_key": {testAdminKey},
-		"secret_key": {testAdminSecret},
-	}
-	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/ui/login", strings.NewReader(form.Encode()))
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, req)
-
-	if w.Result().StatusCode != http.StatusSeeOther {
-		t.Fatalf("bcrypt login: status = %d, want 303", w.Result().StatusCode)
-	}
-}
-
 // TestDeriveSessionKey_Deterministic verifies the derive session key deterministic path by exercising bytes.Equal.
 func TestDeriveSessionKey_Deterministic(t *testing.T) {
 	t.Parallel()
@@ -541,40 +478,26 @@ func TestDeriveSessionKey_DifferentSecretsDifferentKeys(t *testing.T) {
 func TestCrossInstanceSession(t *testing.T) {
 	t.Parallel()
 	// Two handlers with the same config should accept each other's sessions.
-	mockStore := testutil.NewMockStore(t)
-	mockStore.GetQuotaStatsResp = map[string]core.QuotaStat{}
-	mockStore.GetObjectCountsResp = map[string]int64{}
-	mockStore.GetActiveMultipartResp = map[string]int64{}
-	mockStore.GetUsageForPeriodResp = map[string]core.UsageStat{}
-	mockStore.ListDirChildrenResp = &core.DirectoryListResult{}
-	mgr := proxytest.NewManager(t, &proxy.BackendManagerConfig{
-		Storage: proxy.StorageDeps{
+	mockStore := storetest.NewMockMetadataStore(gomock.NewController(t))
+	storetest.Permissive(mockStore)
+	st := proxytest.New(t, mockStore, &proxytest.StackOptions{
+		Runtime: proxytest.NewRuntime(&proxytest.RuntimeOptions{
 			Backends: map[string]backend.ObjectBackend{},
 			Order:    []string{},
-		},
-		Stores: proxy.StoreDeps{
-			Metadata:  mockStore,
-			Dashboard: mockStore,
-		},
-		Operations: proxy.OperationalDeps{
-			Metrics: mockStore,
-		},
+			Metrics:  mockStore,
+		}),
 	})
-	workers := proxytest.BuildWorkers(mgr, mockStore)
-	t.Cleanup(mgr.Close)
+	svc := testOps(st, proxytest.BuildWorkers(st, mockStore), mockStore)
 
 	cfg := &config.Config{
 		Buckets:  []config.BucketConfig{{Name: "b"}},
 		Backends: []config.BackendConfig{{Name: "b1", Endpoint: "e", Bucket: "b", AccessKeyID: "a", SecretAccessKey: "s"}},
-		UI: config.UIConfig{
-			Enabled:     true,
-			AdminKey:    testAdminKey,
-			AdminSecret: testAdminSecret,
-		},
+		Auth:     testRootAuth(),
+		UI:       config.UIConfig{Enabled: true},
 	}
 
-	h1 := New(&Deps{BackendOps: mgr, Objects: mgr.Objects(), Rebalancer: workers.Rebalancer, OverRep: workers.OverReplicationCleaner, AdminHandler: newSkippedAdminHandler(t), DBHealthy: func() bool { return true }, Cfg: cfg, LogBuffer: telemetry.NewLogBuffer()})
-	h2 := New(&Deps{BackendOps: mgr, Objects: mgr.Objects(), Rebalancer: workers.Rebalancer, OverRep: workers.OverReplicationCleaner, AdminHandler: newSkippedAdminHandler(t), DBHealthy: func() bool { return true }, Cfg: cfg, LogBuffer: telemetry.NewLogBuffer()})
+	h1 := New(&Deps{Dashboard: testDashboard(st, mockStore), Sync: testSync(st, mockStore), Objects: svc.Objects, Integrity: svc.Integrity, Replication: svc.Replication, Rebalance: svc.Rebalance, Encryption: svc.Encryption, Compression: svc.Compression, DBHealthy: func() bool { return true }, Buckets: declaredFrom(cfg), Cfg: cfg, LogBuffer: telemetry.NewLogBuffer(), Registry: registryFrom(cfg)})
+	h2 := New(&Deps{Dashboard: testDashboard(st, mockStore), Sync: testSync(st, mockStore), Objects: svc.Objects, Integrity: svc.Integrity, Replication: svc.Replication, Rebalance: svc.Rebalance, Encryption: svc.Encryption, Compression: svc.Compression, DBHealthy: func() bool { return true }, Buckets: declaredFrom(cfg), Cfg: cfg, LogBuffer: telemetry.NewLogBuffer(), Registry: registryFrom(cfg)})
 	mux1 := http.NewServeMux()
 	mux2 := http.NewServeMux()
 	h1.Register(mux1, "/ui")
@@ -782,87 +705,59 @@ func TestUpdateConfig_ReflectsInDashboard(t *testing.T) {
 // DELETE / UPLOAD AUTH GATING
 // -------------------------------------------------------------------------
 
-// TestAPIDelete_RequiresAuth verifies the apidelete requires auth contract.
-// Asserts that status = , want 401.
-func TestAPIDelete_RequiresAuth(t *testing.T) {
+// TestAPIRequestRejections covers what the UI's JSON endpoints refuse before
+// they reach the store: an unauthenticated caller, the wrong method, a body
+// that is not JSON, and a request that names nothing to act on. Each endpoint
+// applies the same four rules, so they are stated once as data.
+func TestAPIRequestRejections(t *testing.T) {
 	t.Parallel()
-	_, mux := newTestHandler(t)
-
-	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/ui/api/delete", strings.NewReader(`{"key":"test"}`))
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, req)
-
-	if w.Result().StatusCode != http.StatusUnauthorized {
-		t.Fatalf("status = %d, want 401", w.Result().StatusCode)
+	tests := []struct {
+		name   string
+		method string
+		path   string
+		body   string
+		authed bool
+		want   int
+	}{
+		{"delete without a session", http.MethodPost, "/ui/api/delete", `{"key":"test"}`, false, http.StatusUnauthorized},
+		{"delete-prefix without a session", http.MethodPost, "/ui/api/delete-prefix", `{"prefix":"test-bucket/"}`, false, http.StatusUnauthorized},
+		{"upload without a session", http.MethodPost, "/ui/api/upload", "", false, http.StatusUnauthorized},
+		{"delete with the wrong method", http.MethodGet, "/ui/api/delete", "", true, http.StatusMethodNotAllowed},
+		{"delete-prefix with the wrong method", http.MethodGet, "/ui/api/delete-prefix", "", true, http.StatusMethodNotAllowed},
+		{"upload with the wrong method", http.MethodGet, "/ui/api/upload", "", true, http.StatusMethodNotAllowed},
+		{"delete with a malformed body", http.MethodPost, "/ui/api/delete", "{bad", true, http.StatusBadRequest},
+		{"delete-prefix with a malformed body", http.MethodPost, "/ui/api/delete-prefix", "{bad", true, http.StatusBadRequest},
+		{"delete naming no key", http.MethodPost, "/ui/api/delete", `{"key":""}`, true, http.StatusBadRequest},
+		{"delete-prefix naming no prefix", http.MethodPost, "/ui/api/delete-prefix", `{"prefix":""}`, true, http.StatusBadRequest},
 	}
-}
 
-// TestAPIUpload_RequiresAuth verifies the apiupload requires auth contract.
-// Asserts that status = , want 401.
-func TestAPIUpload_RequiresAuth(t *testing.T) {
-	t.Parallel()
-	_, mux := newTestHandler(t)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			h, mux := newTestHandler(t)
 
-	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/ui/api/upload", nil)
-	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, req)
+			var body io.Reader
+			if tt.body != "" {
+				body = strings.NewReader(tt.body)
+			}
+			req := httptest.NewRequestWithContext(context.Background(), tt.method, tt.path, body)
+			if tt.authed {
+				req = authedRequest(t, h, mux, tt.method, tt.path, body)
+			}
+			req.Header.Set("Content-Type", "application/json")
 
-	if w.Result().StatusCode != http.StatusUnauthorized {
-		t.Fatalf("status = %d, want 401", w.Result().StatusCode)
+			w := httptest.NewRecorder()
+			mux.ServeHTTP(w, req)
+			if w.Result().StatusCode != tt.want {
+				t.Fatalf("status = %d, want %d", w.Result().StatusCode, tt.want)
+			}
+		})
 	}
 }
 
 // -------------------------------------------------------------------------
 // DELETE API TESTS
 // -------------------------------------------------------------------------
-
-// TestAPIDelete_WrongMethod verifies the apidelete wrong method contract.
-// Asserts that status = , want 405.
-func TestAPIDelete_WrongMethod(t *testing.T) {
-	t.Parallel()
-	h, mux := newTestHandler(t)
-
-	req := authedRequest(t, h, mux, http.MethodGet, "/ui/api/delete", nil)
-	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, req)
-
-	if w.Result().StatusCode != http.StatusMethodNotAllowed {
-		t.Fatalf("status = %d, want 405", w.Result().StatusCode)
-	}
-}
-
-// TestAPIDelete_BadJSON verifies the apidelete bad json contract.
-// Asserts that status = , want 400.
-func TestAPIDelete_BadJSON(t *testing.T) {
-	t.Parallel()
-	h, mux := newTestHandler(t)
-
-	req := authedRequest(t, h, mux, http.MethodPost, "/ui/api/delete", strings.NewReader("{bad"))
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, req)
-
-	if w.Result().StatusCode != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400", w.Result().StatusCode)
-	}
-}
-
-// TestAPIDelete_EmptyKey verifies the apidelete empty key contract.
-// Asserts that status = , want 400.
-func TestAPIDelete_EmptyKey(t *testing.T) {
-	t.Parallel()
-	h, mux := newTestHandler(t)
-
-	req := authedRequest(t, h, mux, http.MethodPost, "/ui/api/delete", strings.NewReader(`{"key":""}`))
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, req)
-
-	if w.Result().StatusCode != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400", w.Result().StatusCode)
-	}
-}
 
 // TestAPIDelete_Success verifies the apidelete success contract.
 // Asserts that status = , want 200; body =.
@@ -895,8 +790,9 @@ func TestAPIDelete_Success(t *testing.T) {
 // Asserts that status = , want 500.
 func TestAPIDelete_ManagerError(t *testing.T) {
 	t.Parallel()
-	h, mux, mock := newTestHandlerWithMock(t)
-	mock.DeleteObjectErr = errors.New("db down")
+	h, mux, _ := newTestHandlerWithMock(t, func(m *storetest.MockMetadataStore) {
+		m.EXPECT().DeleteObject(gomock.Any(), gomock.Any()).Return(nil, nil, errors.New("db down")).AnyTimes()
+	})
 
 	req := authedRequest(t, h, mux, http.MethodPost, "/ui/api/delete",
 		strings.NewReader(`{"key":"test-bucket/file.txt"}`))
@@ -913,83 +809,18 @@ func TestAPIDelete_ManagerError(t *testing.T) {
 // DELETE PREFIX API TESTS
 // -------------------------------------------------------------------------
 
-// TestAPIDeletePrefix_RequiresAuth verifies the apidelete prefix requires auth contract.
-// Asserts that status = , want 401.
-func TestAPIDeletePrefix_RequiresAuth(t *testing.T) {
-	t.Parallel()
-	_, mux := newTestHandler(t)
-
-	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/ui/api/delete-prefix",
-		strings.NewReader(`{"prefix":"test-bucket/"}`))
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, req)
-
-	if w.Result().StatusCode != http.StatusUnauthorized {
-		t.Fatalf("status = %d, want 401", w.Result().StatusCode)
-	}
-}
-
-// TestAPIDeletePrefix_WrongMethod verifies the apidelete prefix wrong method contract.
-// Asserts that status = , want 405.
-func TestAPIDeletePrefix_WrongMethod(t *testing.T) {
-	t.Parallel()
-	h, mux := newTestHandler(t)
-
-	req := authedRequest(t, h, mux, http.MethodGet, "/ui/api/delete-prefix", nil)
-	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, req)
-
-	if w.Result().StatusCode != http.StatusMethodNotAllowed {
-		t.Fatalf("status = %d, want 405", w.Result().StatusCode)
-	}
-}
-
-// TestAPIDeletePrefix_BadJSON verifies the apidelete prefix bad json contract.
-// Asserts that status = , want 400.
-func TestAPIDeletePrefix_BadJSON(t *testing.T) {
-	t.Parallel()
-	h, mux := newTestHandler(t)
-
-	req := authedRequest(t, h, mux, http.MethodPost, "/ui/api/delete-prefix", strings.NewReader("{bad"))
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, req)
-
-	if w.Result().StatusCode != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400", w.Result().StatusCode)
-	}
-}
-
-// TestAPIDeletePrefix_EmptyPrefix verifies the apidelete prefix empty prefix contract.
-// Asserts that status = , want 400.
-func TestAPIDeletePrefix_EmptyPrefix(t *testing.T) {
-	t.Parallel()
-	h, mux := newTestHandler(t)
-
-	req := authedRequest(t, h, mux, http.MethodPost, "/ui/api/delete-prefix",
-		strings.NewReader(`{"prefix":""}`))
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, req)
-
-	if w.Result().StatusCode != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400", w.Result().StatusCode)
-	}
-}
-
 // TestAPIDeletePrefix_Success verifies the apidelete prefix success contract.
 // Asserts that status = , want 200; body =.
 func TestAPIDeletePrefix_Success(t *testing.T) {
 	t.Parallel()
-	h, mux, mock := newTestHandlerWithMock(t)
-	mock.ListObjectsResp = &core.ListObjectsResult{
-		Objects: []core.ObjectLocation{
-			{ObjectKey: "test-bucket/a.txt", BackendName: "b1", SizeBytes: 100},
-			{ObjectKey: "test-bucket/b.txt", BackendName: "b1", SizeBytes: 200},
-		},
-		IsTruncated: false,
-	}
+	h, mux, _ := newTestHandlerWithMock(t, func(m *storetest.MockMetadataStore) {
+		m.EXPECT().ListObjects(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(&core.ListObjectsResult{
+			Objects: []core.ObjectLocation{
+				{ObjectKey: "test-bucket/a.txt", BackendName: "b1", SizeBytes: 100},
+				{ObjectKey: "test-bucket/b.txt", BackendName: "b1", SizeBytes: 200},
+			},
+		}, nil).AnyTimes()
+	})
 
 	req := authedRequest(t, h, mux, http.MethodPost, "/ui/api/delete-prefix",
 		strings.NewReader(`{"prefix":"test-bucket/"}`))
@@ -1019,11 +850,10 @@ func TestAPIDeletePrefix_Success(t *testing.T) {
 // Asserts that status = , want 200; body =.
 func TestAPIDeletePrefix_EmptyResult(t *testing.T) {
 	t.Parallel()
-	h, mux, mock := newTestHandlerWithMock(t)
-	mock.ListObjectsResp = &core.ListObjectsResult{
-		Objects:     nil,
-		IsTruncated: false,
-	}
+	h, mux, _ := newTestHandlerWithMock(t, func(m *storetest.MockMetadataStore) {
+		m.EXPECT().ListObjects(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+			Return(&core.ListObjectsResult{}, nil).AnyTimes()
+	})
 
 	req := authedRequest(t, h, mux, http.MethodPost, "/ui/api/delete-prefix",
 		strings.NewReader(`{"prefix":"empty-prefix/"}`))
@@ -1053,8 +883,9 @@ func TestAPIDeletePrefix_EmptyResult(t *testing.T) {
 // Asserts that status = , want 500.
 func TestAPIDeletePrefix_ListObjectsError(t *testing.T) {
 	t.Parallel()
-	h, mux, mock := newTestHandlerWithMock(t)
-	mock.ListObjectsErr = errors.New("db down")
+	h, mux, _ := newTestHandlerWithMock(t, func(m *storetest.MockMetadataStore) {
+		m.EXPECT().ListObjects(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, errors.New("db down")).AnyTimes()
+	})
 
 	req := authedRequest(t, h, mux, http.MethodPost, "/ui/api/delete-prefix",
 		strings.NewReader(`{"prefix":"test-bucket/"}`))
@@ -1071,14 +902,14 @@ func TestAPIDeletePrefix_ListObjectsError(t *testing.T) {
 // Asserts that status = , want 500.
 func TestAPIDeletePrefix_DeleteError(t *testing.T) {
 	t.Parallel()
-	h, mux, mock := newTestHandlerWithMock(t)
-	mock.ListObjectsResp = &core.ListObjectsResult{
-		Objects: []core.ObjectLocation{
-			{ObjectKey: "test-bucket/a.txt", BackendName: "b1", SizeBytes: 100},
-		},
-		IsTruncated: false,
-	}
-	mock.DeleteObjectsBatchErr = errors.New("delete failed")
+	h, mux, _ := newTestHandlerWithMock(t, func(m *storetest.MockMetadataStore) {
+		m.EXPECT().ListObjects(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(&core.ListObjectsResult{
+			Objects: []core.ObjectLocation{
+				{ObjectKey: "test-bucket/a.txt", BackendName: "b1", SizeBytes: 100},
+			},
+		}, nil).AnyTimes()
+		m.EXPECT().DeleteObjectsBatch(gomock.Any(), gomock.Any()).Return(nil, nil, errors.New("delete failed")).AnyTimes()
+	})
 
 	req := authedRequest(t, h, mux, http.MethodPost, "/ui/api/delete-prefix",
 		strings.NewReader(`{"prefix":"test-bucket/"}`))
@@ -1128,21 +959,6 @@ func multipartForm(t *testing.T, key, filename string, fileContent []byte) (*byt
 		t.Fatal(err)
 	}
 	return &buf, w.FormDataContentType()
-}
-
-// TestAPIUpload_WrongMethod verifies the apiupload wrong method contract.
-// Asserts that status = , want 405.
-func TestAPIUpload_WrongMethod(t *testing.T) {
-	t.Parallel()
-	h, mux := newTestHandler(t)
-
-	req := authedRequest(t, h, mux, http.MethodGet, "/ui/api/upload", nil)
-	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, req)
-
-	if w.Result().StatusCode != http.StatusMethodNotAllowed {
-		t.Fatalf("status = %d, want 405", w.Result().StatusCode)
-	}
 }
 
 // TestAPIUpload_MissingKey verifies the apiupload missing key contract.
@@ -1320,8 +1136,9 @@ func TestAPIRebalance_StatusPolling(t *testing.T) {
 // Asserts that status = , want 202.
 func TestAPIRebalance_ManagerError(t *testing.T) {
 	t.Parallel()
-	h, mux, mock := newTestHandlerWithMock(t)
-	mock.GetQuotaStatsErr = errors.New("db down")
+	h, mux, _ := newTestHandlerWithMock(t, func(m *storetest.MockMetadataStore) {
+		m.EXPECT().GetQuotaStats(gomock.Any()).Return(nil, errors.New("db down")).AnyTimes()
+	})
 
 	req := authedRequest(t, h, mux, http.MethodPost, "/ui/api/rebalance", nil)
 	w := httptest.NewRecorder()
@@ -1332,19 +1149,17 @@ func TestAPIRebalance_ManagerError(t *testing.T) {
 		t.Fatalf("status = %d, want 202", w.Result().StatusCode)
 	}
 
-	// Wait briefly for background goroutine to complete
-	time.Sleep(100 * time.Millisecond)
-
-	// Poll status to see the error
-	req2 := authedRequest(t, h, mux, http.MethodGet, "/ui/api/rebalance/status", nil)
-	w2 := httptest.NewRecorder()
-	mux.ServeHTTP(w2, req2)
-
+	// The failure surfaces on the status endpoint once the background
+	// goroutine finishes, which is its own schedule rather than a fixed wait.
 	var result map[string]any
-	_ = json.NewDecoder(w2.Body).Decode(&result)
-	if result["status"] != "error" {
-		t.Errorf("expected status=error, got %v", result)
-	}
+	testx.Eventually(t, 2*time.Second, func() bool {
+		req2 := authedRequest(t, h, mux, http.MethodGet, "/ui/api/rebalance/status", nil)
+		w2 := httptest.NewRecorder()
+		mux.ServeHTTP(w2, req2)
+		result = nil
+		_ = json.NewDecoder(w2.Body).Decode(&result)
+		return result["status"] == "error"
+	}, "expected status=error, got %v", result)
 }
 
 // -------------------------------------------------------------------------
@@ -1501,8 +1316,9 @@ func TestLogin_UnsupportedMethod(t *testing.T) {
 // Asserts that status = , want 500.
 func TestDashboard_DataError(t *testing.T) {
 	t.Parallel()
-	h, mux, mock := newTestHandlerWithMock(t)
-	mock.GetQuotaStatsErr = errors.New("db down")
+	h, mux, _ := newTestHandlerWithMock(t, func(m *storetest.MockMetadataStore) {
+		m.EXPECT().GetQuotaStats(gomock.Any()).Return(nil, errors.New("db down")).AnyTimes()
+	})
 
 	req := authedRequest(t, h, mux, http.MethodGet, "/ui/", nil)
 	w := httptest.NewRecorder()
@@ -1517,8 +1333,9 @@ func TestDashboard_DataError(t *testing.T) {
 // Asserts that status = , want 500.
 func TestAPIDashboard_DataError(t *testing.T) {
 	t.Parallel()
-	h, mux, mock := newTestHandlerWithMock(t)
-	mock.GetQuotaStatsErr = errors.New("db down")
+	h, mux, _ := newTestHandlerWithMock(t, func(m *storetest.MockMetadataStore) {
+		m.EXPECT().GetQuotaStats(gomock.Any()).Return(nil, errors.New("db down")).AnyTimes()
+	})
 
 	req := authedRequest(t, h, mux, http.MethodGet, "/ui/api/dashboard", nil)
 	w := httptest.NewRecorder()
@@ -1563,8 +1380,9 @@ func TestTreeAPI_InvalidBucketPrefix(t *testing.T) {
 // Asserts that status = , want 500.
 func TestTreeAPI_DataError(t *testing.T) {
 	t.Parallel()
-	h, mux, mock := newTestHandlerWithMock(t)
-	mock.ListDirChildrenErr = errors.New("db down")
+	h, mux, _ := newTestHandlerWithMock(t, func(m *storetest.MockMetadataStore) {
+		m.EXPECT().ListDirectoryChildren(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, errors.New("db down")).AnyTimes()
+	})
 
 	req := authedRequest(t, h, mux, http.MethodGet, "/ui/api/tree?prefix=", nil)
 	w := httptest.NewRecorder()
@@ -1895,8 +1713,8 @@ func TestLogin_BruteForceProtection(t *testing.T) {
 
 // BenchmarkLogin_TimingParity verifies that login attempts with an invalid
 // access key take approximately the same time as attempts with a valid key
-// but wrong secret. Both should be dominated by checkSecret (bcrypt when
-// configured). A large disparity would indicate a timing side-channel.
+// but wrong secret. Both should be dominated by the registry's constant-time
+// secret comparison. A large disparity would indicate a timing side-channel.
 // BenchmarkLogin_InvalidKey benchmarks login_invalid key.
 // BenchmarkLogin_InvalidKey benchmarks login_invalid key.
 func BenchmarkLogin_InvalidKey(b *testing.B) {
@@ -1920,7 +1738,7 @@ func BenchmarkLogin_ValidKeyWrongSecret(b *testing.B) {
 	h, mux := benchLoginHandler(b)
 	_ = h
 
-	form := url.Values{"access_key": {testAdminKey}, "secret_key": {"wrong-secret"}}
+	form := url.Values{"access_key": {testRootKey}, "secret_key": {"wrong-secret"}}
 	body := form.Encode()
 
 	b.ResetTimer()
@@ -1932,55 +1750,36 @@ func BenchmarkLogin_ValidKeyWrongSecret(b *testing.B) {
 	}
 }
 
-// benchLoginHandler builds a handler with a bcrypt-hashed admin secret for
-// login timing benchmarks.
+// benchLoginHandler builds a handler holding the root credential, for login
+// timing benchmarks.
 func benchLoginHandler(b *testing.B) (*Handler, *http.ServeMux) {
 	b.Helper()
 
-	bcryptHash, err := bcrypt.GenerateFromPassword([]byte(testAdminSecret), bcrypt.DefaultCost)
-	if err != nil {
-		b.Fatal(err)
-	}
+	mockStore := storetest.NewMockMetadataStore(gomock.NewController(b))
+	storetest.Permissive(mockStore)
 
-	mockStore := testutil.NewMockStore(b)
-	mockStore.GetQuotaStatsResp = map[string]core.QuotaStat{}
-	mockStore.GetObjectCountsResp = map[string]int64{}
-	mockStore.GetActiveMultipartResp = map[string]int64{}
-	mockStore.GetUsageForPeriodResp = map[string]core.UsageStat{}
-	mockStore.ListDirChildrenResp = &core.DirectoryListResult{}
-
-	mgr := proxytest.NewManager(b, &proxy.BackendManagerConfig{
-		Storage: proxy.StorageDeps{
-			Backends: map[string]backend.ObjectBackend{},
-			Order:    []string{},
-		},
-		Stores: proxy.StoreDeps{
-			Metadata:  mockStore,
-			Dashboard: mockStore,
-		},
-		Policies: proxy.PolicyConfig{
+	st := proxytest.New(b, mockStore, &proxytest.StackOptions{
+		Runtime: proxytest.NewRuntime(&proxytest.RuntimeOptions{
+			Backends:        map[string]backend.ObjectBackend{},
+			Order:           []string{},
 			RoutingStrategy: config.RoutingPack,
-		},
-		Operations: proxy.OperationalDeps{
-			Metrics: mockStore,
-		},
+			Metrics:         mockStore,
+		}),
 	})
-	workers := proxytest.BuildWorkers(mgr, mockStore)
-	b.Cleanup(mgr.Close)
+	svc := testOps(st, proxytest.BuildWorkers(st, mockStore), mockStore)
 
 	cfg := &config.Config{
 		RoutingStrategy: config.RoutingPack,
 		Replication:     config.ReplicationConfig{Factor: 1},
 		RateLimit:       config.RateLimitConfig{Enabled: false},
+		Auth:            testRootAuth(),
 		UI: config.UIConfig{
 			Enabled:       true,
-			AdminKey:      testAdminKey,
-			AdminSecret:   string(bcryptHash),
 			SessionSecret: testSessionSecret,
 		},
 	}
 
-	h := New(&Deps{BackendOps: mgr, Objects: mgr.Objects(), Rebalancer: workers.Rebalancer, OverRep: workers.OverReplicationCleaner, AdminHandler: newSkippedAdminHandler(b), DBHealthy: func() bool { return true }, Cfg: cfg, LogBuffer: telemetry.NewLogBuffer()})
+	h := New(&Deps{Dashboard: testDashboard(st, mockStore), Sync: testSync(st, mockStore), Objects: svc.Objects, Integrity: svc.Integrity, Replication: svc.Replication, Rebalance: svc.Rebalance, Encryption: svc.Encryption, Compression: svc.Compression, DBHealthy: func() bool { return true }, Buckets: declaredFrom(cfg), Cfg: cfg, LogBuffer: telemetry.NewLogBuffer(), Registry: registryFrom(cfg)})
 	mux := http.NewServeMux()
 	h.Register(mux, "/ui")
 
@@ -2040,8 +1839,9 @@ func TestDownload_InvalidBucketPrefix(t *testing.T) {
 // Asserts that status = , want.
 func TestDownload_NotFound(t *testing.T) {
 	t.Parallel()
-	h, mux := newTestHandler(t)
-	// Default mock store returns ErrObjectNotFound for GetAllObjectLocations
+	h, mux, _ := newTestHandlerWithMock(t, func(m *storetest.MockMetadataStore) {
+		m.EXPECT().GetAllObjectLocations(gomock.Any(), gomock.Any()).Return(nil, core.ErrObjectNotFound).AnyTimes()
+	})
 	req := authedRequest(t, h, mux, http.MethodGet, "/ui/api/download?key=test-bucket/missing.txt", nil)
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
@@ -2055,8 +1855,9 @@ func TestDownload_NotFound(t *testing.T) {
 // Asserts that status = , want.
 func TestDownload_StoreError(t *testing.T) {
 	t.Parallel()
-	h, mux, mock := newTestHandlerWithMock(t)
-	mock.GetAllLocationsErr = errors.New("db down")
+	h, mux, _ := newTestHandlerWithMock(t, func(m *storetest.MockMetadataStore) {
+		m.EXPECT().GetAllObjectLocations(gomock.Any(), gomock.Any()).Return(nil, errors.New("db down")).AnyTimes()
+	})
 
 	req := authedRequest(t, h, mux, http.MethodGet, "/ui/api/download?key=test-bucket/file.txt", nil)
 	w := httptest.NewRecorder()
@@ -2137,7 +1938,7 @@ func TestLogin_BruteForceReset(t *testing.T) {
 	}
 
 	// Successful login resets counter
-	form := url.Values{"access_key": {testAdminKey}, "secret_key": {testAdminSecret}}
+	form := url.Values{"access_key": {testRootKey}, "secret_key": {testRootSecret}}
 	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/ui/login", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.RemoteAddr = addr
@@ -2167,9 +1968,10 @@ func TestLogin_BruteForceReset(t *testing.T) {
 // CLEAN-EXCESS (OVER-REPLICATION CLEANUP)
 // -------------------------------------------------------------------------
 
-// TestAPICleanExcess_FactorLeOne covers the short-circuit branch: with the
-// default replication factor of 1, the handler returns 200 immediately with
-// removed=0 rather than kicking off a background job.
+// TestAPICleanExcess_FactorLeOne covers the declined branch: with the default
+// replication factor of 1 there is no surplus to remove, so the run is
+// accepted and then reports itself skipped with a reason, which is what the
+// dashboard renders as a banner.
 func TestAPICleanExcess_FactorLeOne(t *testing.T) {
 	t.Parallel()
 	h, mux := newTestHandler(t)
@@ -2178,19 +1980,16 @@ func TestAPICleanExcess_FactorLeOne(t *testing.T) {
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
 
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202; body=%s", w.Code, w.Body.String())
 	}
-	var resp map[string]any
-	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
-		t.Fatalf("decode: %v", err)
+
+	res := waitForResult(t, h, opCleanExcess)
+	if res.Skipped == "" {
+		t.Error("skip reason is empty; want an explanation for the dashboard banner")
 	}
-	if resp["ok"] != true {
-		t.Errorf("ok = %v, want true", resp["ok"])
-	}
-	// Use JSON unmarshaling's json.Number behaviour: removed comes through as float64.
-	if removed, _ := resp["removed"].(float64); removed != 0 {
-		t.Errorf("removed = %v, want 0", resp["removed"])
+	if res.Counts.Count != 0 {
+		t.Errorf("removed = %d, want 0", res.Counts.Count)
 	}
 }
 
@@ -2257,4 +2056,25 @@ func TestAPICleanExcessStatus_RequiresAuth(t *testing.T) {
 	if w.Code != http.StatusUnauthorized && w.Code != http.StatusForbidden {
 		t.Errorf("status = %d, want 401/403", w.Code)
 	}
+}
+
+// declaredFrom builds the live bucket set the handler resolves a browsed key
+// against, holding what the config declares - the same translation registry
+// assembly applies before publishing it.
+func declaredFrom(cfg *config.Config) *provisioning.Declared {
+	d := provisioning.NewDeclared()
+	d.Set(provisioning.Merge(cfg.Buckets, config.AuthConfig{}, &provisioning.Snapshot{}).Buckets)
+	return d
+}
+
+// registryFrom builds the registry the handler logs in against, from the same
+// config it is otherwise wired with. A registry that cannot be assembled yields
+// no accessor, which is the pre-publication state a handler starts in.
+func registryFrom(cfg *config.Config) func() *auth.BucketRegistry {
+	v := provisioning.Merge(cfg.Buckets, cfg.Auth, &provisioning.Snapshot{})
+	br, err := auth.NewBucketRegistry(&v)
+	if err != nil {
+		return nil
+	}
+	return func() *auth.BucketRegistry { return br }
 }

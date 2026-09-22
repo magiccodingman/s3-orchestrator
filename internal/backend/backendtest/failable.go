@@ -36,7 +36,7 @@ var ErrSimulatedBackendFailure = errors.New("simulated backend failure")
 // keys so typos surface as compile errors.
 type Method int
 
-// MethodPut and related constants used by this package.
+// The backend methods a failure can be injected into.
 const (
 	MethodPut Method = iota
 	MethodGet
@@ -50,10 +50,10 @@ const (
 type FailableBackend struct {
 	backend.ObjectBackend
 
-	mu       sync.RWMutex
-	failAll  bool
+	mu         sync.RWMutex
+	failAll    bool
 	failAllErr error
-	perMethod map[Method]error
+	perMethod  map[Method]error
 }
 
 // New wraps the given backend. The returned FailableBackend passes through

@@ -11,11 +11,6 @@
 // States: closed (healthy) -> open (down) -> half-open (probing) -> closed.
 // -------------------------------------------------------------------------------
 
-// Package breaker implements a generic three-state circuit breaker (closed,
-// open, half-open) with pluggable error filters and probe jitter. The
-// breaker emits no metrics or events on its own  -  callers wire those via
-// the optional OnStateChange callback so this package stays free of
-// observability dependencies.
 package breaker
 
 import (
@@ -37,7 +32,7 @@ import (
 // State represents the current circuit breaker state.
 type State int
 
-// StateClosed and related constants used by this package.
+// The three circuit states, in the order the breaker cycles through them.
 const (
 	StateClosed   State = iota // healthy  -  all calls pass through
 	StateOpen                  // down  -  return sentinel error
@@ -344,7 +339,6 @@ func (cb *CircuitBreaker) ResetStaleProbe() bool {
 
 // transition changes the circuit state, emits structured logs, and notifies
 // the OnStateChange callback. Caller must hold cb.mu.
-//
 func (cb *CircuitBreaker) transition(to State) {
 	from := cb.state
 	cb.state = to
@@ -404,8 +398,8 @@ func (cb *CircuitBreaker) transition(to State) {
 // GENERIC CALL HELPERS
 // -------------------------------------------------------------------------
 
-// CBCall wraps a call that returns (T, error) with circuit breaker logic.
-func CBCall[T any](cb *CircuitBreaker, fn func() (T, error)) (T, error) {
+// Call wraps a call that returns (T, error) with circuit breaker logic.
+func (cb *CircuitBreaker) Call[T any](fn func() (T, error)) (T, error) {
 	var zero T
 	if err := cb.PreCheck(); err != nil {
 		return zero, err
@@ -414,8 +408,8 @@ func CBCall[T any](cb *CircuitBreaker, fn func() (T, error)) (T, error) {
 	return result, cb.PostCheck(err)
 }
 
-// CBCallNoResult wraps a call that returns only error with circuit breaker logic.
-func CBCallNoResult(cb *CircuitBreaker, fn func() error) error {
+// CallNoResult wraps a call that returns only error with circuit breaker logic.
+func (cb *CircuitBreaker) CallNoResult(fn func() error) error {
 	if err := cb.PreCheck(); err != nil {
 		return err
 	}
