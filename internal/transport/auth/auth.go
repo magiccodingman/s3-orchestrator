@@ -5,16 +5,13 @@
 //
 // Implements AWS SigV4 signature verification for S3 client compatibility. Parses
 // the Authorization header or presigned URL query parameters, reconstructs the
-// canonical request, and verifies the HMAC-SHA256 signature chain. Also supports
-// legacy X-Proxy-Token authentication for backward compatibility with simple
-// clients.
+// canonical request, and verifies the HMAC-SHA256 signature chain. A signature is
+// the only proof this accepts: one credential type reaches every surface.
 //
 // BucketRegistry maps client credentials to virtual buckets, enabling multi-tenant
 // access with per-bucket credential isolation.
 // -------------------------------------------------------------------------------
 
-// Package auth provides S3 SigV4 (header and presigned URL) and token-based
-// request authentication with multi-bucket credential resolution.
 package auth
 
 import (
@@ -24,15 +21,15 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/url"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/afreidah/s3-orchestrator/internal/config"
+	"github.com/afreidah/s3-orchestrator/internal/provisioning"
 )
 
 // sigV4MaxSkew is the maximum allowed clock skew for SigV4 request timestamps.
@@ -42,55 +39,168 @@ const sigV4MaxSkew = 15 * time.Minute
 // matching the AWS S3 limit).
 const presignedMaxExpiry = 7 * 24 * time.Hour
 
-// errAuthFailed and related constants used by this package.
+// The generic rejection message and the SigV4 Authorization scheme prefix.
 const (
 	errAuthFailed = "authentication failed"
 	sigV4Prefix   = "AWS4-HMAC-SHA256 "
+
+	// dummySecret keeps an unknown access key costing the same work as a known
+	// one, so response timing cannot be used to enumerate valid keys.
+	dummySecret = "dummy-secret-for-constant-time-auth"
 )
 
 // -------------------------------------------------------------------------
 // BUCKET REGISTRY
 // -------------------------------------------------------------------------
 
-// bucketEntry maps an access key to its bucket and signing secret.
-type bucketEntry struct {
-	BucketName      string
-	SecretAccessKey string
+// ErrDuplicateCredential means two config buckets claim the same client
+// credential, so no unambiguous identity exists for it.
+var ErrDuplicateCredential = errors.New("credential claimed by more than one bucket")
+
+// entry is one proof of an identity: the secret that verifies it and the user it
+// authenticates as. Several entries may share one user, which is what lets a
+// keypair be replaced while its siblings keep working.
+type entry struct {
+	secret string
+	user   *User
 }
 
-// BucketRegistry resolves client credentials to virtual bucket names.
+// BucketRegistry resolves client credentials to the identity behind them.
 type BucketRegistry struct {
-	byAccessKey    map[string]bucketEntry // access_key_id -> {bucket, secret}
-	byToken        map[string]string      // token -> bucket name
-	multipartLimit map[string]int         // bucket name -> max active multipart uploads (0 = unlimited)
+	byAccessKey    map[string]entry      // access_key_id -> identity and its secret
+	byUserID       map[string]*User      // user id -> identity, for a caller that proved itself another way
+	multipartLimit map[string]int        // bucket name -> max active multipart uploads (0 = unlimited)
+	notices        []provisioning.Notice // what registration found and served through anyway
 }
 
-// NewBucketRegistry builds a credential-to-bucket lookup from the config.
-func NewBucketRegistry(buckets []config.BucketConfig) *BucketRegistry {
+// NewBucketRegistry builds a credential-to-identity lookup from the merged view
+// of what a deployment declares. Both sources arrive in one shape, so the
+// request path has no second case to handle.
+//
+// Config wins a collision. A stored credential whose access key a config bucket
+// also declares is shadowed rather than rejected, because a deployment reaches
+// that state by editing a file rather than by doing anything wrong, and refusing
+// to start would take the fleet down over it. Two config credentials claiming
+// one access key is still an error: nothing decides between them, and config
+// validation rejects it first, so this is the backstop that keeps a gap there
+// from becoming a cross-bucket grant.
+func NewBucketRegistry(v *provisioning.View) (*BucketRegistry, error) {
 	br := &BucketRegistry{
-		byAccessKey:    make(map[string]bucketEntry),
-		byToken:        make(map[string]string),
+		byAccessKey:    make(map[string]entry),
+		byUserID:       make(map[string]*User, len(v.Users)),
 		multipartLimit: make(map[string]int),
+		notices:        slices.Clone(v.Notices),
 	}
 
-	for _, bkt := range buckets {
-		if bkt.MaxMultipartUploads > 0 {
-			br.multipartLimit[bkt.Name] = bkt.MaxMultipartUploads
-		}
-		for _, cred := range bkt.Credentials {
-			if cred.AccessKeyID != "" && cred.SecretAccessKey != "" {
-				br.byAccessKey[cred.AccessKeyID] = bucketEntry{
-					BucketName:      bkt.Name,
-					SecretAccessKey: cred.SecretAccessKey,
-				}
-			}
-			if cred.Token != "" {
-				br.byToken[cred.Token] = bkt.Name
-			}
+	for i := range v.Buckets {
+		if b := &v.Buckets[i]; b.MaxMultipartUploads > 0 {
+			br.multipartLimit[b.Name] = b.MaxMultipartUploads
 		}
 	}
 
-	return br
+	users := make(map[string]*User, len(v.Users))
+	for i := range v.Users {
+		u := &v.Users[i]
+		users[u.ID] = &User{
+			ID:         u.ID,
+			Name:       u.Name,
+			FromConfig: u.Source == provisioning.SourceConfig,
+			grants:     maps.Clone(u.Grants),
+			allBuckets: u.AllBuckets,
+			admin:      maps.Clone(u.Admin),
+		}
+		br.byUserID[u.ID] = users[u.ID]
+	}
+
+	// Config credentials claim their keys first, so a stored one colliding with
+	// a config one is the case that gets shadowed rather than the reverse.
+	if err := br.register(v.Credentials, users, provisioning.SourceConfig); err != nil {
+		return nil, err
+	}
+	if err := br.register(v.Credentials, users, provisioning.SourceStore); err != nil {
+		return nil, err
+	}
+	return br, nil
+}
+
+// Notices reports what assembly found and served through anyway, for the caller
+// that logs them at startup and after each reload.
+func (br *BucketRegistry) Notices() []provisioning.Notice {
+	return br.notices
+}
+
+// register adds every credential from one source, in the order that makes config
+// authoritative.
+func (br *BucketRegistry) register(creds []provisioning.Credential, users map[string]*User, src provisioning.Source) error {
+	for i := range creds {
+		c := &creds[i]
+		if c.Source != src {
+			continue
+		}
+		u, ok := users[c.UserID]
+		if !ok {
+			continue
+		}
+		if err := br.addKeypair(c, u); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// addKeypair registers a credential's access key, shadowing a stored one that
+// collides with config and refusing a collision between two config credentials.
+func (br *BucketRegistry) addKeypair(c *provisioning.Credential, u *User) error {
+	if c.AccessKeyID == "" || c.Secret == "" {
+		return nil
+	}
+	if prior, ok := br.byAccessKey[c.AccessKeyID]; ok {
+		if c.Source == provisioning.SourceStore {
+			br.notices = append(br.notices, provisioning.Notice{
+				Kind: provisioning.NoticeCredentialShadowed,
+				Detail: fmt.Sprintf("stored access key %q is shadowed by a config credential",
+					c.AccessKeyID),
+			})
+			return nil
+		}
+		return fmt.Errorf("%w: access key %q claimed by %q and %q",
+			ErrDuplicateCredential, c.AccessKeyID, prior.user.Name, u.Name)
+	}
+	br.byAccessKey[c.AccessKeyID] = entry{secret: c.Secret, user: u}
+	return nil
+}
+
+// UserByID returns the identity with the given id, for a caller that proved
+// itself by something other than a credential this registry holds - the shared
+// admin token, or a dashboard session naming the user it logged in as.
+//
+// It authenticates nothing on its own. Whatever proved the caller has already
+// done so; this only resolves the name to the grants behind it.
+func (br *BucketRegistry) UserByID(id string) (*User, bool) {
+	u, ok := br.byUserID[id]
+	return u, ok
+}
+
+// AuthenticateSecret verifies a keypair presented whole rather than used to
+// sign, which is what a form login submits.
+//
+// The secret is compared in constant time, and an unknown access key is
+// compared against a dummy of the same shape so both outcomes take the same
+// work. Without that, response timing would enumerate valid access keys.
+//
+// This is not a substitute for SigV4 on an API: presenting the secret exposes
+// it to anything on the path, which is acceptable for a browser posting over
+// TLS to the dashboard and is not acceptable for a client library.
+func (br *BucketRegistry) AuthenticateSecret(accessKey, secret string) (*User, error) {
+	e, ok := br.byAccessKey[accessKey]
+	known := e.secret
+	if !ok {
+		known = dummySecret
+	}
+	if subtle.ConstantTimeCompare([]byte(secret), []byte(known)) != 1 || !ok {
+		return nil, errors.New(errAuthFailed)
+	}
+	return e.user, nil
 }
 
 // MaxMultipartUploads returns the configured limit for active multipart
@@ -99,77 +209,54 @@ func (br *BucketRegistry) MaxMultipartUploads(bucket string) int {
 	return br.multipartLimit[bucket]
 }
 
-// AuthenticateAndResolveBucket authenticates the request and returns
-// the authorized bucket name plus, when the SigV4 seed signature
-// declares a streaming payload, the StreamingMaterial that the transport
-// layer needs to verify and decode the chunk chain. The streaming return
-// is nil for non-streaming requests, presigned URLs, and proxy-token
-// authentication.
-func (br *BucketRegistry) AuthenticateAndResolveBucket(r *http.Request) (string, *StreamingMaterial, error) {
+// Authenticate verifies the request and returns the identity behind the
+// credential that proved it, plus, when the SigV4 seed signature declares a
+// streaming payload, the StreamingMaterial the transport layer needs to verify
+// and decode the chunk chain. The streaming return is nil for non-streaming
+// requests, presigned URLs, and proxy-token authentication.
+//
+// Which buckets the caller may reach is the user's to answer, so the transport
+// asks it rather than comparing a name it was handed.
+func (br *BucketRegistry) Authenticate(r *http.Request) (*User, *StreamingMaterial, error) {
 	authHeader := r.Header.Get("Authorization")
 	if strings.HasPrefix(authHeader, sigV4Prefix) {
 		return br.authenticateSigV4(r, authHeader)
 	}
 	if isPresignedRequest(r) {
-		bucket, err := br.authenticatePresigned(r)
-		return bucket, nil, err
+		p, err := br.authenticatePresigned(r)
+		return p, nil, err
 	}
-	if proxyToken := r.Header.Get("X-Proxy-Token"); proxyToken != "" {
-		bucket, err := br.authenticateProxyToken(proxyToken)
-		return bucket, nil, err
-	}
-	return "", nil, fmt.Errorf("missing authentication credentials")
+	return nil, nil, fmt.Errorf("missing authentication credentials")
 }
 
 // authenticateSigV4 verifies a SigV4 Authorization header against the
 // registry. To prevent timing side-channels that could enumerate valid
 // access keys, the signature is always computed - with a dummy secret
 // when the key is unknown - so both paths take the same time.
-func (br *BucketRegistry) authenticateSigV4(r *http.Request, authHeader string) (string, *StreamingMaterial, error) {
+func (br *BucketRegistry) authenticateSigV4(r *http.Request, authHeader string) (*User, *StreamingMaterial, error) {
 	parts := authHeader[len(sigV4Prefix):]
 	credential, signedHeaders, signature := parseSigV4FieldsDirect(parts)
 	if credential == "" {
-		return "", nil, errors.New(errAuthFailed)
+		return nil, nil, errors.New(errAuthFailed)
 	}
 	accessKey, _, _ := strings.Cut(credential, "/")
 	if accessKey == "" {
-		return "", nil, errors.New(errAuthFailed)
+		return nil, nil, errors.New(errAuthFailed)
 	}
 
-	entry, ok := br.byAccessKey[accessKey]
-	secret := "dummy-secret-for-constant-time-auth"
+	e, ok := br.byAccessKey[accessKey]
+	secret := dummySecret
 	if ok {
-		secret = entry.SecretAccessKey
+		secret = e.secret
 	}
 	mat, err := verifySigV4Parsed(r,
 		keyMaterial{AccessKeyID: accessKey, SecretAccessKey: secret, Known: ok},
 		credential, signedHeaders, signature)
 	if err != nil || !ok {
-		return "", nil, errors.New(errAuthFailed)
+		return nil, nil, errors.New(errAuthFailed)
 	}
-	return entry.BucketName, mat, nil
+	return e.user, mat, nil
 }
-
-// authenticateProxyToken matches an X-Proxy-Token header against the
-// registry in constant time. Iterates every entry to avoid leaking which
-// token matched; ConstantTimeCompare requires equal-length inputs, so
-// mismatched lengths short-circuit without revealing the match position.
-func (br *BucketRegistry) authenticateProxyToken(proxyToken string) (string, error) {
-	var matchedBucket string
-	found := 0
-	for token, bucket := range br.byToken {
-		if len(token) == len(proxyToken) &&
-			subtle.ConstantTimeCompare([]byte(proxyToken), []byte(token)) == 1 {
-			matchedBucket = bucket
-			found = 1
-		}
-	}
-	if found == 1 {
-		return matchedBucket, nil
-	}
-	return "", fmt.Errorf("invalid authentication token")
-}
-
 
 // -------------------------------------------------------------------------
 // SIGV4 VERIFICATION
@@ -206,6 +293,11 @@ type keyMaterial struct {
 // VerifySigV4 checks an AWS Signature Version 4 Authorization header against
 // the provided credentials. The caller is responsible for resolving the correct
 // credentials via BucketRegistry. Returns nil if the signature is valid.
+//
+// The request path reaches the same check through verifySigV4Parsed, which
+// takes the header already split. This form is kept for callers holding only a
+// request - tests, and anything embedding the package - and is deliberately
+// exported rather than left as an accident of refactoring.
 func VerifySigV4(r *http.Request, accessKeyID, secretAccessKey string) error {
 	authHeader := r.Header.Get("Authorization")
 	if authHeader == "" {
@@ -321,7 +413,7 @@ func isPresignedRequest(r *http.Request) bool {
 
 // authenticatePresigned extracts SigV4 credentials from query string
 // parameters and verifies the presigned URL signature.
-func (br *BucketRegistry) authenticatePresigned(r *http.Request) (string, error) {
+func (br *BucketRegistry) authenticatePresigned(r *http.Request) (*User, error) {
 	q := r.URL.Query()
 	credential := q.Get("X-Amz-Credential")
 	signedHeaders := q.Get("X-Amz-SignedHeaders")
@@ -330,27 +422,27 @@ func (br *BucketRegistry) authenticatePresigned(r *http.Request) (string, error)
 	expires := q.Get("X-Amz-Expires")
 
 	if credential == "" || signedHeaders == "" || signature == "" || amzDate == "" || expires == "" {
-		return "", errors.New(errAuthFailed)
+		return nil, errors.New(errAuthFailed)
 	}
 
 	accessKey, _, _ := strings.Cut(credential, "/")
 	if accessKey == "" {
-		return "", errors.New(errAuthFailed)
+		return nil, errors.New(errAuthFailed)
 	}
 
-	entry, ok := br.byAccessKey[accessKey]
-	secret := "dummy-secret-for-constant-time-auth"
+	e, ok := br.byAccessKey[accessKey]
+	secret := dummySecret
 	if ok {
-		secret = entry.SecretAccessKey
+		secret = e.secret
 	}
 
 	if err := verifyPresignedSigV4(r,
 		keyMaterial{AccessKeyID: accessKey, SecretAccessKey: secret, Known: ok},
 		credential, signedHeaders, signature, amzDate, expires); err != nil || !ok {
-		return "", errors.New(errAuthFailed)
+		return nil, errors.New(errAuthFailed)
 	}
 
-	return entry.BucketName, nil
+	return e.user, nil
 }
 
 // verifyPresignedSigV4 verifies a presigned URL signature. Unlike header-based
@@ -464,20 +556,6 @@ func writeCanonicalHeadersAndSigned(b *strings.Builder, r *http.Request, signedH
 // HELPERS
 // -------------------------------------------------------------------------
 
-// parseSigV4Fields extracts key=value pairs from the SigV4 auth header.
-// Retained for use by extractAccessKey which only needs the Credential field.
-func parseSigV4Fields(s string) map[string]string {
-	fields := make(map[string]string)
-	for part := range strings.SplitSeq(s, ",") {
-		part = strings.TrimSpace(part)
-		idx := strings.IndexByte(part, '=')
-		if idx > 0 {
-			fields[part[:idx]] = part[idx+1:]
-		}
-	}
-	return fields
-}
-
 // parseSigV4FieldsDirect extracts Credential, SignedHeaders, and Signature
 // from the SigV4 auth header without allocating a map.
 func parseSigV4FieldsDirect(s string) (credential, signedHeaders, signature string) {
@@ -548,7 +626,7 @@ func buildCanonicalQueryString(b *strings.Builder, values url.Values) {
 			params = append(params, sigV4Encode(k)+"="+sigV4Encode(v))
 		}
 	}
-	sort.Strings(params)
+	slices.Sort(params)
 	for i, p := range params {
 		if i > 0 {
 			b.WriteByte('&')
@@ -588,6 +666,9 @@ func encodePath(b *strings.Builder, wirePath string) {
 		b.WriteByte('/')
 		return
 	}
+	// Index-controlled rather than range: the already-encoded-triplet case
+	// advances i past the two hex digits it consumed, which range-over-int
+	// would ignore.
 	for i := 0; i < len(wirePath); i++ {
 		c := wirePath[i]
 		switch {

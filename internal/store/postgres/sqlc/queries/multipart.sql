@@ -10,22 +10,24 @@
 -- -----------------------------------------------------------------------------
 
 -- name: CreateMultipartUpload :exec
-INSERT INTO multipart_uploads (upload_id, object_key, backend_name, content_type, metadata, encryption_key, key_id, created_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, NOW());
+INSERT INTO multipart_uploads (upload_id, object_key, backend_name, content_type, metadata, encryption_key, key_id, tagging, created_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW());
 
 -- name: GetMultipartUpload :one
-SELECT upload_id, object_key, backend_name, content_type, metadata, encryption_key, key_id, created_at
+-- tagging rides along because CompleteMultipartUpload applies the set the
+-- create call carried; the other reads have no use for it and omit it.
+SELECT upload_id, object_key, backend_name, content_type, metadata, encryption_key, key_id, tagging, created_at
 FROM multipart_uploads
 WHERE upload_id = $1;
 
 -- name: UpsertPart :exec
-INSERT INTO multipart_parts (upload_id, part_number, etag, size_bytes, encrypted, encryption_key, key_id, plaintext_size, created_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+INSERT INTO multipart_parts (upload_id, part_number, etag, plaintext_etag, size_bytes, encrypted, encryption_key, key_id, plaintext_size, created_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
 ON CONFLICT (upload_id, part_number) DO UPDATE SET
-    etag = $3, size_bytes = $4, encrypted = $5, encryption_key = $6, key_id = $7, plaintext_size = $8, created_at = NOW();
+    etag = $3, plaintext_etag = $4, size_bytes = $5, encrypted = $6, encryption_key = $7, key_id = $8, plaintext_size = $9, created_at = NOW();
 
 -- name: GetParts :many
-SELECT part_number, etag, size_bytes, encrypted, encryption_key, key_id, plaintext_size, created_at
+SELECT part_number, etag, plaintext_etag, size_bytes, encrypted, encryption_key, key_id, plaintext_size, created_at
 FROM multipart_parts
 WHERE upload_id = $1
 ORDER BY part_number;

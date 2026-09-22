@@ -11,7 +11,7 @@
 # artifact and a deployable container.
 # -------------------------------------------------------------------------------
 
-FROM --platform=$BUILDPLATFORM golang:1.26.5 AS godoc
+FROM --platform=$BUILDPLATFORM golang:1.27.0 AS godoc
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
@@ -28,7 +28,8 @@ RUN mkdir -p /godoc && \
         | sort \
         | while read pkg; do \
             name=$(basename "$pkg"); \
-            printf -- '---\ntitle: "%s"\n---\n\n' "$name" > /godoc/$name.md; \
+            doc=$(go list -f '{{.Doc}}' ./internal/$pkg | sed 's/"/\\"/g'); \
+            printf -- '---\ntitle: "%s"\ndescription: "%s"\n---\n\n' "$name" "$doc" > /godoc/$name.md; \
             gomarkdoc ./internal/$pkg >> /godoc/$name.md; \
             sed -i '/^# '"$name"'$/d' /godoc/$name.md; \
         done
@@ -52,4 +53,5 @@ FROM nginx:alpine
 ARG APK_CACHEBUST=0
 RUN APK_CACHEBUST="$APK_CACHEBUST" apk upgrade --no-cache
 COPY --from=build /src/web/public /usr/share/nginx/html
+COPY web/nginx-cache.conf /etc/nginx/conf.d/nginx-cache.conf
 EXPOSE 80

@@ -26,9 +26,20 @@ import (
 	"github.com/afreidah/s3-orchestrator/internal/encryption"
 	"github.com/afreidah/s3-orchestrator/internal/observe/logfmt"
 	"github.com/afreidah/s3-orchestrator/internal/proxy/readpath"
+	"github.com/afreidah/s3-orchestrator/internal/s3op"
 	"github.com/afreidah/s3-orchestrator/internal/store/core"
 	"github.com/afreidah/s3-orchestrator/internal/util/must"
 	"github.com/afreidah/s3-orchestrator/internal/util/syncutil"
+)
+
+// Single-operation admission sets. Package-level so the read and write paths
+// do not allocate a one-element slice per request just to name the operation
+// they are asking about.
+var (
+	getObjectOp  = []s3op.Operation{s3op.GetObject}
+	headObjectOp = []s3op.Operation{s3op.HeadObject}
+	putObjectOp  = []s3op.Operation{s3op.PutObject}
+	copyObjectOp = []s3op.Operation{s3op.CopyObject}
 )
 
 // managerSpanPrefix is prepended to every OpenTelemetry span name the
@@ -37,24 +48,29 @@ import (
 // GetObject") in the same end-to-end trace.
 const managerSpanPrefix = "Manager "
 
-// ObjectStores is the narrow persistence surface object.Manager needs: object
+// Stores is the narrow persistence surface object.Manager needs: object
 // CRUD + list, plus quota stats. Declared locally so the manager does
 // not pull in the full MetadataStore.
-type ObjectStores interface {
+type Stores interface {
 	core.ObjectStore
 	core.QuotaStore
+	core.TagStore
 }
 
 // Manager handles object-level CRUD operations with read failover,
 // broadcast reads during degraded mode, and location caching.
 type Manager struct {
-	core              ObjectRuntime     // infrastructure subset: backends, usage, timeout, eligibility, error classification, metrics
-	coord             ObjectCoordinator // write-path helpers shared with BackendManager and MultipartManager
-	stores            ObjectStores      // direct store access for read paths and quota inspection
+	core              Runtime     // infrastructure subset: backends, usage, timeout, eligibility, error classification, metrics
+	coord             Coordinator // write-path helpers shared with the multipart manager
+	stores            Stores      // direct store access for read paths and quota inspection
 	encryptor         *encryption.Encryptor
+	codec             Codec
+	compression       config.CompressionConfig
 	cache             *LocationCache
 	objectCache       objcache.ObjectCache // nil when object data caching is disabled
 	parallelBroadcast bool
+	copiesPerWrite    int // 1 leaves every copy after the first to the replicator
+	detached          DetachedRegistry
 	integrityCfg      *syncutil.AtomicConfig[config.IntegrityConfig]
 	failover          *readpath.Failover // per-key read failover + degraded-mode broadcast orchestrator
 	log               *slog.Logger
@@ -63,25 +79,30 @@ type Manager struct {
 // Deps bundles the dependencies New needs so the call signature stays
 // under the parameter-count ceiling. Core and Coord are
 // consumer-declared interfaces; the concrete *infra.BackendRuntime and
-// *writepath.Coordinator that BackendManager builds satisfy them
-// implicitly.
+// *writepath.Coordinator that DI builds satisfy them implicitly.
+//
+// A nil Codec disables compression in both directions. It is supplied even
+// when compression is off for new writes, because objects already stored
+// encoded still have to be decoded on read.
 type Deps struct {
-	Core              ObjectRuntime
-	BroadcastCore     readpath.ReadRuntime // narrow consumer interface for the failover broadcaster; satisfied by the same *infra.BackendRuntime that backs Core
-	Coord             ObjectCoordinator
-	Stores            ObjectStores
-	Encryptor         *encryption.Encryptor
+	Core          Runtime
+	BroadcastCore readpath.ReadRuntime // narrow consumer interface for the failover broadcaster; satisfied by the same *infra.BackendRuntime that backs Core
+	Coord         Coordinator
+	Stores        Stores
+	Encryptor     *encryption.Encryptor
+
+	Codec             Codec // supplied even when compression is off for writes: already-encoded objects still have to be read
+	Compression       config.CompressionConfig
 	LocationCache     *LocationCache
 	ObjectCache       objcache.ObjectCache
 	ParallelBroadcast bool
-	// DegradedBroadcastParallelism caps concurrent probes during
-	// parallel degraded-mode broadcasts. 0 = uncapped.
-	DegradedBroadcastParallelism int
-	// DisableDegradedReads makes the degraded path fail fast instead of broadcasting.
-	DisableDegradedReads bool
-	IntegrityCfg         *syncutil.AtomicConfig[config.IntegrityConfig]
-	// BackendTimeout bounds the degraded-mode loser-drain goroutine.
-	BackendTimeout time.Duration
+	CopiesPerWrite    int              // how many copies a PUT places itself; 0 and 1 both mean one
+	Detached          DetachedRegistry // required once CopiesPerWrite is above 1
+
+	DegradedBroadcastParallelism int  // caps concurrent probes; 0 is uncapped
+	DisableDegradedReads         bool // fail fast instead of broadcasting
+	IntegrityCfg                 *syncutil.AtomicConfig[config.IntegrityConfig]
+	BackendTimeout               time.Duration // bounds the degraded-mode loser-drain goroutine
 }
 
 // New creates a Manager sharing the given core infrastructure and
@@ -99,14 +120,23 @@ func New(d *Deps) *Manager {
 	must.NotNil("d.Stores", d.Stores)
 	must.NotNil("d.LocationCache", d.LocationCache)
 	must.NotNil("d.IntegrityCfg", d.IntegrityCfg)
+	// Only the fan-out reaches for it, so a deployment that never fans out is
+	// not made to wire one.
+	if d.CopiesPerWrite > 1 {
+		must.NotNil("d.Detached", d.Detached)
+	}
 	return &Manager{
 		core:              d.Core,
 		coord:             d.Coord,
 		stores:            d.Stores,
 		encryptor:         d.Encryptor,
+		codec:             d.Codec,
+		compression:       d.Compression,
 		cache:             d.LocationCache,
 		objectCache:       d.ObjectCache,
 		parallelBroadcast: d.ParallelBroadcast,
+		copiesPerWrite:    max(d.CopiesPerWrite, 1),
+		detached:          d.Detached,
 		integrityCfg:      d.IntegrityCfg,
 		failover: readpath.New(&readpath.FailoverDeps{
 			Core:                         d.BroadcastCore,
@@ -133,8 +163,8 @@ func (o *Manager) invalidateObjectCaches(key string) {
 }
 
 // LocationCache returns the location cache the manager holds. Exposed for
-// BackendManager and tests so the lifecycle (Close, Clear) can be driven
-// from the root package without reaching into the unexported field.
+// the runtime, DI reload hooks, and tests so the lifecycle (Close, Clear)
+// can be driven without reaching into the unexported field.
 func (o *Manager) LocationCache() *LocationCache {
 	return o.cache
 }
@@ -147,7 +177,7 @@ func (o *Manager) LocationCache() *LocationCache {
 // size. Used by the HTTP handler to reject uploads before the request body
 // is transmitted (Expect: 100-Continue support).
 func (o *Manager) CanAcceptWrite(size int64) bool {
-	return len(o.core.EligibleForWrite(1, 0, size)) > 0
+	return len(o.core.EligibleForWrite(putObjectOp, 0, size)) > 0
 }
 
 // BackendCapacityStats returns the current per-backend used/limit byte

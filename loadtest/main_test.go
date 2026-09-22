@@ -9,6 +9,8 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -212,4 +214,151 @@ func TestWriteJSON_RoundTrip(t *testing.T) {
 	if got.Hardware.OS == "" {
 		t.Error("hardware fingerprint lost in round-trip")
 	}
+}
+
+// TestEnforceErrorBudget_FailsAboveBudget verifies a run that completed while
+// failing a large share of its requests is reported as a failure. This is the
+// gate that was missing: a scenario used to pass purely because the binary ran
+// to completion.
+func TestEnforceErrorBudget_FailsAboveBudget(t *testing.T) {
+	results := &sweepResults{Results: []runResult{
+		{SizeBytes: 1024, RequestedRPS: 200, ErrorRate: 0.0},
+		{SizeBytes: 65536, RequestedRPS: 200, ErrorRate: 0.2699},
+	}}
+	err := enforceErrorBudget(results, 0.01, false)
+	if err == nil {
+		t.Fatal("26.99% errors against a 1% budget must fail")
+	}
+	// The message has to name the offending step and both numbers, or the
+	// summary tells an operator nothing about which size blew the budget.
+	for _, want := range []string{"65536", "26.99", "1.00"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q missing %q", err, want)
+		}
+	}
+}
+
+// TestEnforceErrorBudget_PassesWithinBudget verifies a clean run is unaffected.
+func TestEnforceErrorBudget_PassesWithinBudget(t *testing.T) {
+	results := &sweepResults{Results: []runResult{
+		{SizeBytes: 1024, ErrorRate: 0.0},
+		{SizeBytes: 65536, ErrorRate: 0.005},
+	}}
+	if err := enforceErrorBudget(results, 0.01, false); err != nil {
+		t.Errorf("a run inside its budget must pass, got %v", err)
+	}
+}
+
+// TestEnforceErrorBudget_ZeroDisables verifies the budget can be turned off,
+// which is how ad-hoc measurement runs opt out of the gate.
+func TestEnforceErrorBudget_ZeroDisables(t *testing.T) {
+	results := &sweepResults{Results: []runResult{{ErrorRate: 1.0}}}
+	if err := enforceErrorBudget(results, 0, false); err != nil {
+		t.Errorf("a zero budget disables the gate, got %v", err)
+	}
+}
+
+// TestEnforceErrorBudget_RampExempt verifies a ramp run is never failed by the
+// budget. Ramps drive the system into saturation on purpose, so a high error
+// rate at the top of the ramp is the measurement, not a fault.
+func TestEnforceErrorBudget_RampExempt(t *testing.T) {
+	results := &sweepResults{Results: []runResult{
+		{RequestedRPS: 4800, ErrorRate: 0.42},
+	}}
+	if err := enforceErrorBudget(results, 0.01, true); err != nil {
+		t.Errorf("a ramp run must be exempt from the budget, got %v", err)
+	}
+}
+
+// TestEnforceErrorBudget_BoundaryIsInclusive verifies a run sitting exactly on
+// its budget passes, so the threshold reads as "at most this much".
+func TestEnforceErrorBudget_BoundaryIsInclusive(t *testing.T) {
+	results := &sweepResults{Results: []runResult{{ErrorRate: 0.01}}}
+	if err := enforceErrorBudget(results, 0.01, false); err != nil {
+		t.Errorf("exactly at budget must pass, got %v", err)
+	}
+}
+
+// TestNeedsSeeding covers which operations require a pre-existing working set.
+// The tagging scenario tags objects that already exist, so it seeds; the
+// inline-tagging PUT creates its own objects and does not.
+func TestNeedsSeeding(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		op   string
+		want bool
+	}{
+		{"put", false},
+		{"puttagged", false},
+		{"get", true},
+		{"mixed", true},
+		{"listobjects", true},
+		{"tagging", true},
+	}
+	for _, tc := range tests {
+		if got := needsSeeding(tc.op); got != tc.want {
+			t.Errorf("needsSeeding(%q) = %v, want %v", tc.op, got, tc.want)
+		}
+	}
+}
+
+// TestNewBody_RandomByDefault verifies the default payload stays random, since
+// that is what measures the write path without an encoder shortening it.
+func TestNewBody_RandomByDefault(t *testing.T) {
+	body, err := newBody(4096, 0)
+	if err != nil {
+		t.Fatalf("newBody: %v", err)
+	}
+	if len(body) != 4096 {
+		t.Fatalf("body is %d bytes, want 4096", len(body))
+	}
+	if compressedFraction(t, body) < 0.9 {
+		t.Error("the default body compressed, so it was not random")
+	}
+}
+
+// TestNewBody_CompressibleShrinks verifies a body asked to be compressible
+// actually encodes smaller. Without it the suite measures compression only as
+// the cost of declining, never as the work of encoding.
+func TestNewBody_CompressibleShrinks(t *testing.T) {
+	body, err := newBody(64<<10, 0.8)
+	if err != nil {
+		t.Fatalf("newBody: %v", err)
+	}
+	if len(body) != 64<<10 {
+		t.Fatalf("body is %d bytes, want %d", len(body), 64<<10)
+	}
+	if got := compressedFraction(t, body); got > 0.5 {
+		t.Errorf("body encoded to %.2f of its size at compressible=0.8, want well under half", got)
+	}
+}
+
+// TestNewBody_FullyCompressible verifies the ceiling is handled: a fraction of
+// 1 fills the whole body rather than running past the end of it.
+func TestNewBody_FullyCompressible(t *testing.T) {
+	body, err := newBody(8192, 1)
+	if err != nil {
+		t.Fatalf("newBody: %v", err)
+	}
+	if len(body) != 8192 {
+		t.Fatalf("body is %d bytes, want 8192", len(body))
+	}
+	if got := compressedFraction(t, body); got > 0.2 {
+		t.Errorf("a fully repetitive body encoded to %.2f of its size", got)
+	}
+}
+
+// compressedFraction reports what share of its size a body keeps once gzipped,
+// which stands in for what the orchestrator's encoder would make of it.
+func compressedFraction(t *testing.T, body []byte) float64 {
+	t.Helper()
+	var buf bytes.Buffer
+	w := gzip.NewWriter(&buf)
+	if _, err := w.Write(body); err != nil {
+		t.Fatalf("compress: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("close compressor: %v", err)
+	}
+	return float64(buf.Len()) / float64(len(body))
 }

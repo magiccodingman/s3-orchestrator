@@ -16,6 +16,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -58,19 +59,28 @@ func (s *Store) GetObjectBackendsForKeys(ctx context.Context, keys []string) (ma
 	if err != nil {
 		return nil, fmt.Errorf("failed to get object backends for keys: %w", err)
 	}
-	defer rows.Close()
-	out := make(map[string][]string, len(keys))
-	for rows.Next() {
-		var key, backend string
-		if err := rows.Scan(&key, &backend); err != nil {
-			return nil, fmt.Errorf("failed to scan key/backend pair: %w", err)
+	pairs, err := collectRows(rows, "key/backend rows", func(rows *sql.Rows) (keyBackend, error) {
+		var kb keyBackend
+		if err := rows.Scan(&kb.key, &kb.backend); err != nil {
+			return keyBackend{}, fmt.Errorf("failed to scan key/backend pair: %w", err)
 		}
-		out[key] = append(out[key], backend)
+		return kb, nil
+	})
+	if err != nil {
+		return nil, err
 	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("failed to iterate key/backend rows: %w", err)
+	out := make(map[string][]string, len(keys))
+	for _, kb := range pairs {
+		out[kb.key] = append(out[kb.key], kb.backend)
 	}
 	return out, nil
+}
+
+// keyBackend is one (object_key, backend_name) row, grouped into the
+// key -> backends map the caller asked for once the page has been read.
+type keyBackend struct {
+	key     string
+	backend string
 }
 
 // GetAllObjectLocations returns all copies of an object, ordered by created_at
@@ -78,59 +88,23 @@ func (s *Store) GetObjectBackendsForKeys(ctx context.Context, keys []string) (ma
 func (s *Store) GetAllObjectLocations(ctx context.Context, key string) ([]core.ObjectLocation, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT object_key, backend_name, size_bytes, encrypted, encryption_key,
-		       key_id, plaintext_size, content_hash, created_at
+		       key_id, plaintext_size, content_hash,
+		       compression_algorithm, compression_level, compression_format_version, logical_size,
+		       created_at, last_scrubbed_at, etag, content_type, user_metadata
 		FROM object_locations
 		WHERE object_key = ?
 		ORDER BY created_at ASC`, key)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get object locations: %w", err)
 	}
-	defer rows.Close()
-
-	var locs []core.ObjectLocation
-	for rows.Next() {
-		loc, err := scanObjectLocation(rows)
-		if err != nil {
-			return nil, err
-		}
-		locs = append(locs, loc)
+	locs, err := collectRows(rows, rowsObjectLocations, scanIdentifiedObjectLocation)
+	if err != nil {
+		return nil, err
 	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("failed to iterate object locations: %w", err)
-	}
-
 	if len(locs) == 0 {
 		return nil, core.ErrObjectNotFound
 	}
 	return locs, nil
-}
-
-// -------------------------------------------------------------------------
-// WRITE OPERATIONS
-// -------------------------------------------------------------------------
-
-// RecordObject delegates to core.RecordObject which composes the
-// engine-agnostic transactional sequence against the SQLite TxAdapter.
-func (s *Store) RecordObject(ctx context.Context, key, backend string, size int64, enc *core.EncryptionMeta) ([]core.DeletedCopy, error) {
-	return core.RecordObject(ctx, s, key, backend, size, enc)
-}
-
-// RecordObjectAndClearPending delegates to core. Inside the same
-// transaction the pending row is deleted so the intent never outlives
-// a committed location.
-func (s *Store) RecordObjectAndClearPending(ctx context.Context, key, backend string, size int64, enc *core.EncryptionMeta, intentID string) ([]core.DeletedCopy, error) {
-	return core.RecordObjectAndClearPending(ctx, s, key, backend, size, enc, intentID)
-}
-
-// DeleteObject delegates to core.DeleteObject.
-func (s *Store) DeleteObject(ctx context.Context, key string) ([]core.DeletedCopy, error) {
-	return core.DeleteObject(ctx, s, key)
-}
-
-// DeleteObjectsBatch delegates to core.DeleteObjectsBatch which
-// removes every supplied key in one transaction.
-func (s *Store) DeleteObjectsBatch(ctx context.Context, keys []string) (map[string][]core.DeletedCopy, error) {
-	return core.DeleteObjectsBatch(ctx, s, keys)
 }
 
 // -------------------------------------------------------------------------
@@ -150,7 +124,7 @@ func (s *Store) ListObjects(ctx context.Context, prefix, startAfter string, maxK
 
 	// Subquery with GROUP BY + MIN(rowid) replaces DISTINCT ON (object_key).
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT ol.object_key, ol.backend_name, ol.size_bytes, ol.created_at
+		SELECT ol.object_key, ol.backend_name, ol.size_bytes, ol.created_at, ol.etag
 		FROM object_locations ol
 		INNER JOIN (
 			SELECT object_key, MIN(rowid) AS min_rowid
@@ -166,11 +140,25 @@ func (s *Store) ListObjects(ctx context.Context, prefix, startAfter string, maxK
 	}
 	defer rows.Close()
 
-	objects, err := scanSlimObjectLocations(rows)
+	objects, err := scanListedObjectLocations(rows)
 	if err != nil {
 		return nil, err
 	}
 	return core.BuildListPage(objects, maxKeys), nil
+}
+
+// CountObjectsByPrefix returns how many distinct keys live under a prefix,
+// which is what answers whether a bucket still holds anything.
+func (s *Store) CountObjectsByPrefix(ctx context.Context, prefix string) (int64, error) {
+	var n int64
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(DISTINCT object_key)
+		FROM object_locations
+		WHERE object_key LIKE ? || '%' ESCAPE '\'`, likeEscaper.Replace(prefix)).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("failed to count objects by prefix: %w", err)
+	}
+	return n, nil
 }
 
 // ListObjectsDelimited groups a delimiter listing inside SQLite with a recursive
@@ -225,7 +213,7 @@ func (s *Store) ListObjectsDelimited(ctx context.Context, prefix, delimiter, sta
 					|| char(unicode(substr(w.k, length(:prefix) + instr(substr(w.k, length(:prefix) + 1), :delim) + length(:delim) - 1, 1)) + 1)
 				ELSE w.k
 			END AS skip_bound,
-			ol.backend_name, ol.size_bytes, ol.created_at
+			ol.backend_name, ol.size_bytes, ol.created_at, ol.etag
 		FROM walk w
 		LEFT JOIN object_locations ol ON ol.rowid = (
 			SELECT MIN(rowid) FROM object_locations o2
@@ -258,8 +246,7 @@ func (s *Store) ListObjectsDelimited(ctx context.Context, prefix, delimiter, sta
 // scanDelimitedEntries reads the loose-index-scan rows. Leaf columns are NULL on
 // CommonPrefix rows (the LEFT JOIN only matches leaves).
 func scanDelimitedEntries(rows *sql.Rows) ([]core.DelimitedEntry, error) {
-	var entries []core.DelimitedEntry
-	for rows.Next() {
+	return collectRows(rows, "delimited entries", func(rows *sql.Rows) (core.DelimitedEntry, error) {
 		var (
 			key       string
 			isPrefix  int
@@ -268,9 +255,10 @@ func scanDelimitedEntries(rows *sql.Rows) ([]core.DelimitedEntry, error) {
 			backend   sql.NullString
 			sizeBytes sql.NullInt64
 			createdAt sql.NullString
+			etag      sql.NullString
 		)
-		if err := rows.Scan(&key, &isPrefix, &commonPfx, &skipBound, &backend, &sizeBytes, &createdAt); err != nil {
-			return nil, fmt.Errorf("failed to scan delimited entry: %w", err)
+		if err := rows.Scan(&key, &isPrefix, &commonPfx, &skipBound, &backend, &sizeBytes, &createdAt, &etag); err != nil {
+			return core.DelimitedEntry{}, fmt.Errorf("failed to scan delimited entry: %w", err)
 		}
 		e := core.DelimitedEntry{IsPrefix: isPrefix != 0, CommonPrefix: commonPfx.String, SkipBound: skipBound}
 		if !e.IsPrefix {
@@ -279,24 +267,34 @@ func scanDelimitedEntries(rows *sql.Rows) ([]core.DelimitedEntry, error) {
 			e.Leaf.SizeBytes = sizeBytes.Int64
 			t, parseErr := parseTime(createdAt.String)
 			if parseErr != nil {
-				return nil, fmt.Errorf(errInvalidTimestamp, createdAt.String, parseErr)
+				return core.DelimitedEntry{}, fmt.Errorf(errInvalidTimestamp, createdAt.String, parseErr)
 			}
 			e.Leaf.CreatedAt = t
+			e.Leaf.Identity = listedIdentity(etag)
 		}
-		entries = append(entries, e)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("failed to iterate delimited entries: %w", err)
-	}
-	return entries, nil
+		return e, nil
+	})
 }
 
-// ListExpiredObjects returns one row per unique key matching the given prefix
-// whose created_at is older than cutoff, up to limit rows. Used by lifecycle
-// expiration to find objects eligible for deletion.
-func (s *Store) ListExpiredObjects(ctx context.Context, prefix string, cutoff time.Time, limit int) ([]core.ObjectLocation, error) {
-	escapedPrefix := likeEscaper.Replace(prefix)
-	cutoffStr := cutoff.UTC().Format(time.RFC3339Nano)
+// ListExpiredObjects returns one row per unique key matching the query's
+// filters whose created_at is older than its cutoff, up to Limit rows. Used by
+// lifecycle expiration to find objects eligible for deletion.
+//
+// One EXISTS per tag, all required, which is what makes several tags an
+// intersection. EXISTS rather than a join because the dedup subquery groups by
+// object_key and a join would multiply its input row per matching tag.
+func (s *Store) ListExpiredObjects(ctx context.Context, q core.ExpiredObjectsQuery) ([]core.ObjectLocation, error) {
+	args := []any{likeEscaper.Replace(q.Prefix), formatTime(q.Cutoff)}
+
+	var tagFilter strings.Builder
+	for _, key := range sortedTagKeys(q.Tags) {
+		tagFilter.WriteString(`
+			  AND EXISTS (SELECT 1 FROM object_tags t
+			              WHERE t.object_key = object_locations.object_key
+			                AND t.tag_key = ? AND t.tag_value = ?)`)
+		args = append(args, key, q.Tags[key])
+	}
+	args = append(args, q.Limit)
 
 	// Subquery with GROUP BY + MIN(rowid) replaces DISTINCT ON (object_key).
 	rows, err := s.db.QueryContext(ctx, `
@@ -306,11 +304,11 @@ func (s *Store) ListExpiredObjects(ctx context.Context, prefix string, cutoff ti
 			SELECT object_key, MIN(rowid) AS min_rowid
 			FROM object_locations
 			WHERE object_key LIKE ? || '%' ESCAPE '\'
-			  AND created_at < ?
+			  AND created_at < ?`+tagFilter.String()+`
 			GROUP BY object_key
 		) dedup ON ol.rowid = dedup.min_rowid
 		ORDER BY ol.object_key
-		LIMIT ?`, escapedPrefix, cutoffStr, limit)
+		LIMIT ?`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list expired objects: %w", err)
 	}
@@ -319,13 +317,26 @@ func (s *Store) ListExpiredObjects(ctx context.Context, prefix string, cutoff ti
 	return scanSlimObjectLocations(rows)
 }
 
+// sortedTagKeys orders a tag filter's keys so the generated SQL and its
+// arguments are identical run to run, which keeps the statement cacheable and
+// a failure reproducible.
+func sortedTagKeys(tags map[string]string) []string {
+	keys := make([]string, 0, len(tags))
+	for k := range tags {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
 // ListObjectsByBackend returns objects stored on a specific backend, ordered by
-// size ascending (smallest first). Used by the rebalancer to find movable objects.
+// size ascending (smallest first). Backs the rebalance, placement and drain
+// candidate scans, so it returns managed rows only.
 func (s *Store) ListObjectsByBackend(ctx context.Context, backendName string, limit int) ([]core.ObjectLocation, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT object_key, backend_name, size_bytes, created_at
 		FROM object_locations
-		WHERE backend_name = ?
+		WHERE backend_name = ? AND managed
 		ORDER BY size_bytes ASC
 		LIMIT ?`, backendName, limit)
 	if err != nil {
@@ -356,51 +367,59 @@ func (s *Store) ListObjectsByBackendKeyAsc(ctx context.Context, backendName, aft
 	return scanSlimObjectLocations(rows)
 }
 
-// scanSlimObjectLocations consumes a *sql.Rows holding the slim
-// (object_key, backend_name, size_bytes, created_at) projection used by
-// ListObjects, ListExpiredObjects, and ListObjectsByBackend. Centralizes
-// the per-row scan + RFC3339 timestamp parse so the three list helpers
-// don't carry parallel loop bodies.
-func scanSlimObjectLocations(rows *sql.Rows) ([]core.ObjectLocation, error) {
-	var locs []core.ObjectLocation
-	for rows.Next() {
-		var loc core.ObjectLocation
-		var createdAt string
-		if err := rows.Scan(&loc.ObjectKey, &loc.BackendName, &loc.SizeBytes, &createdAt); err != nil {
-			return nil, fmt.Errorf("failed to scan object location: %w", err)
+// scanListedObjectLocations scans a listing row, which carries the ETag on top
+// of the slim columns because a Contents entry reports one. NULL leaves the
+// entry without an identity, which is what an object that has not learned its
+// ETag yet has.
+func scanListedObjectLocations(rows *sql.Rows) ([]core.ObjectLocation, error) {
+	return collectRows(rows, rowsObjectLocations, func(rows *sql.Rows) (core.ObjectLocation, error) {
+		var (
+			loc       core.ObjectLocation
+			createdAt string
+			etag      sql.NullString
+		)
+		if err := rows.Scan(&loc.ObjectKey, &loc.BackendName, &loc.SizeBytes, &createdAt, &etag); err != nil {
+			return core.ObjectLocation{}, fmt.Errorf("failed to scan object location: %w", err)
 		}
 		var parseErr error
 		loc.CreatedAt, parseErr = parseTime(createdAt)
 		if parseErr != nil {
-			return nil, fmt.Errorf(errInvalidTimestamp, createdAt, parseErr)
+			return core.ObjectLocation{}, fmt.Errorf(errInvalidTimestamp, createdAt, parseErr)
 		}
-		locs = append(locs, loc)
+		loc.Identity = listedIdentity(etag)
+		return loc, nil
+	})
+}
+
+// listedIdentity builds the identity a listing row carries: the ETag alone,
+// which is all a Contents entry reports.
+func listedIdentity(etag sql.NullString) *core.ObjectIdentity {
+	if !etag.Valid || etag.String == "" {
+		return nil
 	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("failed to iterate object locations: %w", err)
-	}
-	return locs, nil
+	return &core.ObjectIdentity{ETag: etag.String}
 }
 
-// -------------------------------------------------------------------------
-// LOCATION MUTATIONS
-// -------------------------------------------------------------------------
-
-// MoveObjectLocation delegates to core.MoveObjectLocation.
-func (s *Store) MoveObjectLocation(ctx context.Context, key, fromBackend, toBackend string) (int64, error) {
-	return core.MoveObjectLocation(ctx, s, key, fromBackend, toBackend)
-}
-
-// DeleteObjectLocation removes a single object_locations row for the given key
-// and backend, debiting the backend's bytes_used by the removed copy's size in
-// the same transaction. Delegates to core.DeleteObjectLocation.
-func (s *Store) DeleteObjectLocation(ctx context.Context, key, backendName string) error {
-	return core.DeleteObjectLocation(ctx, s, key, backendName)
-}
-
-// ImportObject delegates to core.ImportObject.
-func (s *Store) ImportObject(ctx context.Context, key, backend string, size int64) (bool, error) {
-	return core.ImportObject(ctx, s, key, backend, size)
+// scanSlimObjectLocations consumes a *sql.Rows holding the slim
+// (object_key, backend_name, size_bytes, created_at) projection used by
+// ListObjectsByBackend and its key-ordered twin. Centralizes the per-row scan
+// and timestamp parse so those callers don't carry parallel loop bodies.
+func scanSlimObjectLocations(rows *sql.Rows) ([]core.ObjectLocation, error) {
+	return collectRows(rows, rowsObjectLocations, func(rows *sql.Rows) (core.ObjectLocation, error) {
+		var (
+			loc       core.ObjectLocation
+			createdAt string
+		)
+		if err := rows.Scan(&loc.ObjectKey, &loc.BackendName, &loc.SizeBytes, &createdAt); err != nil {
+			return core.ObjectLocation{}, fmt.Errorf("failed to scan object location: %w", err)
+		}
+		var parseErr error
+		loc.CreatedAt, parseErr = parseTime(createdAt)
+		if parseErr != nil {
+			return core.ObjectLocation{}, fmt.Errorf(errInvalidTimestamp, createdAt, parseErr)
+		}
+		return loc, nil
+	})
 }
 
 // BackendObjectStats returns the object count and total bytes stored on a backend.
@@ -441,71 +460,149 @@ func (s *Store) DeleteBackendData(ctx context.Context, backendName string) error
 // INTEGRITY
 // -------------------------------------------------------------------------
 
-// GetRandomHashedObjects returns random object locations that have a stored
-// content hash. Used by the scrubber to verify data integrity. Uses
-// ORDER BY RANDOM() LIMIT instead of PostgreSQL TABLESAMPLE BERNOULLI.
-func (s *Store) GetRandomHashedObjects(ctx context.Context, limit int) ([]core.ObjectLocation, error) {
+// GetLeastRecentlyScrubbedObjects returns the copies least recently touched,
+// by verification or by writing. Falling back to created_at keeps a freshly
+// written copy from jumping the queue, so a write rate above the scrub rate
+// cannot starve older data.
+//
+// backends restricts the batch to copies the scrubber can afford to read. An
+// empty slice selects nothing: the caller has established that no backend can
+// be read right now, and returning the whole queue would ignore it.
+func (s *Store) GetLeastRecentlyScrubbedObjects(ctx context.Context, limit int, backends []string) ([]core.ObjectLocation, error) {
+	if len(backends) == 0 {
+		return nil, nil
+	}
+	backendsJSON, err := json.Marshal(backends)
+	if err != nil {
+		return nil, fmt.Errorf("encode scrub backend list: %w", err)
+	}
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT object_key, backend_name, size_bytes, encrypted, encryption_key,
-		       key_id, plaintext_size, content_hash, created_at
+		       key_id, plaintext_size, content_hash,
+		       compression_algorithm, compression_level, compression_format_version, logical_size,
+		       created_at, last_scrubbed_at
 		FROM object_locations
-		WHERE content_hash IS NOT NULL
-		ORDER BY RANDOM()
-		LIMIT ?`, limit)
+		WHERE content_hash IS NOT NULL AND managed
+		  AND backend_name IN (SELECT value FROM json_each(?))
+		ORDER BY COALESCE(last_scrubbed_at, created_at) ASC, object_key ASC
+		LIMIT ?`, string(backendsJSON), limit)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get random hashed objects: %w", err)
+		return nil, fmt.Errorf("failed to get least recently scrubbed objects: %w", err)
 	}
-	defer rows.Close()
+	return collectRows(rows, "least recently scrubbed objects", scanObjectLocation)
+}
 
-	var locs []core.ObjectLocation
-	for rows.Next() {
-		loc, err := scanObjectLocation(rows)
-		if err != nil {
-			return nil, err
-		}
-		locs = append(locs, loc)
+// CountScrubCandidatesOnBackends reports how many scrubbable copies live on the
+// named backends, so a cycle can say how much of the queue it declined to read.
+func (s *Store) CountScrubCandidatesOnBackends(ctx context.Context, backends []string) (int64, error) {
+	if len(backends) == 0 {
+		return 0, nil
 	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("failed to iterate random hashed objects: %w", err)
+	backendsJSON, err := json.Marshal(backends)
+	if err != nil {
+		return 0, fmt.Errorf("encode scrub backend list: %w", err)
 	}
-	return locs, nil
+	return s.countRows(ctx, "scrub candidates", `
+		SELECT count(*)
+		FROM object_locations
+		WHERE content_hash IS NOT NULL AND managed
+		  AND backend_name IN (SELECT value FROM json_each(?))`, string(backendsJSON))
+}
+
+// MarkObjectScrubbed records that a copy was examined, which is what advances
+// the sweep past it.
+func (s *Store) MarkObjectScrubbed(ctx context.Context, key, backendName string) error {
+	now := now()
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE object_locations SET last_scrubbed_at = ?
+		 WHERE object_key = ? AND backend_name = ?`,
+		now, key, backendName,
+	); err != nil {
+		return fmt.Errorf("failed to mark object scrubbed: %w", err)
+	}
+	return nil
+}
+
+// IntegrityCoverage reports how far behind verification is, split by whether
+// the sweep can reach the copy. reachable is the same backend set the scrub
+// queue draws from.
+//
+// The age and the never-verified count cover reachable copies only, because a
+// copy the sweep may not read can never be stamped: counting it pins the
+// minimum to a fixed timestamp and the age then tracks wall clock rather than
+// the backlog. Deferred counts the rest, so a fleet holding most of its copies
+// on a backend over its usage limit cannot report as healthy.
+//
+// The age falls back to created_at exactly as the queue ordering does, so a
+// never-verified copy is measured from when it was written. Taking MIN over
+// last_scrubbed_at alone skips those rows entirely, which reports a fleet that
+// has never been scrubbed as an age of zero.
+func (s *Store) IntegrityCoverage(ctx context.Context, reachable []string) (core.CoverageStat, error) {
+	backendsJSON, err := json.Marshal(reachable)
+	if err != nil {
+		return core.CoverageStat{}, fmt.Errorf("encode reachable backend list: %w", err)
+	}
+
+	var oldest sql.NullString
+	var stat core.CoverageStat
+	err = s.db.QueryRowContext(ctx,
+		`SELECT MIN(CASE WHEN reachable THEN COALESCE(last_scrubbed_at, created_at) END),
+		        COUNT(*) FILTER (WHERE reachable AND last_scrubbed_at IS NULL),
+		        COUNT(*) FILTER (WHERE NOT reachable)
+		 FROM (
+		     SELECT last_scrubbed_at, created_at,
+		            backend_name IN (SELECT value FROM json_each(?)) AS reachable
+		     FROM object_locations
+		     WHERE content_hash IS NOT NULL AND managed
+		 )`, string(backendsJSON),
+	).Scan(&oldest, &stat.NeverVerified, &stat.Deferred)
+	if err != nil {
+		return core.CoverageStat{}, fmt.Errorf("failed to read integrity coverage: %w", err)
+	}
+	if !oldest.Valid {
+		return stat, nil
+	}
+	ts, err := time.Parse(time.RFC3339Nano, oldest.String)
+	if err != nil {
+		return stat, fmt.Errorf("failed to parse scrub queue head timestamp %q: %w", oldest.String, err)
+	}
+	stat.OldestUnverifiedAge = time.Since(ts)
+	return stat, nil
 }
 
 // GetObjectsWithoutHash returns object locations that have no stored content
 // hash, ordered by creation time. Used by the backfill command.
-func (s *Store) GetObjectsWithoutHash(ctx context.Context, limit, offset int) ([]core.ObjectLocation, error) {
+// An empty backend selects every one, which is what a pass over the whole fleet
+// asks for.
+func (s *Store) GetObjectsWithoutHash(ctx context.Context, limit, offset int, backend string) ([]core.ObjectLocation, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT object_key, backend_name, size_bytes, encrypted, encryption_key,
-		       key_id, plaintext_size, content_hash, created_at
+		       key_id, plaintext_size, content_hash,
+		       compression_algorithm, compression_level, compression_format_version, logical_size,
+		       created_at, last_scrubbed_at
 		FROM object_locations
-		WHERE content_hash IS NULL
+		WHERE content_hash IS NULL AND managed
+		  AND (? = '' OR backend_name = ?)
 		ORDER BY created_at ASC
-		LIMIT ? OFFSET ?`, limit, offset)
+		LIMIT ? OFFSET ?`, backend, backend, limit, offset)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get objects without hash: %w", err)
 	}
-	defer rows.Close()
-
-	var locs []core.ObjectLocation
-	for rows.Next() {
-		loc, err := scanObjectLocation(rows)
-		if err != nil {
-			return nil, err
-		}
-		locs = append(locs, loc)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("failed to iterate objects without hash: %w", err)
-	}
-	return locs, nil
+	return collectRows(rows, "objects without hash", scanObjectLocation)
 }
 
-// UpdateContentHash sets the content hash for an object location.
+// UpdateContentHash records the hash the backfill pass computed and stamps the
+// copy as verified in the same statement. The pass read the whole body to
+// produce the digest, so the copy is verified by construction at that moment.
+// Leaving last_scrubbed_at NULL would report it as never verified and sort it
+// to the head of the scrub queue on its original created_at, so the next sweep
+// would re-read the same bytes.
 func (s *Store) UpdateContentHash(ctx context.Context, key, backendName, hash string) error {
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE object_locations
-		SET content_hash = ?
-		WHERE object_key = ? AND backend_name = ?`, hash, key, backendName)
+		SET content_hash = ?, last_scrubbed_at = ?
+		WHERE object_key = ? AND backend_name = ?`,
+		hash, time.Now().UTC().Format(time.RFC3339Nano), key, backendName)
 	return err
 }
 
@@ -513,37 +610,130 @@ func (s *Store) UpdateContentHash(ctx context.Context, key, backendName, hash st
 // ROW SCANNERS
 // -------------------------------------------------------------------------
 
+// scanIdentifiedObjectLocation scans a row that also selects the three
+// identity columns, which only the read path's own query does: a scrub or
+// replication row is about the bytes, not about what a client is told they
+// are. The identity columns come last so the shared scanner ahead of it stays
+// the one description of the rest of the row.
+func scanIdentifiedObjectLocation(rows *sql.Rows) (core.ObjectLocation, error) {
+	var (
+		loc          core.ObjectLocation
+		cols         scannedObjectColumns
+		etag         sql.NullString
+		contentType  sql.NullString
+		userMetadata sql.NullString
+	)
+	dest := append(cols.scanDest(&loc), &etag, &contentType, &userMetadata)
+	if err := rows.Scan(dest...); err != nil {
+		return core.ObjectLocation{}, fmt.Errorf("failed to scan object location: %w", err)
+	}
+	if err := cols.apply(&loc); err != nil {
+		return core.ObjectLocation{}, err
+	}
+	loc.Identity = identityFromColumns(etag, contentType, userMetadata)
+	return loc, nil
+}
+
 // scanObjectLocation scans a full object location row including all encryption
 // and integrity columns.
 func scanObjectLocation(rows *sql.Rows) (core.ObjectLocation, error) {
 	var (
-		loc           core.ObjectLocation
-		createdAt     string
-		keyID         *string
-		plaintextSize *int64
-		contentHash   *string
+		loc  core.ObjectLocation
+		cols scannedObjectColumns
 	)
-	if err := rows.Scan(
-		&loc.ObjectKey, &loc.BackendName, &loc.SizeBytes,
-		&loc.Encrypted, &loc.EncryptionKey,
-		&keyID, &plaintextSize, &contentHash,
-		&createdAt,
-	); err != nil {
+	if err := rows.Scan(cols.scanDest(&loc)...); err != nil {
 		return core.ObjectLocation{}, fmt.Errorf("failed to scan object location: %w", err)
 	}
-	var parseErr error
-	loc.CreatedAt, parseErr = parseTime(createdAt)
-	if parseErr != nil {
-		return core.ObjectLocation{}, fmt.Errorf(errInvalidTimestamp, createdAt, parseErr)
-	}
-	if keyID != nil {
-		loc.KeyID = *keyID
-	}
-	if plaintextSize != nil {
-		loc.PlaintextSize = *plaintextSize
-	}
-	if contentHash != nil {
-		loc.ContentHash = *contentHash
+	if err := cols.apply(&loc); err != nil {
+		return core.ObjectLocation{}, err
 	}
 	return loc, nil
+}
+
+// scannedObjectColumns holds the nullable columns of an object_locations row
+// between the scan and the conversion. Both scanners share it, so the column
+// order and the NULL handling are each stated once - the identified scanner
+// appends its three columns to this list rather than restating it.
+type scannedObjectColumns struct {
+	createdAt     string
+	keyID         *string
+	plaintextSize *int64
+	contentHash   *string
+	compAlgorithm *string
+	compLevel     *string
+	compVersion   *int64
+	logicalSize   *int64
+	lastScrubbed  *string
+}
+
+// scanDest returns the scan targets in the order every object_locations query
+// selects them.
+func (c *scannedObjectColumns) scanDest(loc *core.ObjectLocation) []any {
+	return []any{
+		&loc.ObjectKey, &loc.BackendName, &loc.SizeBytes,
+		&loc.Encrypted, &loc.EncryptionKey,
+		&c.keyID, &c.plaintextSize, &c.contentHash,
+		&c.compAlgorithm, &c.compLevel, &c.compVersion, &c.logicalSize,
+		&c.createdAt, &c.lastScrubbed,
+	}
+}
+
+// apply dereferences the scanned columns onto loc.
+func (c *scannedObjectColumns) apply(loc *core.ObjectLocation) error {
+	var parseErr error
+	loc.CreatedAt, parseErr = parseTime(c.createdAt)
+	if parseErr != nil {
+		return fmt.Errorf(errInvalidTimestamp, c.createdAt, parseErr)
+	}
+	if c.keyID != nil {
+		loc.KeyID = *c.keyID
+	}
+	if c.plaintextSize != nil {
+		loc.PlaintextSize = *c.plaintextSize
+	}
+	if c.contentHash != nil {
+		loc.ContentHash = *c.contentHash
+	}
+	if c.compAlgorithm != nil {
+		loc.CompressionAlgorithm = *c.compAlgorithm
+	}
+	if c.compLevel != nil {
+		loc.CompressionLevel = *c.compLevel
+	}
+	if c.compVersion != nil {
+		loc.CompressionFormatVersion = int(*c.compVersion)
+	}
+	if c.logicalSize != nil {
+		loc.LogicalSize = *c.logicalSize
+	}
+	if c.lastScrubbed != nil {
+		scrubbed, err := parseTime(*c.lastScrubbed)
+		if err != nil {
+			return fmt.Errorf(errInvalidTimestamp, *c.lastScrubbed, err)
+		}
+		loc.LastScrubbedAt = &scrubbed
+	}
+	return nil
+}
+
+// RecordObjectIdentity fills the identity columns a read had to ask a backend
+// for. Applied to every copy of the key: a per-copy value is what lets a
+// failover change the ETag under a conditional request. Columns already set
+// are left alone, so what a write computed over the client's own bytes
+// outranks what a backend reports about the bytes as stored.
+func (s *Store) RecordObjectIdentity(ctx context.Context, key string, id *core.ObjectIdentity) error {
+	if id == nil {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE object_locations
+		SET etag          = COALESCE(etag, ?),
+		    content_type  = COALESCE(content_type, ?),
+		    user_metadata = COALESCE(user_metadata, ?)
+		WHERE object_key = ?`,
+		identityETag(id), identityContentType(id), identityMetadataJSON(id), key)
+	if err != nil {
+		return fmt.Errorf("record object identity: %w", err)
+	}
+	return nil
 }

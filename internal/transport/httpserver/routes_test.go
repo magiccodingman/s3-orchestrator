@@ -23,6 +23,10 @@ import (
 	"github.com/afreidah/s3-orchestrator/internal/transport/s3api"
 )
 
+// -------------------------------------------------------------------------
+// CONSTANTS
+// -------------------------------------------------------------------------
+
 // errRateLimiterBoom is the sentinel the override constructor returns
 // so the tests can assert the di.Optional Failed branch was reached.
 var errRateLimiterBoom = errors.New("rate limiter boom")
@@ -36,12 +40,15 @@ func overrideFailingRateLimiter(inj do.Injector) {
 	})
 }
 
+// -------------------------------------------------------------------------
+// PUBLIC API
+// -------------------------------------------------------------------------
+
 // TestRegisterAdminHandler_RateLimiterFailedFallsBack drives the slog
 // fallback branch where the optional rate limiter fails to resolve but
 // the admin mux is still mounted (without a limiter wrap).
 func TestRegisterAdminHandler_RateLimiterFailedFallsBack(t *testing.T) {
 	cfg := loadCfg(t, validTestConfigYAML)
-	cfg.UI.AdminKey = "test-key"
 	inj, cleanup := resolvedInjector(t, cfg, "all")
 	defer cleanup()
 
@@ -69,23 +76,11 @@ func TestRegisterS3Handler_RateLimiterFailedFallsBack(t *testing.T) {
 	}
 }
 
-// TestRegisterAdminHandler_DisabledByEmptyKey covers the early-return
-// when no admin key is configured: the function should noop without
-// touching the injector.
-func TestRegisterAdminHandler_DisabledByEmptyKey(t *testing.T) {
-	cfg := &config.Config{}
-	if err := registerAdminHandler(http.NewServeMux(), do.New(), cfg); err != nil {
-		t.Fatalf("registerAdminHandler: %v", err)
-	}
-}
-
 // TestRegisterAdminHandler_AdminHandlerInvokeFails drives the
-// "initialize admin handler" wrapped-error path by configuring an admin
-// key against a bare injector that has no admin.Handler provider.
+// "initialize admin handler" wrapped-error path against a bare injector
+// that has no admin.Handler provider.
 func TestRegisterAdminHandler_AdminHandlerInvokeFails(t *testing.T) {
-	cfg := &config.Config{}
-	cfg.UI.AdminKey = "key"
-	err := registerAdminHandler(http.NewServeMux(), do.New(), cfg)
+	err := registerAdminHandler(http.NewServeMux(), do.New(), &config.Config{})
 	if err == nil {
 		t.Fatal("expected error when admin.Handler is not registered")
 	}
@@ -118,21 +113,21 @@ func TestRegisterUIHandler_InvokeFails(t *testing.T) {
 	}
 }
 
-// TestRegisterS3Handler_BackendManagerInvokeFails drives the
-// "initialize backend manager" wrapped-error path against a bare
-// injector with no BackendManager provider.
-func TestRegisterS3Handler_BackendManagerInvokeFails(t *testing.T) {
+// TestRegisterS3Handler_BackendRuntimeInvokeFails drives the
+// "initialize backend runtime" wrapped-error path against a bare
+// injector with no BackendRuntime provider.
+func TestRegisterS3Handler_BackendRuntimeInvokeFails(t *testing.T) {
 	err := registerS3Handler(http.NewServeMux(), do.New(), &config.Config{})
 	if err == nil {
-		t.Fatal("expected error when BackendManager is not registered")
+		t.Fatal("expected error when BackendRuntime is not registered")
 	}
-	if !strings.Contains(err.Error(), "initialize backend manager") {
-		t.Errorf("err = %q, want wrap mentioning backend manager", err)
+	if !strings.Contains(err.Error(), "initialize backend runtime") {
+		t.Errorf("err = %q, want wrap mentioning backend runtime", err)
 	}
 }
 
 // TestRegisterS3Handler_S3ServerInvokeFails drives the
-// "initialize S3 server" wrapped-error path: BackendManager resolves
+// "initialize S3 server" wrapped-error path: the backend runtime resolves
 // cleanly but the s3api.Server provider errors, so registerS3Handler
 // must propagate the wrapped error rather than mount a broken handler.
 func TestRegisterS3Handler_S3ServerInvokeFails(t *testing.T) {

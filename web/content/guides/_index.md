@@ -1,6 +1,7 @@
 ---
 title: "s3-orchestrator guides"
 linkTitle: "Guides"
+description: "Step-by-step walkthroughs: stacking provider free tiers, multi-cloud redundancy, MinIO replication, and deployment on Nomad or systemd."
 chapter: true
 weight: 30
 ---
@@ -20,7 +21,21 @@ weight: 30
     <i class="fas fa-coins landing-card-icon" style="color: #6ee7b7;"></i>
     <div>
       <strong>Maximizing Free Tiers</strong>
-      <p>Combine free-tier storage from multiple cloud providers into a single pool without exceeding any provider's limits.</p>
+      <p>Combine free-tier storage from multiple cloud providers into a single pool without exceeding any provider's limits, and stop Bandwidth Alliance providers billing egress at all.</p>
+    </div>
+  </a>
+  <a class="landing-card" href="access-control/">
+    <i class="fas fa-user-shield landing-card-icon" style="color: #5eead4;"></i>
+    <div>
+      <strong>Setting Up Access Control</strong>
+      <p>Declare the administering credential, onboard a client with only the access it needs, and scope an operator to the control plane.</p>
+    </div>
+  </a>
+  <a class="landing-card" href="terraform-provider/">
+    <i class="fas fa-cubes landing-card-icon" style="color: #818cf8;"></i>
+    <div>
+      <strong>Provisioning with Terraform</strong>
+      <p>Declare the buckets, users, keypairs and grants a deployment serves, narrow access without a gap, and move a bucket out of the configuration file without downtime.</p>
     </div>
   </a>
   <a class="landing-card" href="replication-guide/">

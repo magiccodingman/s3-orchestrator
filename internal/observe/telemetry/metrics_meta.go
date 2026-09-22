@@ -14,10 +14,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
-// BuildInfo and related package-level variables used by this package.
+// Build information and webhook notification metrics.
 var (
-	// --- Info metric ---
-
 	// BuildInfo exposes version information.
 	BuildInfo = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
@@ -26,8 +24,6 @@ var (
 		},
 		[]string{"version", "go_version"},
 	)
-
-	// --- Notification metrics ---
 
 	// NotificationSentTotal counts successfully delivered webhook notifications.
 	NotificationSentTotal = promauto.NewCounterVec(

@@ -1,3 +1,7 @@
+---
+description: "The project's Go conventions: comment and file-header format, package layout, error handling, logging, testing, and versioning rules."
+---
+
 **Author:** Alex Freidah
 
 ---
@@ -79,6 +83,60 @@ func doSomething() {
 - Use ALL CAPS for section name
 - **Blank line AFTER closing divider** - separates section from code
 - Used for major logical divisions (e.g., PUBLIC API, INTERNALS, TYPES)
+- The box goes above the first declaration's doc comment, never between a doc comment and its declaration
+
+**When to use them:**
+
+Every file with more than one logical group of declarations carries section boxes, so a reader lands in a familiar shape whichever file they open. A file under roughly 100 lines with a single concern does not - a box per file is noise, not structure.
+
+**Section vocabulary.** Prefer these names, in this order, so the same concept is not called three things across the tree:
+
+| Section | Holds |
+|---------|-------|
+| `CONSTANTS` | package-level constant blocks |
+| `TYPES` | the types a file declares |
+| `INTERFACE` | a consumer-declared or role interface |
+| `CONSTRUCTOR` | `New*` and the wiring it needs |
+| *domain sections* | the file's actual work, named for it: `ADMISSION`, `FLUSH`, `LISTINGS`, `SCRUB QUEUE`, `UNDER-REPLICATION` |
+| `LIFECYCLE` | `Close`, `Shutdown`, and other teardown |
+| `INTERNALS` / `HELPERS` | unexported helpers the sections above call |
+
+Domain sections carry the weight: a file with `LISTINGS` / `STATISTICS AND WRITES` / `INTERNALS` tells a reader more than one split into `PUBLIC API` / `PRIVATE`.
+
+### Comments Inside Declaration Blocks
+
+A comment line above a single entry inside a `struct`, `interface`, `const` or `var` block breaks the block's visual flow and makes a block that should read at a glance three times its height. Two forms are allowed instead:
+
+- **End-of-line**, when the note is short:
+
+```go
+const (
+	StateClosed   State = iota // healthy  -  all calls pass through
+	StateOpen                  // down  -  return sentinel error
+	StateHalfOpen              // probing  -  one call allowed through
+)
+```
+
+- **In the block's doc comment**, when the note carries real reasoning:
+
+```go
+// ExistingCopy is the projection of an object_locations row that promotion
+// and overwrite logic needs from a SELECT-for-update read.
+//
+// Encrypted and HasDEK say whether the row claims the bytes are an envelope and
+// whether the key that reads them is still present. They are carried here so a
+// decision about which copy to drop cannot destroy the last row able to decrypt
+// the object.
+type ExistingCopy struct {
+	BackendName string
+	SizeBytes   int64
+	CreatedAt   time.Time
+	Encrypted   bool
+	HasDEK      bool
+}
+```
+
+An entry whose name already says what it is gets no comment at all. `revive`'s `exported` rule is satisfied by the doc comment on the block, so moving the text up does not cost lint coverage.
 
 ### Single-Line Comments
 
@@ -138,12 +196,12 @@ Every `.go` file starts with a 79-char header block:
 //
 // Author: Alex Freidah
 //
-// Object-level CRUD operations on the BackendManager. Handles backend selection
-// via routing strategy, read failover across replicas, broadcast reads during
-// degraded mode, and usage limit enforcement on reads and writes.
+// Object-level CRUD operations. Handles backend selection via routing
+// strategy, read failover across replicas, broadcast reads during degraded
+// mode, and usage limit enforcement on reads and writes.
 // -------------------------------------------------------------------------------
 
-package proxy
+package object
 ```
 
 **Rules:**
@@ -170,7 +228,11 @@ package backend
 **Rules:**
 - One sentence is the floor; pin the package's invariants and link out to the implementation files for per-symbol detail
 - Only `doc.go` carries a package comment; every other file keeps its box header + blank line before `package`
-- New packages get a `doc.go`; convert existing packages opportunistically when you next touch them, never as a one-shot churn PR
+- Every package has one, including `main` and test-only helper packages. A new package without a `doc.go` is incomplete
+
+`go/doc` concatenates every package comment it finds, in file-name order, so a second one does not replace the first - it appends to it, and the rendered overview says the same thing twice. That is the reason for the one-file rule.
+
+mockgen writes `// Package X is a generated GoMock package.` above the package clause of everything it emits. In a package whose mocks are `_test.go` files that never reaches godoc and is left alone; where they are not (`storetest`, `opstest`, `backendtest`), `make generate` strips it so `doc.go` stays the only package comment.
 
 ---
 
@@ -179,6 +241,8 @@ package backend
 ### Indentation
 
 - **1 tab** - Go standard (`gofmt` enforced)
+
+Formatting is a lint failure, not a convention: `make lint` runs `gofmt` and `goimports`, and `make fmt` applies both.
 
 ### Imports
 
@@ -213,18 +277,16 @@ Order: stdlib, internal packages, external packages.
 Group related fields with inline comments explaining non-obvious fields:
 
 ```go
-type BackendManager struct {
-    runtime          *infra.BackendRuntime  // backend fleet/admission/usage/metrics; expose via Runtime()
-    stores           Stores                 // narrow store-role view; see Stores interface
-    coord            *writepath.Coordinator // shared write-path helpers (also held by objectManager and multipartManager)
-    multipartManager *multipart.Manager     // multipart upload lifecycle; expose via Multipart()
-    objectManager    *object.Manager        // CRUD, read failover, broadcast reads; expose via Objects()
-    dashboard        *dashboard.Aggregator  // web UI data aggregation
-    drainManager     *drain.Manager         // nil-able; expose via Drain()
+type Manager struct {
+    core        ObjectRuntime          // infrastructure subset: backends, usage, timeout, metrics
+    coord       ObjectCoordinator      // write-path helpers, shared with the multipart manager
+    stores      ObjectStores           // direct store access for read paths and quota inspection
+    encryptor   *encryption.Encryptor  // nil when encryption is disabled
+    cache       *LocationCache         // key -> backend, consulted only in degraded mode
+    objectCache objcache.ObjectCache   // nil when object data caching is disabled
+    failover    *readpath.Failover     // per-key read failover + degraded-mode broadcast
 
-    usageFlushCfg syncutil.AtomicConfig[config.UsageFlushConfig]
-    lifecycleCfg  syncutil.AtomicConfig[config.LifecycleConfig]
-    integrityCfg  *syncutil.AtomicConfig[config.IntegrityConfig] // shared with objectManager
+    integrityCfg *syncutil.AtomicConfig[config.IntegrityConfig] // shared with the multipart manager
 }
 ```
 
@@ -237,12 +299,12 @@ Applied across `internal/store` (the per-role store interfaces consumed at use s
 **Rationale:**
 - A consumer's dependency footprint is documented in its own source file.
 - Adding a method to a producer type never bloats existing consumer mocks.
-- Tests can mock at the granularity of what is used (typically 4–10 methods), not the full producer surface.
+- Tests can mock at the granularity of what is used (typically 4-10 methods), not the full producer surface.
 - Aligns with Rob Pike's "accept interfaces, return structs" guideline.
 
 **Trade-offs:**
 - Each consumer declares its own small interface (extra text, but localized).
-- The composition layer (the root `proxy` package, `internal/di`) still holds concrete types — it owns construction and is the seam where interfaces meet implementations.
+- The composition layer (the root `proxy` package, `internal/di`) still holds concrete types - it owns construction and is the seam where interfaces meet implementations.
 
 **Where the interfaces live:**
 
@@ -252,7 +314,7 @@ Applied across `internal/store` (the per-role store interfaces consumed at use s
 | `internal/worker/ops_runtime.go` | Worker-side `Ops` / `CleanupOps` / `ScrubberOps` interfaces against the proxy infrastructure |
 | `internal/store/core/interfaces.go` | Per-role narrow store interfaces (consumers compose them when they need to declare a minimal store dependency) |
 
-**Naming convention:** `<Consumer><Provider>` — e.g. the multipart subpackage's view of `*infra.BackendRuntime` is `MultipartRuntime`; the object subpackage's view of `*writepath.Coordinator` is `ObjectCoordinator`. The prefix names the consumer, the suffix names the producer concept.
+**Naming convention:** `<Consumer><Provider>` - e.g. the multipart subpackage's view of `*infra.BackendRuntime` is `MultipartRuntime`; the object subpackage's view of `*writepath.Coordinator` is `ObjectCoordinator`. The prefix names the consumer, the suffix names the producer concept.
 
 **Constructor shape:** consumers take the interfaces, not concrete pointers. Composition-layer code (the root proxy package, DI providers) passes the concrete `*infra.BackendRuntime`, `*writepath.Coordinator`, `*object.Manager`, etc., and the concrete types satisfy the interfaces implicitly.
 
@@ -275,21 +337,26 @@ type Manager struct {
 func New(core MultipartRuntime, coord MultipartCoordinator, ...) *Manager { ... }
 ```
 
-**Mocking:** generated mocks are not produced eagerly. When a test actually needs to mock a consumer-declared interface, add a `//go:generate mockgen -source=consumer_interfaces.go -destination=mock/<file>.go -package=<pkg>mock` directive at the top of the consumer interface file and run `make generate`. Until a mock is needed, the interface declaration alone documents the dependency surface — generating unused mocks is busywork.
+**Mocking:** generated mocks are not produced eagerly. When a test actually needs to mock a consumer-declared interface, add a `//go:generate mockgen -source=consumer_interfaces.go -destination=mock/<file>.go -package=<pkg>mock` directive at the top of the consumer interface file and run `make generate`. Until a mock is needed, the interface declaration alone documents the dependency surface - generating unused mocks is busywork.
 
 **When NOT to declare a narrow interface (#918).** A consumer-side interface earns its keep when at least one of these is true:
 
 1. **Multiple implementations actually exist** (a real polymorphism point, e.g. `keySource` over S3 iter + DB iter).
-2. **A test fake genuinely benefits from the seam** — a hand-rolled fake or `gomock`-generated mock that lets tests exercise the consumer without standing up the real producer (e.g. `worker.Ops` mocked across ~60 test sites; `admin.ReplicatorOps`/`OverReplicationOps`/`ScrubberOps`/`Reconciler` whose fakes drive admin handler branches).
-3. **An import cycle would otherwise form** (e.g. `readpath.LocationCache` — without the interface, `readpath` would have to import `object` which already imports `readpath`).
+2. **A test fake genuinely benefits from the seam** - a hand-rolled fake or `gomock`-generated mock that lets tests exercise the consumer without standing up the real producer (e.g. `worker.Ops` mocked across ~60 test sites; `admin.ReplicatorOps`/`OverReplicationOps`/`ScrubberOps`/`Reconciler` whose fakes drive admin handler branches).
+3. **An import cycle would otherwise form** (e.g. `readpath.LocationCache` - without the interface, `readpath` would have to import `object` which already imports `readpath`).
 4. **The interface models a real domain boundary** between subsystems (`drain.DrainRuntime`, `MultipartRuntime`, `ObjectRuntime`, `WriteRuntime`).
 
-If none apply — single impl, single consumer, no test fake, no cycle, no boundary — pass the concrete `*Type` directly. Examples cut under #918: `readpath.ObjectLocationLister`, `multipart.MultipartCoordinator`, `multipart.StaleCleaner`, `accounting.UsageTracker`.
+If none apply - single impl, single consumer, no test fake, no cycle, no boundary - pass the concrete `*Type` directly. Examples cut under #918: `readpath.ObjectLocationLister`, `multipart.MultipartCoordinator`, `multipart.StaleCleaner`, `accounting.UsageTracker`.
 
-**Special case: `core.MetadataStore` is composition-root-only.** `MetadataStore` is the union of every per-role store interface (`ObjectStore`, `QuotaStore`, `MultipartStore`, `PendingStore`, `CleanupStore`, etc.) — a god interface in the same way `*BackendManager` would be if every consumer took it whole. Treat it that way:
+**There is no exported union of the store roles.** A type that unions every per-role interface is a god interface, and an exported one in the package every consumer already imports is an invitation to take it as a dependency. So the union exists in exactly three places, none of them reachable from a feature package:
 
-- **OK to hold or accept:** `internal/di`, `internal/runtime`, `internal/lifecycle`, in-package test fixtures, and the proxy subtree's composition root (`BackendManagerConfig.Stores`). These are composition layers; their job is to route the concrete store into the narrow interfaces each consumer declares.
-- **Not OK to hold or accept:** every feature package under `internal/proxy/*`, `internal/worker/`, `internal/transport/*`, `internal/store/postgres`, etc. Each declares its own role-composite interface naming exactly the per-role store interfaces it needs:
+- `core.engineRoles`, unexported, and a generic constraint rather than an interface: `core.AssertEngine[*Store]` is how each engine states it implements everything, and a constraint cannot be a variable type, so nothing can depend on it.
+- `internal/di.metadataStore`, unexported, because the composition root genuinely has to hold one opened engine before aliasing it into roles.
+- `storetest.MetadataStore`, the mockgen target, so one generated mock stands in wherever a test needs a fully-populated store.
+
+The union is not a fact about the domain: nothing in persistence requires one object to implement all seventeen roles, and a design that split persistence across several objects would satisfy every role interface and violate nothing. What it encodes is that there happens to be one store type per engine, which is wiring rather than domain.
+
+Every feature package under `internal/proxy/*`, `internal/worker/`, `internal/transport/*` declares its own role-composite naming exactly the per-role interfaces it needs:
 
   ```go
   // internal/worker/scrubber.go
@@ -306,13 +373,13 @@ If none apply — single impl, single consumer, no test fake, no cycle, no bound
   }
   ```
 
-  The single concrete `MetadataStore` satisfies every such composite implicitly, so DI wiring stays one line per provider while each consumer's dependency footprint is documented in its own source file. This rule exists because a feature package that takes `MetadataStore` whole gives the misleading impression it might call any DB role — auditing the actual surface then requires reading the implementation, which defeats the point of consumer-declared interfaces.
+  Each concrete store satisfies every such composite implicitly, so DI wiring stays one line per provider while each consumer's dependency footprint is documented in its own source file. A package that took the whole surface would give the misleading impression it might call any DB role, and auditing what it actually touches would then mean reading the implementation.
 
 **Producer-side interfaces are an anti-pattern.** `*infra.BackendRuntime`, `*writepath.Coordinator`, `*object.Manager`, `*multipart.Manager` are exported as concrete pointer types with no sibling `Core`/`Coordinator`/`Manager` interface that mirrors their public surface. Producer-side interfaces force every consumer to mock the full producer API, which is exactly what this pattern is built to avoid.
 
 **Logger is not a behavior dependency.** Never include `Log() *slog.Logger` in a consumer-declared interface. The logger is observability infrastructure: it has no return value the consumer depends on, and the per-component scope is a property of the consumer itself, not of the producer. Components build their own `log *slog.Logger` field in the constructor body via `slog.Default().With(logfmt.Component("<slug>"))` (see Logging and Audit), so each subsystem owns its component name and tests do not need to thread a logger through dependency interfaces.
 
-**Single-method interface names follow the Go `-er` convention.** A single-method interface is named after its method, with the verb in agent-noun form: `Read` → `Reader`, `Close` → `Closer`, `Stringer` for `String()`. Names ending in `-Ops`, `-Store`, `-ing`, or other shapes that do not describe an actor get flagged by `golangci-lint` / sonar (rule S8196) and should be renamed:
+**Single-method interface names follow the Go `-er` convention.** A single-method interface is named after its method, with the verb in agent-noun form: `Read` -> `Reader`, `Close` -> `Closer`, `Stringer` for `String()`. Names ending in `-Ops`, `-Store`, `-ing`, or other shapes that do not describe an actor get flagged by `golangci-lint` / sonar (rule S8196) and should be renamed:
 
 | Method | Good | Bad |
 |---|---|---|
@@ -323,26 +390,28 @@ If none apply — single impl, single consumer, no test fake, no cycle, no bound
 | `UpdateUsageLimits(...)` | `usageLimitsApplier` | `usageLimitsHook` |
 | `UpdateQuotaMetrics(...)` | `quotaMetricsRefresher` | `metricsHook` |
 
-For interfaces that exist to *provide* a value (typical "Acct" / "Stores" / "Config" getters), name the interface after the returned type plus `Provider` or `Source` — `RecorderProvider` for `Acct() *Recorder`, `ConfigSource` for `Config() *Config`. The `Provider` / `Source` suffix is also an agent noun and satisfies the rule.
+For interfaces that exist to *provide* a value (typical "Acct" / "Stores" / "Config" getters), name the interface after the returned type plus `Provider` or `Source` - `RecorderProvider` for `Acct() *Recorder`, `ConfigSource` for `Config() *Config`. The `Provider` / `Source` suffix is also an agent noun and satisfies the rule.
 
 Multi-method interfaces are exempt: `worker.Ops`, `ObjectRuntime`, `MultipartCoordinator` describe a role (or a composite of sub-roles), not a single action, so the `-er` form does not apply.
 
-### Where new methods live: `infra.BackendRuntime` vs `*BackendManager`
+### Where new methods live
 
 The split is by **persistence coupling**:
 
 - **`infra.BackendRuntime`** owns methods that touch only backend objects,
   in-memory usage counters, admission, timeouts, error classification, and
-  metrics — no `store.X` calls. Keeping them store-free is what lets every
+  metrics - no `store.X` calls. Keeping them store-free is what lets every
   worker reuse the runtime through the role interfaces without dragging the
   metadata-store dependency along.
-- **`*BackendManager` methods** (typically in `manager_writepath.go` or a
-  sibling `manager_*.go`) own methods that read or write the metadata store,
-  open transactions, or coordinate multiple sub-managers.
+- **A collaborator under `internal/proxy/*`** owns methods that read or write
+  the metadata store, open transactions, or coordinate more than one of the
+  others. `object`, `multipart`, `writepath`, `drain` and `usage` each own a
+  slice of that, and each takes the store roles it needs directly.
 
-When in doubt: if the method needs the store, it is a manager method;
-otherwise it belongs on the runtime. The consumer interface for the method
-is declared by whichever side hosts it.
+When in doubt: if the method needs the store, it belongs to whichever
+collaborator owns that concern, not to the runtime. There is no root object
+to fall back on, which is the point - a method with no obvious owner is a sign
+the concern has no home yet, rather than a reason to make one type hold it.
 
 ### Per-Backend Accounting: Use the Recorder
 
@@ -361,9 +430,9 @@ Per-backend usage and per-operation metric accounting flow through one shared he
 
 The cardinal rule "every backend call costs one API-call charge regardless of outcome" lives in the method bodies, not in repeated inline comments at every call site. The argument-order risk of the bare `Record(b, 1, 0, size)` vs `Record(b, 1, size, 0)` form is eliminated because ingress vs egress is named in the method.
 
-Exceptions — *not* every Usage call goes through Recorder:
-- `BackendManager.RecordUsage(b, apiCalls, egress, ingress)` is the admin escape hatch that takes an arbitrary tuple. It bypasses the per-attempt rule on purpose and uses `Usage().Record` directly.
-- Tests that exercise the tracker's own semantics (`manager_usage_test.go`) call `Usage().Record` directly — they're verifying the tracker, not the accounting rule.
+Exceptions - *not* every Usage call goes through Recorder:
+- The operations layer's bulk passes take a `UsageGate` and call `Record(b, apiCalls, egress, ingress)` on the tracker with an arbitrary tuple. That bypasses the per-attempt rule on purpose: a fleet-wide rewrite asks once and spends in units the Recorder has no name for.
+- Tests that exercise the tracker's own semantics (`manager_usage_test.go`) call `Usage().Record` directly - they're verifying the tracker, not the accounting rule.
 
 ### Variable Naming
 
@@ -374,7 +443,7 @@ Avoid shadowing package imports with local variable names. When a function recei
 be, err := mp.GetBackend(mu.BackendName)
 etag, err := be.PutObject(ctx, key, body, size, contentType, nil)
 
-// Bad — shadows the backend package import
+// Bad - shadows the backend package import
 backend, err := mp.GetBackend(mu.BackendName)
 ```
 
@@ -400,7 +469,7 @@ Never return `func() {}` to satisfy a `(T, cleanup func(), error)` signature whe
 **How to apply:** Attach the cleanup as a method on the returned type so the caller writes `defer x.Cleanup()` once and the method internally branches on which underlying resource (if any) actually needs releasing. The lint never sees an empty literal, and the caller code stays identical across branches.
 
 ```go
-// Bad — empty literal trips S1186 on the in-memory branch.
+// Bad - empty literal trips S1186 on the in-memory branch.
 func newSink(size int64) (*sink, func(), error) {
     if size <= memoryLimit {
         return &sink{buf: &bytes.Buffer{}}, func() {}, nil
@@ -409,7 +478,7 @@ func newSink(size int64) (*sink, func(), error) {
     return &sink{file: f}, func() { _ = f.Close() }, nil
 }
 
-// Good — cleanup is a method that no-ops on the branch with no resource.
+// Good - cleanup is a method that no-ops on the branch with no resource.
 func newSink(size int64) (*sink, error) {
     if size <= memoryLimit {
         return &sink{buf: &bytes.Buffer{}}, nil
@@ -461,9 +530,14 @@ internal/
     ui/                      # Dashboard handlers + templates
     auth/                    # SigV4 verification + bucket auth
     httputil/                # Cross-cutting HTTP helpers (trusted proxies, login throttle, cert reload)
-  proxy/                     # Manager layer: routes requests, owns workers, glues store + backend
-    manager/                 # BackendManager + role-narrow sub-managers
-    metrics/                 # Manager-level metric collector
+  proxy/                     # Orchestration layer: a namespace over the collaborators below, with no root object
+    infra/                   # BackendRuntime: fleet, usage counters, admission, timeouts
+    object/                  # Object CRUD, read failover, broadcast reads
+    multipart/               # Multipart upload lifecycle
+    writepath/               # Shared write helpers: routing, pending intents, recovery
+    readpath/                # Read failover orchestrator
+    usage/                   # Counter flush to the store + the drift reconcile
+    metrics/                 # Per-backend metric collector
     drain/                   # Backend drain coordinator
     dashboard/               # Dashboard read aggregator
   worker/                    # Background services: replicator, rebalancer, cleanup, scrubber, reaper
@@ -534,14 +608,11 @@ needed; nothing is constructed until it is asked for.
 1. **Lazy providers**: a provider returns the dependency it builds; it
    never has side effects beyond construction. The injector calls it on
    the first `do.Invoke` and memoises the result for subsequent calls.
-2. **Wide composite store, consumer-defined narrow interfaces at the
-   boundary**: consumers receive the wide `core.MetadataStore` (a
-   composite that embeds every per-role interface) and either typehint-
-   narrow it at the field declaration or declare a local interface
-   listing only the methods they call. Producer-side narrow roles
-   (`ObjectStore`, `QuotaStore`, etc.) exist as embedding building
-   blocks for `MetadataStore`; consumer code does not import them
-   directly.
+2. **Role interfaces at the boundary**: `di` holds the opened engine as
+   the unexported `metadataStore` and passes it into each constructor,
+   where it lands in the narrow role composite that consumer declared.
+   Nothing outside `di` can name the wide type, so a consumer's
+   dependency footprint is whatever roles it wrote down.
 
 ### Provider Pattern
 
@@ -550,17 +621,13 @@ Every provider follows the same shape:
 ```go
 // ProvideRebalancer constructs the rebalancer worker.
 func ProvideRebalancer(i do.Injector) (*worker.Rebalancer, error) {
-    mgr, err := do.Invoke[*proxy.BackendManager](i)
+    c, err := resolveWorkerCore(i)
     if err != nil {
         return nil, err
     }
-    stores, err := do.Invoke[core.MetadataStore](i)
-    if err != nil {
-        return nil, err
-    }
-    // Runtime primitives come from the backend runtime; the manager
+    // Fleet primitives come from the runtime; the write coordinator
     // supplies the Placement facet (target selection, delete/move).
-    return worker.NewRebalancer(mgr.Runtime(), mgr, stores), nil
+    return worker.NewRebalancer(c.Runtime, c.Coord, c.Stores), nil
 }
 ```
 
@@ -651,30 +718,32 @@ genuinely missing dependency surfaces at boot, not at first use.
 - Storing the injector as a field on a non-handler struct. Workers,
   managers, and stores receive their dependencies as constructor args
   resolved in the provider; only handlers (HTTP/CLI entry points) carry
-  the injector itself.
+  the injector itself. Adding a store method has its own mechanical
+  checklist, in
+  [`docs/contributing/store.md`](contributing/store.md).
 
 ### Constructor Patterns
 
 **Parameter threshold.** A constructor with **four or more parameters**, or
 with two or more same-typed primitives (bool/int/string) whose call-site
 order is ambiguous, takes a single `Deps` (dependency bag) or `Config`
-(value config) struct instead of a positional list — named fields document
+(value config) struct instead of a positional list - named fields document
 each argument and make transposition impossible. `context.Context` stays
 the first positional argument, never inside the struct; three or fewer
 distinct-typed parameters stay positional. Pass the struct by pointer when
 it is large (`gocritic` flags structs over ~80 bytes), by value otherwise.
-Capability sub-structs (the `BackendManagerConfig` Storage / Stores /
-Policies / Features / Operations grouping) are reserved for genuinely large
-configs whose fields come from different sources — a flat `Deps` is the
-default.
+A flat `Deps` is the default. Capability sub-structs, grouping fields by
+where they come from, are reserved for genuinely large configs - and are
+worth a second look before reaching for: the last one grew four sub-structs
+that nothing read, which stayed invisible because a config nobody reads still
+compiles.
 
 Constructors at the DI/wiring boundary panic on missing required
 dependencies via `internal/util/must`. The boundary is the set of
 constructors a DI provider or a test fixture builds directly:
-`proxy.NewBackendManager`, every `worker.New*`, every
-`transport/{s3api,admin,ui}.New*`, and the `proxy/{drain,readpath,
-multipart,object,writepath}` package constructors that take a `*Deps`
-or interface bag. Internal helpers that are only called from one
+every `worker.New*`, every `transport/{s3api,admin,ui}.New*`, and the
+`proxy/{drain,readpath,multipart,object,writepath,usage}` package
+constructors that take a `*Deps` or interface bag. Internal helpers that are only called from one
 already-validated site (`accounting.New`, `metrics.New`,
 `dashboard.New`, `infra.New`) trust their caller and skip the panic.
 
@@ -704,12 +773,12 @@ fail at boot for I/O, parsing, or network reasons keep the
 upstream.
 
 **When NOT to use `must.NotNil`.** It is for already-resolved internal
-dependencies whose absence is a programmer wiring bug — nothing else. Do
+dependencies whose absence is a programmer wiring bug - nothing else. Do
 not reach for it on:
 
 - values derived from config or user input (validate in `internal/config.SetDefaultsAndValidate` and return an error);
 - network clients, file paths, or external services that can fail at runtime;
-- optional or feature-gated dependencies — use `Optional[T]` or an explicit nil-check rather than panicking.
+- optional or feature-gated dependencies - use `Optional[T]` or an explicit nil-check rather than panicking.
 
 The test: if a nil here could result from anything other than a developer
 mis-wiring the program, return an error instead of panicking.
@@ -760,9 +829,36 @@ they truly belong to a new bounded concern - into a new role.
    handwritten test mocks (`internal/proxy/mock_store_test.go` etc.).
 6. Add a `Provide<Role>` provider in `internal/di/di.go` if it is a new
    role; otherwise the existing provider already covers it.
-7. Schema changes go in a new `internal/store/postgres/migrations/000NN_*.sql`
-   AND `internal/store/sqlite/schema.sql`. Bump
-   `postgres.ExpectedSchemaVersion`.
+7. Schema changes are written twice, once per engine, and both engines pin the
+   version they expect:
+
+   **PostgreSQL** - add `internal/store/postgres/migrations/000NN_*.sql` and
+   bump `postgres.ExpectedSchemaVersion` to the new migration number.
+
+   **SQLite** - add `internal/store/sqlite/migrations/000NN_*.sql`, apply the
+   same change to `internal/store/sqlite/schema.sql`, and bump both
+   `sqlite.expectedSchemaVersion` and the `INSERT INTO schema_version` value at
+   the bottom of `schema.sql`.
+
+   Both files are needed because they serve different databases. `schema.sql`
+   is the baseline a fresh database is created from; the numbered migration is
+   what an existing database is upgraded through. A change made in only one of
+   them means a new install and an upgraded install disagree, which is the kind
+   of drift nothing notices until an operator hits it.
+
+   Migrations are named `<version>_<description>.sql`; the runner reads the
+   version from the file name, applies every migration above the recorded
+   version in order, and writes the version row in the same transaction as the
+   migration itself.
+
+   Data repair belongs in a migration too, not in a startup pass. A one-off
+   fixup that runs on every boot is unversioned, unrecorded, and invisible to
+   the operator whose data it rewrites.
+
+   Missing a version bump leaves the binary refusing to start against a
+   database it just migrated, and only the integration suite catches it: those
+   tests are behind `//go:build integration`, so `go test ./...` compiles and
+   passes without them. Verify schema work with `make integration-test`.
 
 ### Adding a New Worker
 
@@ -903,10 +999,17 @@ conventions above and continue to use `slog.LogAttrs` directly.
 **S3 API requests** produce two correlated audit entries sharing the
 same `request_id`:
 
-- HTTP layer (`s3.PutObject`, `s3.GetObject`, etc.) — method, path,
+- HTTP layer (`s3.PutObject`, `s3.GetObject`, etc.) - method, path,
   bucket, status, duration.
-- Storage layer (`storage.PutObject`, `storage.GetObject`, etc.) —
+- Storage layer (`storage.PutObject`, `storage.GetObject`, etc.) -
   key, backend, size.
+
+Both also carry `user`, the identity the request authenticated as.
+`audit.Log` reads it and the request id from context, so no call site
+passes either and the storage-layer entry carries the same pair as the
+HTTP-layer one without being handed an identity. An entry with no
+`user` authenticated no caller: a rejected request, or a background
+worker acting on its own.
 
 **Internal operations** generate their own correlation IDs:
 
@@ -943,7 +1046,7 @@ directly.
   spans.
 - `trace_id` and `span_id` are automatically injected into JSON log
   output by `telemetry.TraceHandler` for any log call with an active
-  span in context — use `*Context` slog variants
+  span in context - use `*Context` slog variants
   (`InfoContext`/`WarnContext`/`ErrorContext`).
 
 ### Log Levels
@@ -952,8 +1055,8 @@ directly.
 |-------|-----|
 | `slog.LevelDebug` | Verbose state; off by default. |
 | `slog.LevelInfo`  | Lifecycle (startup/shutdown), terminal success of a notable operation, audit entries. |
-| `slog.LevelWarn`  | Recoverable failure — caller proceeds, operator should know (failover, degraded mode, retry-able errors). |
-| `slog.LevelError` | Unrecoverable failure of an operation — request fails, background tick aborts, integrity violation. |
+| `slog.LevelWarn`  | Recoverable failure - caller proceeds, operator should know (failover, degraded mode, retry-able errors). |
+| `slog.LevelError` | Unrecoverable failure of an operation - request fails, background tick aborts, integrity violation. |
 
 ---
 
@@ -1134,11 +1237,11 @@ missing audit log means a customer dispute cannot be reconstructed.
 - Benchmark files use the `_bench_test.go` suffix: `auth_bench_test.go`, `helpers_bench_test.go`
 - Integration benchmarks live in `internal/integration/bench_test.go` (gated behind the `integration` build tag)
 - Run benchmarks: `make bench`, `make bench-auth`, `make bench-crypto`, etc. Override duration with `BENCH_TIME=5s make bench`
-- Use `b.Loop()` (Go 1.24+) for all benchmark loops — not `for i := 0; i < b.N; i++`
+- Use `b.Loop()` (Go 1.24+) for all benchmark loops - not `for i := 0; i < b.N; i++`
 - Use `b.SetBytes()` for throughput benchmarks so Go reports MB/s
 - Use `b.ResetTimer()` after setup/population steps
 - Use `b.RunParallel` with `pb.Next()` for concurrent benchmarks (`b.Loop()` cannot replace `pb.Next()` inside `RunParallel` callbacks)
-- Pre-compute keys and test data outside the measured loop — `fmt.Sprintf` inside a benchmark loop measures string formatting, not the code under test
+- Pre-compute keys and test data outside the measured loop - `fmt.Sprintf` inside a benchmark loop measures string formatting, not the code under test
 - Benchmark names follow `BenchmarkFunctionName/variant` with sub-benchmarks for different input sizes
 
 ### Fuzz Tests
@@ -1147,15 +1250,15 @@ missing audit log means a customer dispute cannot be reconstructed.
 - Run fuzz targets: `make fuzz` (default 30s per target). Override with `FUZZ_TIME=5m make fuzz` for deeper exploration
 - CI runs a 10s smoke test per target to catch regressions
 - Seed the corpus with valid inputs, edge cases, and adversarial inputs via `f.Add()`
-- Fuzz callbacks must never panic — verify invariants with `t.Errorf` instead
-- Match the production code path — use `xml.NewDecoder().Decode` not `xml.Unmarshal` when production uses streaming decoders
+- Fuzz callbacks must never panic - verify invariants with `t.Errorf` instead
+- Match the production code path - use `xml.NewDecoder().Decode` not `xml.Unmarshal` when production uses streaming decoders
 - **Differential oracles:** When two implementations exist for the same operation (e.g., `parseSigV4Fields` and `parseSigV4FieldsDirect`), fuzz both and assert they agree on every input
 - **Structural invariants:** Assert properties of the output that must always hold (e.g., "canonical request has exactly N newlines", "bucket never contains a slash", "nonce is always 12 bytes")
-- Do not assert application-level validation at the parsing layer — XML decoders accept negative integers; the handler layer validates range constraints
+- Do not assert application-level validation at the parsing layer - XML decoders accept negative integers; the handler layer validates range constraints
 
 ### Test Patterns
 
-- **Generated mocks** (`mockgen`) are the preferred approach for new tests — they stay in sync with interfaces automatically
+- **Generated mocks** (`mockgen`) are the preferred approach for new tests - they stay in sync with interfaces automatically
 - **FailableStore** wraps a store to inject errors for circuit breaker testing
 - Test assertions use standard `testing.T` methods, not external assertion libraries
 
@@ -1174,7 +1277,7 @@ Use this sparingly and only for code that genuinely cannot be tested:
 - `main()` and subcommand entry points that call `os.Exit`
 - Signal handlers and process lifecycle glue
 
-Do **not** use `codecov:ignore` for code that requires a database, S3 backend, or Redis — integration tests run with testcontainers and contribute coverage. Extract testable logic into separate functions that return errors instead of calling `os.Exit` directly.
+Do **not** use `codecov:ignore` for code that requires a database, S3 backend, or Redis - integration tests run with testcontainers and contribute coverage. Extract testable logic into separate functions that return errors instead of calling `os.Exit` directly.
 
 ---
 
@@ -1231,14 +1334,14 @@ The `.version` file in the repository root controls the version baked into binar
 
 When a PR changes config fields, API behavior, or deployment requirements, update all affected documentation in the same PR:
 
-- `packaging/config.yaml` — sample config
-- `config.yaml` — local dev config
-- `README.md` — config reference section
-- `docs/*.md` — per-topic operational documentation (see `docs/admin-guide.md` for the index)
-- `docs/security-hardening.md` — if security-relevant
-- `docs/disaster-recovery.md` — if it affects failure modes
-- `web/content/guides/*.md` — deployment guides
-- `deploy/` — Nomad, Kubernetes, and Helm manifests
+- `packaging/config.yaml` - sample config
+- `config.yaml` - local dev config
+- `README.md` - config reference section
+- `docs/*.md` - per-topic operational documentation (see `docs/admin-guide.md` for the index)
+- `docs/security-hardening.md` - if security-relevant
+- `docs/disaster-recovery.md` - if it affects failure modes
+- `web/content/guides/*.md` - deployment guides
+- `deploy/` - Nomad, Kubernetes, and Helm manifests
 
 Search across all docs with `grep -rn 'field_name' README.md docs/ web/content/ packaging/ deploy/` before committing to catch every reference.
 
@@ -1287,7 +1390,7 @@ For branches without a linked issue, use a short kebab-case description of the t
 // to safely handle concurrent overwrites and deletes.
 // -------------------------------------------------------------------------------
 
-package proxy
+package worker
 
 // -------------------------------------------------------------------------
 // PUBLIC API
@@ -1295,12 +1398,12 @@ package proxy
 
 // Replicate finds under-replicated objects and creates additional copies to
 // reach the target replication factor. Returns the number of copies created.
-func (m *BackendManager) Replicate(ctx context.Context, cfg config.ReplicationConfig) (int, error) {
+func (r *Replicator) Replicate(ctx context.Context, cfg config.ReplicationConfig) (int, error) {
     start := time.Now()
     ctx = audit.WithRequestID(ctx, audit.NewID())
 
     // Find under-replicated objects
-    locations, err := m.store.GetUnderReplicatedObjects(ctx, cfg.Factor, cfg.BatchSize)
+    locations, err := r.store.GetUnderReplicatedObjects(ctx, cfg.Factor, cfg.BatchSize)
     if err != nil {
         return 0, fmt.Errorf("failed to query under-replicated objects: %w", err)
     }
@@ -1321,10 +1424,10 @@ func (m *BackendManager) Replicate(ctx context.Context, cfg config.ReplicationCo
 // 3. Finally we record the results
 // ==================================
 
-package proxy
+package worker
 
 // Let's create the replicate function
-func (m *BackendManager) Replicate(ctx context.Context, cfg config.ReplicationConfig) (int, error) {
+func (r *Replicator) Replicate(ctx context.Context, cfg config.ReplicationConfig) (int, error) {
     // get the start time
     start := time.Now()
     // ...

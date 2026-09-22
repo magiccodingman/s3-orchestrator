@@ -17,15 +17,66 @@ import (
 	"context"
 	"time"
 
+	"go.uber.org/mock/gomock"
+
 	"github.com/afreidah/s3-orchestrator/internal/counter"
 	"github.com/afreidah/s3-orchestrator/internal/proxy/accounting"
 	"github.com/afreidah/s3-orchestrator/internal/store/core"
 )
 
+// -------------------------------------------------------------------------
+// CONSTRUCTOR
+// -------------------------------------------------------------------------
+
+// newMockOps builds an Ops mock that already answers Quota() with a real
+// tracker, which a test reaches through ops.Quota() to assert the bytes a
+// mutation credited.
+//
+// Stamped here rather than per fixture because a MockOps with no answer aborts
+// the calling goroutine, and inside a worker pool that abort deadlocks the
+// dispatcher instead of failing the test.
+func newMockOps(ctrl *gomock.Controller) *MockOps {
+	ops := NewMockOps(ctrl)
+	ops.EXPECT().Quota().Return(counter.NewQuotaTracker(nil)).AnyTimes()
+	return ops
+}
+
+// newMockScrubberOps is newMockOps for the scrubber's narrower Ops surface,
+// which reaches the same tracker when a scrub drops a corrupt copy.
+func newMockScrubberOps(ctrl *gomock.Controller) *MockScrubberOps {
+	ops := NewMockScrubberOps(ctrl)
+	ops.EXPECT().Quota().Return(counter.NewQuotaTracker(nil)).AnyTimes()
+	return ops
+}
+
+// newMockCleanupOps is newMockOps for the cleanup and pending workers, which
+// credit the tracker when a promotion displaces an older copy.
+func newMockCleanupOps(ctrl *gomock.Controller) *MockCleanupOps {
+	ops := NewMockCleanupOps(ctrl)
+	ops.EXPECT().Quota().Return(counter.NewQuotaTracker(nil)).AnyTimes()
+	return ops
+}
+
+// newTestReplicator builds a Replicator with no stored-form decoders and no
+// integrity config, which is the shape most replication tests want: copies move
+// verbatim and nothing is hash-checked. Tests that exercise verify_on_replicate
+// call SetIntegrityConfig and pass their own decoders through ReplicatorDeps.
+func newTestReplicator(ops Ops, pl Placement, store ReplicatorStore) *Replicator {
+	return NewReplicator(ReplicatorDeps{Ops: ops, Placement: pl, Store: store})
+}
+
+// -------------------------------------------------------------------------
+// TYPES
+// -------------------------------------------------------------------------
+
 // mockMetadataStore is a minimal stub for worker tests. It embeds every
 // narrow store role as a nil interface so any worker signature accepts it;
 // tests override only the methods they exercise, and any unstubbed call
 // panics, which surfaces test-fixture gaps loudly.
+//
+// The fields are grouped by the worker that reads them: the scrub cycle's
+// backend filtering, the rebalancer planner's batch-query fixtures, and the
+// pending reaper's intents.
 type mockMetadataStore struct {
 	core.ObjectStore
 	core.QuotaStore
@@ -51,37 +102,62 @@ type mockMetadataStore struct {
 	dlqDepthErr         error
 	randomHashedObjects []core.ObjectLocation
 	objectsWithoutHash  []core.ObjectLocation
+	allLocations        []core.ObjectLocation
+	allLocationsErr     error
+	scrubbed            []string
+
+	scrubSelectedBackends []string
+	scrubDeclinedBackends []string
+	deferredCandidates    int64
+	deferredCandidatesErr error
+
+	markScrubbedErr     error
+	deletedLocations    []string
+	deleteLocationErr   error
+	oldestUnverifiedErr error
+	oldestUnverified    time.Duration
+	neverVerified       int64
+	deferredCopies      int64
+	coverageReachable   []string
 	lastUpdatedHash     string
+	lastRecordedETag    string
 	underReplicated     []core.ObjectLocation
+	underReplicatedErr  error
 	overReplicated      []core.ObjectLocation
+	overReplicatedErr   error
 	overReplicatedCount int64
 	quotaStats          map[string]core.QuotaStat
+	quotaStatsErr       error
 	recordReplicaOK     bool
 	recordReplicaSize   int64
 	recordReplicaErr    error
 	replicaRecorded     int
 	removedCopies       int
+	removedCopySize     int64
 	removeExcessNoOp    bool
+	removeExcessErr     error
 	objectsByBackend    map[string][]core.ObjectLocation
 	moveSize            int64
 	staleDeleted        int
+	deletedLocationSize int64
 
-	// Rebalancer planner fixtures: counts batch invocations and lets
-	// tests override the (key -> backends) map returned by the new
-	// batch query.
 	getBackendsForKeysCalls int
 	getBackendsForKeysResp  map[string][]string
 
-	// Pending reaper fixtures
 	stalePending      []core.PendingObject
 	deletedPendingIDs []string
 	promotedPending   []core.PendingObject
 	promoteResult     core.PendingPromoteResult
 	promoteDisplaced  []core.DeletedCopy
+	promoteDeltas     core.QuotaDeltas
 	promoteErr        error
 	pendingDepthVal   int64
 	pendingDepthErr   error
 }
+
+// -------------------------------------------------------------------------
+// PUBLIC API
+// -------------------------------------------------------------------------
 
 // GetPendingCleanups is a stub on mockMetadataStore; returns either the test-set
 // fixture field or the zero value.
@@ -148,15 +224,42 @@ func (m *mockMetadataStore) CleanupDLQDepth(_ context.Context) (int64, error) {
 	return m.dlqDepthVal, m.dlqDepthErr
 }
 
-// GetRandomHashedObjects is a stub on mockMetadataStore; returns either the test-set
-// fixture field or the zero value.
-func (m *mockMetadataStore) GetRandomHashedObjects(_ context.Context, _ int) ([]core.ObjectLocation, error) {
+// GetLeastRecentlyScrubbedObjects is a stub on mockMetadataStore; returns either the test-set
+// fixture field or the zero value. Records the backend filter so tests can
+// assert the scrubber only asked for backends it can afford to read.
+func (m *mockMetadataStore) GetLeastRecentlyScrubbedObjects(_ context.Context, _ int, backends []string) ([]core.ObjectLocation, error) {
+	m.scrubSelectedBackends = backends
 	return m.randomHashedObjects, nil
+}
+
+// CountScrubCandidatesOnBackends is a stub on mockMetadataStore; records the
+// backends a cycle declined and returns the test-set fixture count.
+func (m *mockMetadataStore) CountScrubCandidatesOnBackends(_ context.Context, backends []string) (int64, error) {
+	m.scrubDeclinedBackends = backends
+	return m.deferredCandidates, m.deferredCandidatesErr
+}
+
+// MarkObjectScrubbed is a stub on mockMetadataStore; records the copies a
+// scrub cycle stamped so tests can assert the sweep advanced past them.
+func (m *mockMetadataStore) MarkObjectScrubbed(_ context.Context, key, backendName string) error {
+	m.scrubbed = append(m.scrubbed, key+"@"+backendName)
+	return m.markScrubbedErr
+}
+
+// IntegrityCoverage is a stub on mockMetadataStore; records the backend set the
+// caller scoped the query to and returns the test-set fixture fields.
+func (m *mockMetadataStore) IntegrityCoverage(_ context.Context, reachable []string) (core.CoverageStat, error) {
+	m.coverageReachable = reachable
+	return core.CoverageStat{
+		OldestUnverifiedAge: m.oldestUnverified,
+		NeverVerified:       m.neverVerified,
+		Deferred:            m.deferredCopies,
+	}, m.oldestUnverifiedErr
 }
 
 // GetObjectsWithoutHash is a stub on mockMetadataStore; returns either the test-set
 // fixture field or the zero value.
-func (m *mockMetadataStore) GetObjectsWithoutHash(_ context.Context, limit, _ int) ([]core.ObjectLocation, error) {
+func (m *mockMetadataStore) GetObjectsWithoutHash(_ context.Context, limit, _ int, _ string) ([]core.ObjectLocation, error) {
 	if limit > len(m.objectsWithoutHash) {
 		return m.objectsWithoutHash, nil
 	}
@@ -170,6 +273,19 @@ func (m *mockMetadataStore) UpdateContentHash(_ context.Context, _, _, hash stri
 	return nil
 }
 
+// RecordObjectIdentity is a stub on mockMetadataStore; records the ETag the
+// backfill computed so a test can assert the object learned one.
+func (m *mockMetadataStore) RecordObjectIdentity(_ context.Context, _ string, id *core.ObjectIdentity) error {
+	if id != nil {
+		m.lastRecordedETag = id.ETag
+	}
+	return nil
+}
+
+// -------------------------------------------------------------------------
+// CONSTRUCTOR
+// -------------------------------------------------------------------------
+
 // newTestUsageTracker creates a UsageTracker with no limits for testing.
 func newTestUsageTracker() *counter.UsageTracker {
 	return counter.NewUsageTracker(counter.NewLocalCounterBackend([]string{"b1", "b2"}), nil)
@@ -182,22 +298,26 @@ func newTestRecorder() *accounting.Recorder {
 	return accounting.New(newTestUsageTracker(), func(string, string, time.Time, error) {})
 }
 
+// -------------------------------------------------------------------------
+// PUBLIC API
+// -------------------------------------------------------------------------
+
 // GetUnderReplicatedObjects is a stub on mockMetadataStore; returns either the test-set
 // fixture field or the zero value.
 func (m *mockMetadataStore) GetUnderReplicatedObjects(_ context.Context, _, _ int) ([]core.ObjectLocation, error) {
-	return m.underReplicated, nil
+	return m.underReplicated, m.underReplicatedErr
 }
 
 // GetUnderReplicatedObjectsExcluding is a stub on mockMetadataStore; returns either the test-set
 // fixture field or the zero value.
 func (m *mockMetadataStore) GetUnderReplicatedObjectsExcluding(_ context.Context, _, _ int, _ []string) ([]core.ObjectLocation, error) {
-	return m.underReplicated, nil
+	return m.underReplicated, m.underReplicatedErr
 }
 
 // GetQuotaStats is a stub on mockMetadataStore; returns either the test-set
 // fixture field or the zero value.
 func (m *mockMetadataStore) GetQuotaStats(_ context.Context) (map[string]core.QuotaStat, error) {
-	return m.quotaStats, nil
+	return m.quotaStats, m.quotaStatsErr
 }
 
 // RecordReplica is a stub on mockMetadataStore; returns either the test-set
@@ -213,7 +333,7 @@ func (m *mockMetadataStore) RecordReplica(_ context.Context, _, _, _ string) (in
 // GetOverReplicatedObjects is a stub on mockMetadataStore; returns either the test-set
 // fixture field or the zero value.
 func (m *mockMetadataStore) GetOverReplicatedObjects(_ context.Context, _, _ int) ([]core.ObjectLocation, error) {
-	return m.overReplicated, nil
+	return m.overReplicated, m.overReplicatedErr
 }
 
 // CountOverReplicatedObjects is a stub on mockMetadataStore; returns either the test-set
@@ -223,14 +343,18 @@ func (m *mockMetadataStore) CountOverReplicatedObjects(_ context.Context, _ int)
 }
 
 // RemoveExcessCopy is a stub on mockMetadataStore; reports a successful
-// removal so the cleaner counts it, or a benign no-op (removed=false) when
-// removeExcessNoOp is set, mimicking a race that already absorbed the excess.
-func (m *mockMetadataStore) RemoveExcessCopy(_ context.Context, _, _ string, _ int) (bool, error) {
+// removal so the cleaner counts it, a benign no-op (removed=false) when
+// removeExcessNoOp is set, mimicking a race that already absorbed the excess,
+// or the seeded removeExcessErr when the test drives a refusal.
+func (m *mockMetadataStore) RemoveExcessCopy(_ context.Context, _, _ string, _ int) (int64, bool, error) {
+	if m.removeExcessErr != nil {
+		return 0, false, m.removeExcessErr
+	}
 	if m.removeExcessNoOp {
-		return false, nil
+		return 0, false, nil
 	}
 	m.removedCopies++
-	return true, nil
+	return m.removedCopySize, true, nil
 }
 
 // ListObjectsByBackend is a stub on mockMetadataStore; returns either the test-set
@@ -248,7 +372,7 @@ func (m *mockMetadataStore) MoveObjectLocation(_ context.Context, _, _, _ string
 // GetAllObjectLocations is a stub on mockMetadataStore; returns either the test-set
 // fixture field or the zero value.
 func (m *mockMetadataStore) GetAllObjectLocations(_ context.Context, _ string) ([]core.ObjectLocation, error) {
-	return nil, nil
+	return m.allLocations, m.allLocationsErr
 }
 
 // GetObjectBackendsForKeys is a stub on mockMetadataStore; returns either the test-set
@@ -269,9 +393,13 @@ func (m *mockMetadataStore) FlushUsageDeltas(_ context.Context, _, _ string, _, 
 
 // DeleteObjectLocation is a stub on mockMetadataStore; returns either the test-set
 // fixture field or the zero value.
-func (m *mockMetadataStore) DeleteObjectLocation(_ context.Context, _, _ string) error {
+func (m *mockMetadataStore) DeleteObjectLocation(_ context.Context, key, backendName string) (int64, error) {
+	if m.deleteLocationErr != nil {
+		return 0, m.deleteLocationErr
+	}
 	m.staleDeleted++
-	return nil
+	m.deletedLocations = append(m.deletedLocations, key+"@"+backendName)
+	return m.deletedLocationSize, nil
 }
 
 // --- PendingStore stubs ---
@@ -294,11 +422,11 @@ func (m *mockMetadataStore) DeletePending(_ context.Context, intentID string) er
 // resolution outcome. The captured slice lets tests verify the reaper
 // passed is a stub on mockMetadataStore; returns either the test-set
 // fixture field or the zero value.
-func (m *mockMetadataStore) PromotePending(_ context.Context, p *core.PendingObject) (core.PendingPromoteResult, []core.DeletedCopy, error) {
+func (m *mockMetadataStore) PromotePending(_ context.Context, p *core.PendingObject) (core.PendingPromoteResult, []core.DeletedCopy, core.QuotaDeltas, error) {
 	if p != nil {
 		m.promotedPending = append(m.promotedPending, *p)
 	}
-	return m.promoteResult, m.promoteDisplaced, m.promoteErr
+	return m.promoteResult, m.promoteDisplaced, m.promoteDeltas, m.promoteErr
 }
 
 // PendingDepth returns the configured depth value (defaults to 0).

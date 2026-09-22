@@ -17,7 +17,8 @@ package tui
 import (
 	"context"
 	"fmt"
-	"sort"
+	"maps"
+	"slices"
 	"strings"
 
 	"github.com/afreidah/s3-orchestrator/internal/transport/admin/adminapi"
@@ -31,9 +32,7 @@ const (
 	logTimeWidth      = 8
 	logLevelWidth     = 5
 	logComponentWidth = 16
-	// logFixedWidth is the space the non-message columns and their single-space
-	// separators consume, subtracted from the pane width to size the message.
-	logFixedWidth = logTimeWidth + 1 + logLevelWidth + 1 + logComponentWidth + 1
+	logFixedWidth     = logTimeWidth + 1 + logLevelWidth + 1 + logComponentWidth + 1 // columns plus separators
 )
 
 // logsView holds the state of the logs pane.
@@ -102,9 +101,7 @@ func (m *model) applyLogs(resp *adminapi.LogsResponse) {
 func (m *model) handleLogsKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch key.String() {
 	case "esc", "left", "h":
-		m.navFocus = true
-		m.navCursor = int(m.section)
-		return m, nil
+		return m.navBack()
 	case "r":
 		m.logs.loading = true
 		cmd := m.loadLogs()
@@ -171,11 +168,7 @@ func logMessage(e *adminapi.LogEntry) string {
 	if len(e.Attrs) == 0 {
 		return e.Message
 	}
-	keys := make([]string, 0, len(e.Attrs))
-	for k := range e.Attrs {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
+	keys := slices.Sorted(maps.Keys(e.Attrs))
 
 	var b strings.Builder
 	b.WriteString(e.Message)
@@ -212,14 +205,10 @@ func (m *model) logsFooterView() string {
 // logsBodyView renders the current content: an error, the loading indicator, an
 // empty notice, or the scrolling log viewport.
 func (m *model) logsBodyView() string {
-	switch {
-	case m.logs.err != nil:
-		return errStyle.Render("error: " + m.logs.err.Error())
-	case m.logs.loading:
-		return m.spinner.View() + " loading..."
-	case len(m.logs.entries) == 0:
-		return pathStyle.Render("(no log entries)")
-	default:
+	return m.paneBody(m.logs.err, "", m.logs.loading, func() string {
+		if len(m.logs.entries) == 0 {
+			return pathStyle.Render("(no log entries)")
+		}
 		return m.logs.vp.View()
-	}
+	})
 }

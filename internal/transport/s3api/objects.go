@@ -15,18 +15,20 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 	"time"
 
+	"go.opentelemetry.io/otel/trace"
+
+	s3be "github.com/afreidah/s3-orchestrator/internal/backend"
 	"github.com/afreidah/s3-orchestrator/internal/internalkey"
 	"github.com/afreidah/s3-orchestrator/internal/observe/telemetry"
+	"github.com/afreidah/s3-orchestrator/internal/proxy/object"
 	"github.com/afreidah/s3-orchestrator/internal/store/core"
 	"github.com/afreidah/s3-orchestrator/internal/util/bufpool"
-	"go.opentelemetry.io/otel/trace"
 )
 
 // errIfNoneMatchExists is returned by handlePut when the request carries
@@ -106,7 +108,6 @@ func (s *Server) handlePut(ctx context.Context, w http.ResponseWriter, r *http.R
 		}
 	}
 
-	// --- Conditional write: If-None-Match: * fails when the key exists ---
 	// Best-effort precondition check before the body upload so a doomed
 	// request does not transmit. Matches AWS S3's documented behavior:
 	// the check is not a hard guarantee under contention, but eliminates
@@ -115,29 +116,42 @@ func (s *Server) handlePut(ctx context.Context, w http.ResponseWriter, r *http.R
 		return status, err
 	}
 
-	// --- Early rejection before body transmission (Expect: 100-Continue) ---
 	// Check backend capacity before reading the request body. When the
 	// client sends Expect: 100-continue, Go's net/http delays the 100
 	// Continue response until the first r.Body.Read(). Rejecting here
 	// avoids transmitting the entire upload body for a doomed request.
-	if !s.Manager.Objects().CanAcceptWrite(r.ContentLength) {
+	if !s.Objects.CanAcceptWrite(r.ContentLength) {
 		telemetry.EarlyRejectionsTotal.Inc()
 		msg := fmt.Sprintf("No backend can accept a %d byte upload", r.ContentLength)
-		if hint := formatCapacityHint(s.Manager.Objects().BackendCapacityStats(ctx)); hint != "" {
+		if hint := formatCapacityHint(s.Objects.BackendCapacityStats(ctx)); hint != "" {
 			msg += "; backend usage: " + hint
 		}
 		writeS3Error(w, http.StatusInsufficientStorage, "InsufficientStorage", msg)
 		return http.StatusInsufficientStorage, fmt.Errorf("no backend capacity for %d bytes", r.ContentLength)
 	}
 
-	// --- Add size to span ---
+	// Refused alongside the capacity check and for the same reason: an
+	// unusable tag set rejected after the body lands has already spent the
+	// transfer and left an object on a backend to clean up.
+	tags, err := parseTaggingHeader(r.Header.Get("x-amz-tagging"))
+	if err != nil {
+		return writeTaggingError(w, err), err
+	}
+
 	span := trace.SpanFromContext(ctx)
 	span.SetAttributes(
 		telemetry.AttrObjectSize.Int64(r.ContentLength),
 		telemetry.AttrContentType.String(contentType),
 	)
 
-	etag, err := s.Manager.Objects().PutObject(ctx, key, r.Body, r.ContentLength, contentType, metadata)
+	etag, err := s.Objects.PutObject(ctx, &object.PutObjectRequest{
+		Key:         key,
+		Body:        r.Body,
+		Size:        r.ContentLength,
+		ContentType: contentType,
+		Metadata:    metadata,
+		Tags:        tags,
+	})
 	if err != nil {
 		return writeStorageError(w, err, "Failed to store object"), err
 	}
@@ -155,41 +169,55 @@ func (s *Server) handlePut(ctx context.Context, w http.ResponseWriter, r *http.R
 func (s *Server) handleGet(ctx context.Context, w http.ResponseWriter, r *http.Request, key string) (int, int64, error) {
 	rangeHeader := r.Header.Get("Range")
 
-	result, err := s.Manager.Objects().GetObject(ctx, key, rangeHeader)
+	result, err := s.Objects.GetObject(ctx, key, rangeHeader)
 	if err != nil {
 		return writeStorageError(w, err, "Failed to retrieve object"), 0, err
 	}
 	defer func() { _ = result.Body.Close() }()
 
-	// --- Add size to span ---
 	span := trace.SpanFromContext(ctx)
 	span.SetAttributes(
 		telemetry.AttrObjectSize.Int64(result.Size),
 		telemetry.AttrContentType.String(result.ContentType),
 	)
 
+	// Validators go out before the conditional check so a 304 carries the
+	// ETag and Last-Modified it would have carried on a 200 (RFC 9110 15.4.5).
+	setValidatorHeaders(w, result.GetObjectResult)
+
+	// Preconditions are evaluated before the Range is considered: a failed
+	// precondition aborts the whole request, whether or not only part of the
+	// representation was asked for (RFC 9110 13.1). Evaluating these only for
+	// unranged GETs let a resumable download splice bytes from a replaced
+	// object into the file it had already partly fetched.
+	if status, done := checkConditionals(r, result.ETag, result.LastModified); done {
+		w.WriteHeader(status)
+		return status, 0, nil
+	}
+
+	// If-Range asks for the range only while the representation is unchanged,
+	// and for the whole object otherwise. The partial body already opened is
+	// discarded and the object re-fetched in full, which costs an extra round
+	// trip only on the mismatch that would otherwise corrupt the download.
+	if rangeHeader != "" && !ifRangeMatches(r, result.ETag, result.LastModified) {
+		_ = result.Body.Close()
+		full, ferr := s.Objects.GetObject(ctx, key, "")
+		if ferr != nil {
+			return writeStorageError(w, ferr, "Failed to retrieve object"), 0, ferr
+		}
+		result = full
+		setValidatorHeaders(w, result.GetObjectResult)
+	}
+
 	w.Header().Set(headerContentType, result.ContentType)
 	if result.Size > 0 {
 		w.Header().Set("Content-Length", strconv.FormatInt(result.Size, 10))
-	}
-	if result.ETag != "" {
-		w.Header().Set("ETag", result.ETag)
-	}
-	if !result.LastModified.IsZero() {
-		w.Header().Set("Last-Modified", result.LastModified.UTC().Format(http.TimeFormat))
 	}
 	w.Header().Set("Accept-Ranges", "bytes")
 	for k, v := range result.Metadata {
 		w.Header().Set("x-amz-meta-"+k, v)
 	}
-
-	// --- Conditional request evaluation (skip for range requests) ---
-	if rangeHeader == "" {
-		if status, done := checkConditionals(r, result.ETag, result.LastModified); done {
-			w.WriteHeader(status)
-			return status, 0, nil
-		}
-	}
+	setTaggingCountHeader(w, result.TagCount)
 
 	status := http.StatusOK
 	if result.ContentRange != "" {
@@ -208,12 +236,11 @@ func (s *Server) handleGet(ctx context.Context, w http.ResponseWriter, r *http.R
 
 // handleHead processes HEAD requests.
 func (s *Server) handleHead(ctx context.Context, w http.ResponseWriter, r *http.Request, key string) (int, error) {
-	result, err := s.Manager.Objects().HeadObject(ctx, key)
+	result, err := s.Objects.HeadObject(ctx, key)
 	if err != nil {
 		return writeStorageError(w, err, "Failed to retrieve object metadata"), err
 	}
 
-	// --- Add size to span ---
 	span := trace.SpanFromContext(ctx)
 	span.SetAttributes(
 		telemetry.AttrObjectSize.Int64(result.Size),
@@ -232,8 +259,8 @@ func (s *Server) handleHead(ctx context.Context, w http.ResponseWriter, r *http.
 	for k, v := range result.Metadata {
 		w.Header().Set("x-amz-meta-"+k, v)
 	}
+	setTaggingCountHeader(w, result.TagCount)
 
-	// --- Conditional request evaluation ---
 	if status, done := checkConditionals(r, result.ETag, result.LastModified); done {
 		w.WriteHeader(status)
 		return status, nil
@@ -246,7 +273,7 @@ func (s *Server) handleHead(ctx context.Context, w http.ResponseWriter, r *http.
 // handleDelete processes DELETE requests. The manager treats missing objects as
 // success (S3 idempotent delete), so any error returned is a real backend failure.
 func (s *Server) handleDelete(ctx context.Context, w http.ResponseWriter, _ *http.Request, key string) (int, error) {
-	if err := s.Manager.Objects().DeleteObject(ctx, key); err != nil {
+	if err := s.Objects.DeleteObject(ctx, key); err != nil {
 		return writeStorageError(w, err, "Failed to delete object"), err
 	}
 
@@ -254,34 +281,55 @@ func (s *Server) handleDelete(ctx context.Context, w http.ResponseWriter, _ *htt
 	return http.StatusNoContent, nil
 }
 
-// handleCopyObject processes PUT requests with the x-amz-copy-source header.
-// Copies an object from the source key to the destination key, potentially
-// across backends, with atomic quota tracking. Only same-bucket copies are
-// allowed (no cross-bucket copying).
-func (s *Server) handleCopyObject(ctx context.Context, w http.ResponseWriter, bucket, destInternalKey, copySource string) (int, error) {
-	// --- Parse x-amz-copy-source header (may be URL-encoded) ---
+// resolveCopySource turns an x-amz-copy-source header into the internal key it
+// names. Shared by CopyObject and UploadPartCopy so both read the header the
+// same way and refuse a cross-bucket source alike: a credential authorizes one
+// bucket, so a source outside it is one the caller cannot read.
+//
+// ok=false means the response has already been written and the caller must
+// propagate the (status, error) unchanged.
+func resolveCopySource(w http.ResponseWriter, bucket, copySource string) (string, int, error, bool) {
 	decoded, err := url.PathUnescape(copySource)
 	if err != nil {
 		writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "Invalid x-amz-copy-source encoding")
-		return http.StatusBadRequest, fmt.Errorf("invalid copy source encoding: %w", err)
+		return "", http.StatusBadRequest, fmt.Errorf("invalid copy source encoding: %w", err), false
 	}
 	source := strings.TrimPrefix(decoded, "/")
 	sourceBucket, sourceKey, ok := parsePath("/" + source)
 	if !ok || sourceKey == "" {
 		writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "Invalid x-amz-copy-source")
-		return http.StatusBadRequest, fmt.Errorf("invalid copy source: %s", copySource)
+		return "", http.StatusBadRequest, fmt.Errorf("invalid copy source: %s", copySource), false
 	}
-
-	// --- Validate source bucket matches authorized bucket (same-bucket only) ---
 	if sourceBucket != bucket {
-		writeS3Error(w, http.StatusForbidden, "AccessDenied", "Cross-bucket copy is not allowed")
-		return http.StatusForbidden, fmt.Errorf("cross-bucket copy denied: %s != %s", sourceBucket, bucket)
+		writeS3Error(w, http.StatusForbidden, s3CodeAccessDenied, "Cross-bucket copy is not allowed")
+		return "", http.StatusForbidden, fmt.Errorf("cross-bucket copy denied: %s != %s", sourceBucket, bucket), false
+	}
+	return internalkey.Make(bucket, sourceKey), 0, nil, true
+}
+
+// handleCopyObject processes PUT requests with the x-amz-copy-source header.
+// Copies an object from the source key to the destination key, potentially
+// across backends, with atomic quota tracking. Only same-bucket copies are
+// allowed (no cross-bucket copying).
+func (s *Server) handleCopyObject(ctx context.Context, w http.ResponseWriter, r *http.Request, bucket, destInternalKey, copySource string) (int, error) {
+	sourceInternalKey, status, err, ok := resolveCopySource(w, bucket, copySource)
+	if !ok {
+		return status, err
 	}
 
-	// Prefix source key for internal storage
-	sourceInternalKey := internalkey.Make(bucket, sourceKey)
+	// Refused before the copy so an unusable directive or tag set costs no
+	// transfer, matching how the header is handled on a plain PUT.
+	replaceTags, tags, err := parseTaggingDirective(r.Header)
+	if err != nil {
+		return writeTaggingError(w, err), err
+	}
 
-	etag, err := s.Manager.Objects().CopyObject(ctx, sourceInternalKey, destInternalKey)
+	etag, err := s.Objects.CopyObject(ctx, &object.CopyObjectRequest{
+		SourceKey:   sourceInternalKey,
+		DestKey:     destInternalKey,
+		ReplaceTags: replaceTags,
+		Tags:        tags,
+	})
 	if err != nil {
 		return writeStorageError(w, err, "Failed to copy object"), err
 	}
@@ -302,11 +350,9 @@ func (s *Server) handleCopyObject(ctx context.Context, w http.ResponseWriter, bu
 // 1000 objects per request and returns per-key results in an XML response.
 // Per the S3 spec, HTTP 200 is always returned even when individual keys fail.
 func (s *Server) handleDeleteObjects(ctx context.Context, w http.ResponseWriter, r *http.Request, bucket string) (int, error) {
-	// Parse XML request body
 	var req deleteObjectsRequest
-	if err := xml.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
-		writeS3Error(w, http.StatusBadRequest, "MalformedXML", "Failed to parse request body")
-		return http.StatusBadRequest, fmt.Errorf("failed to decode delete request: %w", err)
+	if status, err := decodeXMLBody(w, r, maxDeleteObjectsBody, &req); err != nil {
+		return status, fmt.Errorf("delete objects: %w", err)
 	}
 
 	if len(req.Objects) == 0 {
@@ -325,7 +371,7 @@ func (s *Server) handleDeleteObjects(ctx context.Context, w http.ResponseWriter,
 		keys[i] = internalkey.Make(bucket, obj.Key)
 	}
 
-	results := s.Manager.Objects().DeleteObjects(ctx, keys)
+	results := s.Objects.DeleteObjects(ctx, keys)
 
 	// Build XML response with per-key outcomes
 	resp := deleteObjectsResult{
@@ -376,7 +422,7 @@ func (s *Server) checkIfNoneMatchStar(ctx context.Context, w http.ResponseWriter
 	if r.Header.Get("If-None-Match") != "*" {
 		return 0, nil, false
 	}
-	exists, err := s.Manager.Objects().ObjectExists(ctx, key)
+	exists, err := s.Objects.ObjectExists(ctx, key)
 	if err != nil {
 		return writeStorageError(w, err, "Failed to evaluate conditional write"), err, true
 	}
@@ -386,6 +432,53 @@ func (s *Server) checkIfNoneMatchStar(ctx context.Context, w http.ResponseWriter
 		return http.StatusPreconditionFailed, errIfNoneMatchExists, true
 	}
 	return 0, nil, false
+}
+
+// setValidatorHeaders writes the ETag and Last-Modified that identify the
+// representation. Split out because they must also appear on a 304, which
+// carries no body and skips the rest of the header block.
+func setValidatorHeaders(w http.ResponseWriter, result *s3be.GetObjectResult) {
+	if result.ETag != "" {
+		w.Header().Set("ETag", result.ETag)
+	}
+	if !result.LastModified.IsZero() {
+		w.Header().Set("Last-Modified", result.LastModified.UTC().Format(http.TimeFormat))
+	}
+}
+
+// setTaggingCountHeader reports how many tags the object carries. A count of
+// zero is left off entirely, matching S3: the header means "this object has
+// tags, fetch them with GetObjectTagging", so sending a zero would answer a
+// question nobody asked. An unreadable count arrives here as zero too, which
+// is why the header is advisory and GetObjectTagging remains the authority.
+func setTaggingCountHeader(w http.ResponseWriter, tagCount int) {
+	if tagCount > 0 {
+		w.Header().Set(headerTaggingCount, strconv.Itoa(tagCount))
+	}
+}
+
+// ifRangeMatches reports whether an If-Range validator still describes the
+// current representation, which is what decides between serving the requested
+// range and serving the whole object.
+//
+// An absent header means the client did not ask for the conditional form, so
+// the range stands. A value parseable as an HTTP date is compared as a
+// last-modified validator; anything else is compared as an entity tag. Per
+// RFC 9110 13.1.5 the entity-tag comparison is strong, so a weak tag never
+// matches: a weak validator cannot safely be used to splice a partial
+// response onto bytes already held.
+func ifRangeMatches(r *http.Request, etag string, lastModified time.Time) bool {
+	ir := r.Header.Get("If-Range")
+	if ir == "" {
+		return true
+	}
+	if t, err := http.ParseTime(ir); err == nil {
+		return !lastModified.IsZero() && lastModified.Equal(t)
+	}
+	if strings.HasPrefix(ir, "W/") || etag == "" {
+		return false
+	}
+	return ir == etag
 }
 
 // checkConditionals evaluates conditional request headers per RFC 7232.

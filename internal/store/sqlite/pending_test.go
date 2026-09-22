@@ -82,7 +82,7 @@ func TestPending_InsertAndDepth(t *testing.T) {
 	intent.KeyID = "kid-1"
 	intent.PlaintextSize = 90
 	intent.ContentHash = "abc"
-	if err := s.InsertPending(ctx, &intent); err != nil {
+	if _, err := s.InsertPendingIfFits(ctx, &intent); err != nil {
 		t.Fatalf("InsertPending: %v", err)
 	}
 
@@ -122,7 +122,7 @@ func TestPending_DeleteRemovesRow(t *testing.T) {
 	ctx := context.Background()
 
 	intent := pendingFixture("intent-1", "bucket/k1")
-	if err := s.InsertPending(ctx, &intent); err != nil {
+	if _, err := s.InsertPendingIfFits(ctx, &intent); err != nil {
 		t.Fatalf("InsertPending: %v", err)
 	}
 	if err := s.DeletePending(ctx, "intent-1"); err != nil {
@@ -155,7 +155,7 @@ func TestPending_GetStaleRespectsCutoff(t *testing.T) {
 	ctx := context.Background()
 
 	intent := pendingFixture("fresh", "bucket/k1")
-	if err := s.InsertPending(ctx, &intent); err != nil {
+	if _, err := s.InsertPendingIfFits(ctx, &intent); err != nil {
 		t.Fatalf("InsertPending: %v", err)
 	}
 
@@ -178,7 +178,7 @@ func TestPending_GetStaleHonoursLimit(t *testing.T) {
 
 	for i := range 5 {
 		intent := pendingFixture("intent-"+string(rune('a'+i)), "bucket/k")
-		if err := s.InsertPending(ctx, &intent); err != nil {
+		if _, err := s.InsertPendingIfFits(ctx, &intent); err != nil {
 			t.Fatalf("InsertPending(%d): %v", i, err)
 		}
 	}
@@ -207,7 +207,7 @@ func TestPending_DeleteByBackend(t *testing.T) {
 	b := pendingFixture("b", "k-b")
 	b.BackendName = "backend-b"
 	for _, p := range []core.PendingObject{a, b} {
-		if err := s.InsertPending(ctx, &p); err != nil {
+		if _, err := s.InsertPendingIfFits(ctx, &p); err != nil {
 			t.Fatalf("InsertPending: %v", err)
 		}
 	}
@@ -234,7 +234,7 @@ func TestPromotePending_Committed(t *testing.T) {
 	ctx := context.Background()
 
 	intent := pendingFixture("intent-1", "bucket/k1")
-	if err := s.InsertPending(ctx, &intent); err != nil {
+	if _, err := s.InsertPendingIfFits(ctx, &intent); err != nil {
 		t.Fatalf("InsertPending: %v", err)
 	}
 	// Reload so CreatedAt reflects the database default rather than the zero value.
@@ -244,7 +244,7 @@ func TestPromotePending_Committed(t *testing.T) {
 	}
 	intent = stale[0]
 
-	result, displaced, err := s.PromotePending(ctx, &intent)
+	result, displaced, _, err := s.PromotePending(ctx, &intent)
 	if err != nil {
 		t.Fatalf("PromotePending: %v", err)
 	}
@@ -269,7 +269,7 @@ func TestPromotePending_AlreadyResolved(t *testing.T) {
 	s := newTestStore(t)
 	intent := pendingFixture("missing", "bucket/k1")
 
-	result, displaced, err := s.PromotePending(context.Background(), &intent)
+	result, displaced, _, err := s.PromotePending(context.Background(), &intent)
 	if err != nil {
 		t.Fatalf("PromotePending: %v", err)
 	}
@@ -281,19 +281,18 @@ func TestPromotePending_AlreadyResolved(t *testing.T) {
 	}
 }
 
-// TestPromotePending_Superseded verifies that when an object_locations row
-// for the key has a created_at later than the intent, the intent is
-// dropped as stale rather than promoted. This is the timestamp-aware
-// resolution that prevents head-of-line blocking and avoids deleting a
-// retry's correct metadata.
-func TestPromotePending_Superseded(t *testing.T) {
+// TestPromotePending_WriteAlreadyClearedTheIntent verifies that a write which
+// supersedes an intent removes it as part of its own transaction, so the reaper
+// arrives to find nothing left to resolve rather than having to work out that
+// the intent is stale.
+func TestPromotePending_WriteAlreadyClearedTheIntent(t *testing.T) {
 	t.Parallel()
 	s := newTestStore(t)
 	ctx := context.Background()
 
 	// Insert a pending intent first so its created_at is older.
 	intent := pendingFixture("intent-1", "bucket/k1")
-	if err := s.InsertPending(ctx, &intent); err != nil {
+	if _, err := s.InsertPendingIfFits(ctx, &intent); err != nil {
 		t.Fatalf("InsertPending: %v", err)
 	}
 	stale, _ := s.GetStalePending(ctx, time.Now().Add(time.Hour), 10)
@@ -303,22 +302,22 @@ func TestPromotePending_Superseded(t *testing.T) {
 	// strictly later created_at.
 	time.Sleep(10 * time.Millisecond)
 
-	// Now record a successful object_locations row for the same key  - 
+	// Now record a successful object_locations row for the same key  -
 	// simulates a retry that committed normally after the original PUT's
 	// metadata commit failed.
-	if _, err := s.RecordObject(ctx, "bucket/k1", "backend-a", 200, nil); err != nil {
+	if _, _, err := s.RecordObject(ctx, &core.RecordObjectRequest{Key: "bucket/k1", Size: 200, Copies: []core.ObjectCopy{{Backend: "backend-a"}}}); err != nil {
 		t.Fatalf("RecordObject: %v", err)
 	}
 
-	result, displaced, err := s.PromotePending(ctx, &intent)
+	result, displaced, _, err := s.PromotePending(ctx, &intent)
 	if err != nil {
 		t.Fatalf("PromotePending: %v", err)
 	}
-	if result != core.PendingPromoteSuperseded {
-		t.Errorf("result = %v, want Superseded", result)
+	if result != core.PendingPromoteAlreadyResolved {
+		t.Errorf("result = %v, want AlreadyResolved", result)
 	}
 	if len(displaced) != 0 {
-		t.Errorf("displaced = %+v, want none for superseded", displaced)
+		t.Errorf("displaced = %+v, want none for an intent already cleared", displaced)
 	}
 	if got := queryPendingCount(t, s); got != 0 {
 		t.Errorf("pending row not removed: count = %d", got)
@@ -352,11 +351,13 @@ func TestRecordObjectAndClearPending_DeletesIntent(t *testing.T) {
 	ctx := context.Background()
 
 	intent := pendingFixture("intent-1", "bucket/k1")
-	if err := s.InsertPending(ctx, &intent); err != nil {
+	if _, err := s.InsertPendingIfFits(ctx, &intent); err != nil {
 		t.Fatalf("InsertPending: %v", err)
 	}
 
-	displaced, err := s.RecordObjectAndClearPending(ctx, "bucket/k1", "backend-a", 100, nil, "intent-1")
+	displaced, _, err := s.RecordObject(ctx, &core.RecordObjectRequest{
+		Key: "bucket/k1", Size: 100, Copies: []core.ObjectCopy{{Backend: "backend-a", IntentID: "intent-1"}},
+	})
 	if err != nil {
 		t.Fatalf("RecordObjectAndClearPending: %v", err)
 	}
@@ -380,7 +381,9 @@ func TestRecordObjectAndClearPending_EmptyIntentBehavesLikeRecordObject(t *testi
 	s := newTestStore(t)
 	ctx := context.Background()
 
-	displaced, err := s.RecordObjectAndClearPending(ctx, "bucket/k1", "backend-a", 100, nil, "")
+	displaced, _, err := s.RecordObject(ctx, &core.RecordObjectRequest{
+		Key: "bucket/k1", Size: 100, Copies: []core.ObjectCopy{{Backend: "backend-a"}},
+	})
 	if err != nil {
 		t.Fatalf("RecordObjectAndClearPending: %v", err)
 	}

@@ -4,27 +4,64 @@
 // Author: Alex Freidah
 //
 // Common helper functions used across multiple SQLite store files: timestamp
-// formatting, time parsing, and nullable column conversions for round-tripping
-// optional string/int64 fields between core domain types and sql.Null*.
+// formatting, time parsing, nullable column conversions for round-tripping
+// optional string/int64 fields between core domain types and sql.Null*, and the
+// row collection every query body drains its result through.
 // -------------------------------------------------------------------------------
 
 package sqlite
 
 import (
+	"context"
 	"database/sql"
+	"fmt"
 	"time"
+
+	"github.com/afreidah/s3-orchestrator/internal/store/core"
 )
 
 // -------------------------------------------------------------------------
 // TIMESTAMP HELPERS
 // -------------------------------------------------------------------------
 
-// now returns the current time as an RFC3339Nano string for SQLite storage.
+// timestampFormat is the canonical on-disk shape for every timestamp column.
+//
+// SQLite stores these as TEXT, so ORDER BY and every range comparison on them
+// is lexicographic, and text order has to agree with chronological order.
+// time.RFC3339Nano cannot be used for writes because it strips trailing zeros:
+// the fractional part varies in width, and wherever the earlier value is a
+// prefix of the later one the comparison inverts, because 'Z' (0x5A) sorts
+// above '0' (0x30).
+//
+//	"...00.5Z"  >  "...00.50000001Z"   as text
+//	"...00.5Z"  <  "...00.50000001Z"   in time
+//
+// Nine digits, always padded, keeps the two orders identical. Milliseconds
+// would also be fixed width but are too coarse: writes made within the same
+// millisecond collapse into ties, and the scrub queue then falls through to its
+// object_key tiebreak rather than ordering by age.
+const timestampFormat = "2006-01-02T15:04:05.000000000Z07:00"
+
+// canonicalTimestampLen is the width every stored timestamp has once written in
+// timestampFormat: "2006-01-02T15:04:05.000000000Z". Migration 0006 uses it to
+// recognise rows it has already normalised, which is what makes re-running free.
+const canonicalTimestampLen = 30
+
+// now returns the current time in the canonical on-disk shape.
 func now() string {
-	return time.Now().UTC().Format(time.RFC3339Nano)
+	return formatTime(time.Now())
 }
 
-// parseTime parses an RFC3339Nano timestamp string from SQLite into a time.Time.
+// formatTime renders t in the canonical on-disk shape. Every write of a
+// timestamp column goes through here or through now(), so no column ever holds
+// a mix of widths.
+func formatTime(t time.Time) string {
+	return t.UTC().Format(timestampFormat)
+}
+
+// parseTime parses a stored timestamp. Reads accept RFC3339Nano rather than the
+// canonical format so rows written before this change, and rows written by a
+// column DEFAULT, still parse.
 func parseTime(s string) (time.Time, error) {
 	return time.Parse(time.RFC3339Nano, s)
 }
@@ -71,4 +108,134 @@ func nullInt64Value(n sql.NullInt64) int64 {
 		return 0
 	}
 	return n.Int64
+}
+
+// boolToInt renders a Go bool as the 0/1 integer SQLite stores booleans as.
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// -------------------------------------------------------------------------
+// ROW COLLECTION
+// -------------------------------------------------------------------------
+
+// rowsObjectLocations names object_locations rows for the iteration error the
+// several queries that read them share.
+const rowsObjectLocations = "object locations"
+
+// collectRows drains rows into a slice, calling scan once per row. It owns the
+// parts of a scan loop that are the same everywhere and are only ever wrong by
+// omission: closing the rows, and checking the iteration error that Next
+// reports by returning false rather than by returning an error.
+//
+// The per-row error is passed through untouched, because the scan closure is
+// what knows which row it failed to read. what names the rows for the
+// iteration error alone.
+func collectRows[T any](rows *sql.Rows, what string, scan func(*sql.Rows) (T, error)) ([]T, error) {
+	defer func() { _ = rows.Close() }()
+	var out []T
+	for rows.Next() {
+		v, err := scan(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to iterate %s: %w", what, err)
+	}
+	return out, nil
+}
+
+// countRows runs a single-value COUNT query and labels its failure. Every
+// depth and count in this package is otherwise the same three lines around a
+// different string.
+func (s *Store) countRows(ctx context.Context, what, query string, args ...any) (int64, error) {
+	var count int64
+	if err := s.db.QueryRowContext(ctx, query, args...).Scan(&count); err != nil {
+		return 0, fmt.Errorf("failed to count %s: %w", what, err)
+	}
+	return count, nil
+}
+
+// collectMap is collectRows for the queries that come back keyed - one row per
+// backend, per period, per name - where the scan yields the key alongside the
+// value it maps to.
+func collectMap[T any](rows *sql.Rows, what string, scan func(*sql.Rows) (string, T, error)) (map[string]T, error) {
+	defer func() { _ = rows.Close() }()
+	out := make(map[string]T)
+	for rows.Next() {
+		key, value, err := scan(rows)
+		if err != nil {
+			return nil, err
+		}
+		out[key] = value
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to iterate %s: %w", what, err)
+	}
+	return out, nil
+}
+
+// scanNameValue reads the (name, number) pair every per-backend total in this
+// package selects. A NULL sum reads as zero, since a backend with no rows has
+// no bytes rather than an unknown number of them.
+func scanNameValue(rows *sql.Rows) (string, int64, error) {
+	var (
+		name  string
+		value sql.NullInt64
+	)
+	if err := rows.Scan(&name, &value); err != nil {
+		return "", 0, fmt.Errorf("failed to scan per-backend total: %w", err)
+	}
+	return name, nullInt64Value(value), nil
+}
+
+// -------------------------------------------------------------------------
+// IDENTITY COLUMN HELPERS
+// -------------------------------------------------------------------------
+
+// identityETag, identityContentType and identityMetadataJSON render the three
+// identity columns from an optional *core.ObjectIdentity. A nil identity
+// writes NULL to all three, which is the row an object whose ETag was never
+// computed carries.
+func identityETag(id *core.ObjectIdentity) sql.NullString {
+	if id == nil {
+		return sql.NullString{}
+	}
+	return nullableString(id.ETag)
+}
+
+func identityContentType(id *core.ObjectIdentity) sql.NullString {
+	if id == nil {
+		return sql.NullString{}
+	}
+	return nullableString(id.ContentType)
+}
+
+// A marshal failure would mean a map[string]string that cannot be JSON, which
+// does not exist; the column stays NULL rather than failing a write over
+// metadata a later read can re-learn.
+func identityMetadataJSON(id *core.ObjectIdentity) sql.NullString {
+	if id == nil {
+		return sql.NullString{}
+	}
+	b, err := core.EncodeUserMetadata(id.UserMetadata)
+	if err != nil || len(b) == 0 {
+		return sql.NullString{}
+	}
+	return nullableString(string(b))
+}
+
+// identityFromColumns rebuilds the identity a row carries, or nil when it
+// carries none.
+func identityFromColumns(etag, contentType, userMetadata sql.NullString) *core.ObjectIdentity {
+	id, err := core.IdentityFromColumns(nullStringValue(etag), nullStringValue(contentType), []byte(nullStringValue(userMetadata)))
+	if err != nil {
+		return nil
+	}
+	return id
 }

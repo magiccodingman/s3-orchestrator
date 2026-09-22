@@ -21,28 +21,34 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
-	"sync/atomic"
+	"time"
 
 	"github.com/afreidah/s3-orchestrator/internal/backend"
+	"github.com/afreidah/s3-orchestrator/internal/internalkey"
 	"github.com/afreidah/s3-orchestrator/internal/store/core"
 )
 
-// Entry is the unit consumed by the merge: a key already namespaced
-// to the current virtual bucket and its size on whichever side produced it.
+// Entry is the unit consumed by the merge: a backend key exactly as it is
+// stored, its size on whichever side produced it, and whether it falls inside
+// a configured virtual bucket. Keys are never rewritten -- the merge compares
+// them in byte order, and prepending a prefix to only some of them would break
+// the ordering the whole design rests on.
 type Entry struct {
-	key  string
-	size int64
+	key          string
+	size         int64
+	unmanaged    bool
+	lastModified time.Time
 }
 
 // keySource is a forward, lex-ordered, bounded-memory iterator over keys
 // (with size on the S3 side; DB-only keys do not carry size since the merge
 // only needs it on import).
+//
+// Next reports ok=false at end-of-stream and returns a non-nil error only on
+// transport / DB failure, which callers must abort on. Stop releases any
+// backing goroutine and is safe to call more than once.
 type keySource interface {
-	// next returns the next entry. ok=false signals end-of-stream; err is
-	// non-nil only on transport / DB failure (callers must abort).
 	Next(ctx context.Context) (Entry, bool, error)
-
-	// stop releases any backing goroutine. Safe to call multiple times.
 	Stop()
 }
 
@@ -63,11 +69,16 @@ func Sorted(
 	onImport func(ctx context.Context, e Entry) error,
 	onDelete func(ctx context.Context, key string) error,
 ) error {
-	s := &mergeState{s3: s3, db: dbIter, onImport: onImport, onDelete: onDelete}
-	if err := s.advanceS3(ctx); err != nil {
+	s := &mergeState{
+		s3:       cursor{src: s3, side: sideBackend},
+		db:       cursor{src: dbIter, side: sideLedger},
+		onImport: onImport,
+		onDelete: onDelete,
+	}
+	if err := s.s3.advance(ctx); err != nil {
 		return err
 	}
-	if err := s.advanceDB(ctx); err != nil {
+	if err := s.db.advance(ctx); err != nil {
 		return err
 	}
 	for !s.done() {
@@ -78,30 +89,52 @@ func Sorted(
 	return nil
 }
 
-// mergeState holds the rolling cursor pair plus the callbacks the
-// merge loop dispatches to. Bundling the four-variable cursor state
-// lets per-branch advancement live in methods on mergeState rather
-// than free functions taking pointers to every cursor.
+// cursor is one side of the merge: the stream, the entry it currently holds,
+// and whether it holds one at all. Both sides behave identically, so the
+// advance rule is written once and each side carries the name it is reported
+// under.
+type cursor struct {
+	src  keySource
+	cur  Entry
+	ok   bool
+	side string
+}
+
+// advance pulls the next entry into the cursor, refusing a stream that goes
+// backwards: the merge only produces the right answer while both sides ascend.
+func (c *cursor) advance(ctx context.Context) error {
+	next, ok, err := c.src.Next(ctx)
+	if err != nil {
+		return err
+	}
+	if ok && c.ok {
+		if err := checkAscending(c.side, c.cur.key, next.key); err != nil {
+			return err
+		}
+	}
+	c.cur, c.ok = next, ok
+	return nil
+}
+
+// mergeState holds the two cursors plus the callbacks the merge loop
+// dispatches to. Bundling the cursor state lets per-branch advancement live in
+// methods rather than free functions taking pointers to every cursor.
 type mergeState struct {
-	s3, db   keySource
-	s3Cur    Entry
-	dbCur    Entry
-	s3OK     bool
-	dbOK     bool
+	s3, db   cursor
 	onImport func(ctx context.Context, e Entry) error
 	onDelete func(ctx context.Context, key string) error
 }
 
 // done reports whether both streams are exhausted.
-func (s *mergeState) done() bool { return !s.s3OK && !s.dbOK }
+func (s *mergeState) done() bool { return !s.s3.ok && !s.db.ok }
 
 // step advances exactly one merge round, picking the branch (import,
 // delete, or match) based on which side currently holds the smaller key.
 func (s *mergeState) step(ctx context.Context) error {
 	switch {
-	case !s.dbOK || (s.s3OK && s.s3Cur.key < s.dbCur.key):
+	case !s.db.ok || (s.s3.ok && s.s3.cur.key < s.db.cur.key):
 		return s.importStep(ctx)
-	case !s.s3OK || s.s3Cur.key > s.dbCur.key:
+	case !s.s3.ok || s.s3.cur.key > s.db.cur.key:
 		return s.deleteStep(ctx)
 	default:
 		return s.matchStep(ctx)
@@ -112,49 +145,52 @@ func (s *mergeState) step(ctx context.Context) error {
 // one. Used when the DB cursor is exhausted or the S3 key sorts before
 // the DB key.
 func (s *mergeState) importStep(ctx context.Context) error {
-	if err := s.onImport(ctx, s.s3Cur); err != nil {
+	if err := s.onImport(ctx, s.s3.cur); err != nil {
 		return err
 	}
-	return s.advanceS3(ctx)
+	return s.s3.advance(ctx)
 }
 
 // deleteStep fires onDelete for the current DB key then pulls the next DB
 // row. Used when the S3 stream is exhausted or the DB key sorts before
 // the S3 key.
 func (s *mergeState) deleteStep(ctx context.Context) error {
-	if err := s.onDelete(ctx, s.dbCur.key); err != nil {
+	if err := s.onDelete(ctx, s.db.cur.key); err != nil {
 		return err
 	}
-	return s.advanceDB(ctx)
+	return s.db.advance(ctx)
 }
 
 // matchStep advances both cursors. Used when the keys match  -  the row is
 // present on both sides and no callback fires.
 func (s *mergeState) matchStep(ctx context.Context) error {
-	if err := s.advanceS3(ctx); err != nil {
+	if err := s.s3.advance(ctx); err != nil {
 		return err
 	}
-	return s.advanceDB(ctx)
+	return s.db.advance(ctx)
 }
 
-// advanceS3 pulls the next entry from the S3 stream into the cursor pair.
-func (s *mergeState) advanceS3(ctx context.Context) error {
-	cur, ok, err := s.s3.Next(ctx)
-	if err != nil {
-		return err
-	}
-	s.s3Cur, s.s3OK = cur, ok
-	return nil
-}
+// The two sides of the merge, named in the ascending-order failure so an
+// operator knows which stream to look at.
+const (
+	sideBackend = "backend listing"
+	sideLedger  = "ledger cursor"
+)
 
-// advanceDB pulls the next entry from the DB stream into the cursor pair.
-func (s *mergeState) advanceDB(ctx context.Context) error {
-	cur, ok, err := s.db.Next(ctx)
-	if err != nil {
-		return err
+// ErrNotAscending reports a stream that handed the merge a key at or before its
+// predecessor.
+var ErrNotAscending = errors.New("reconcile stream is not in ascending key order")
+
+// checkAscending enforces the invariant the whole merge rests on. A stream that
+// goes backwards makes the merge delete every key between the two and re-import
+// them on the next pass, which converges on nothing and looks like ordinary
+// churn in the counts. Failing the pass turns that into one loud error naming
+// the pair of keys that broke it.
+func checkAscending(side, prev, next string) error {
+	if next > prev {
+		return nil
 	}
-	s.dbCur, s.dbOK = cur, ok
-	return nil
+	return fmt.Errorf("%w: the %s returned %q after %q", ErrNotAscending, side, next, prev)
 }
 
 // -------------------------------------------------------------------------
@@ -173,10 +209,10 @@ type ObjectLister interface {
 }
 
 // S3KeyStream inverts the page-callback shape of ObjectLister.ListObjects
-// into a forward iterator. A single goroutine drives the callback,
-// dropping keys that belong to other virtual buckets and namespacing the
-// rest under bucketPrefix. apiPages, when non-nil, is incremented per
-// page so the caller can record API usage.
+// into a forward iterator. A single goroutine drives the callback, emitting
+// every key the backend holds in the order it was listed and tagging each with
+// whether it belongs to a configured virtual bucket. apiPages, when non-nil,
+// is incremented per page so the caller can record API usage.
 type S3KeyStream struct {
 	ch        chan Entry
 	errCh     chan error
@@ -188,12 +224,16 @@ type S3KeyStream struct {
 // NewS3KeyStream starts the goroutine that walks the backend and returns a
 // keySource. The caller must invoke stop when done so a partial walk does
 // not leak goroutines.
+// usage and backendName meter the walk: each listing page is charged as it is
+// consumed, and the stream ends when the backend can no longer afford another.
+// A nil usage leaves the walk unmetered, which is what a caller with no tracker
+// to charge against passes.
 func NewS3KeyStream(
 	ctx context.Context,
 	s3b ObjectLister,
-	bucketPrefix string,
-	otherPrefixes []string,
-	apiPages *int64,
+	bucketPrefixes []string,
+	usage UsageRecorder,
+	backendName string,
 ) *S3KeyStream {
 	streamCtx, cancel := context.WithCancel(ctx)
 	s := &S3KeyStream{
@@ -202,17 +242,17 @@ func NewS3KeyStream(
 		cancel: cancel,
 	}
 
-	go s.run(streamCtx, s3b, bucketPrefix, otherPrefixes, apiPages)
+	go s.run(streamCtx, s3b, bucketPrefixes, pageBudget{usage: usage, backendName: backendName})
 
 	return s
 }
 
 // run drives the backing ListObjects walk on the stream goroutine, forwarding
 // each page through emitPage and surfacing any non-cancellation error on errCh.
-func (s *S3KeyStream) run(ctx context.Context, s3b ObjectLister, bucketPrefix string, otherPrefixes []string, apiPages *int64) {
+func (s *S3KeyStream) run(ctx context.Context, s3b ObjectLister, bucketPrefixes []string, budget pageBudget) {
 	defer close(s.ch)
 	err := s3b.ListObjects(ctx, "", func(objects []backend.ListedObject) error {
-		return s.emitPage(ctx, objects, bucketPrefix, otherPrefixes, apiPages)
+		return s.emitPage(ctx, objects, bucketPrefixes, budget)
 	})
 	if err != nil && !errors.Is(err, context.Canceled) {
 		s.errCh <- err
@@ -220,40 +260,54 @@ func (s *S3KeyStream) run(ctx context.Context, s3b ObjectLister, bucketPrefix st
 	close(s.errCh)
 }
 
-// emitPage maps one ListObjects page into namespaced entries and sends them on
-// the channel, counting the page and bailing out when the stream is cancelled.
-func (s *S3KeyStream) emitPage(ctx context.Context, objects []backend.ListedObject, bucketPrefix string, otherPrefixes []string, apiPages *int64) error {
-	if apiPages != nil {
-		atomic.AddInt64(apiPages, 1)
-	}
+// emitPage sends one ListObjects page onto the channel, counting the page and
+// bailing out when the stream is cancelled. Keys pass through untouched, so the
+// emitted sequence preserves the backend's byte ordering.
+func (s *S3KeyStream) emitPage(ctx context.Context, objects []backend.ListedObject, bucketPrefixes []string, budget pageBudget) error {
+	canContinue := budget.charge()
 	for i := range objects {
 		obj := &objects[i]
-		key, ok := namespaceKey(obj.Key, bucketPrefix, otherPrefixes)
-		if !ok {
-			continue
-		}
 		select {
-		case s.ch <- Entry{key: key, size: obj.SizeBytes}:
+		case s.ch <- Entry{
+			key:          obj.Key,
+			size:         obj.SizeBytes,
+			unmanaged:    Unmanaged(obj.Key, bucketPrefixes),
+			lastModified: obj.LastModified,
+		}:
 		case <-ctx.Done():
 			return ctx.Err()
 		}
 	}
+	// Reported after the page is emitted, so the merge still sees everything
+	// this page paid for. Stopping the walk here ends the reconcile at the
+	// limit instead of carrying it thousands of requests past.
+	if !canContinue {
+		return errBudgetExhausted
+	}
 	return nil
 }
 
-// namespaceKey applies the bucket-routing rules used by the original
-// realKeys map. Returns (namespaced, true) when the key should be visited
-// or ("", false) when it belongs to a sibling bucket.
-func namespaceKey(rawKey, bucketPrefix string, otherPrefixes []string) (string, bool) {
-	if strings.HasPrefix(rawKey, bucketPrefix) {
-		return rawKey, true
+// BucketPrefixes converts configured virtual bucket names into the key
+// prefixes their objects are stored under.
+func BucketPrefixes(buckets []string) []string {
+	out := make([]string, 0, len(buckets))
+	for _, b := range buckets {
+		out = append(out, internalkey.Prefix(b))
 	}
-	for _, p := range otherPrefixes {
+	return out
+}
+
+// Unmanaged reports whether a backend key falls outside every configured
+// virtual bucket. Such a key is still reconciled and still counts toward the
+// backend's quota, but no worker acts on it: the orchestrator did not put it
+// there.
+func Unmanaged(rawKey string, bucketPrefixes []string) bool {
+	for _, p := range bucketPrefixes {
 		if strings.HasPrefix(rawKey, p) {
-			return "", false
+			return false
 		}
 	}
-	return bucketPrefix + rawKey, true
+	return true
 }
 
 // next pulls the next entry off the streaming channel that the
@@ -307,14 +361,14 @@ type DBKeyLister interface {
 	ListObjectsByBackendKeyAsc(ctx context.Context, backendName, afterKey string, limit int) ([]core.ObjectLocation, error)
 }
 
-// DBCursorStream walks store.ListObjectsByBackendKeyAsc one bounded page at
-// a time and filters rows to those belonging to bucketPrefix. Keys for
-// sibling buckets stored on the same backend are skipped.
+// DBCursorStream walks store.ListObjectsByBackendKeyAsc one bounded page at a
+// time, yielding every row recorded for the backend. Reconcile is scoped to a
+// backend rather than to one virtual bucket, so nothing is filtered out here:
+// a row the cursor skipped would look backend-only to the merge and be
+// re-imported on every pass.
 type DBCursorStream struct {
-	store         DBKeyLister
-	backendName   string
-	bucketPrefix  string
-	otherPrefixes []string
+	store       DBKeyLister
+	backendName string
 
 	page      []core.ObjectLocation
 	idx       int
@@ -322,41 +376,32 @@ type DBCursorStream struct {
 	exhausted bool
 }
 
-// DBCursorStreamDeps groups the cursor stream's parameters. BackendName and
-// BucketPrefix are named fields so the two adjacent strings can't be swapped.
+// DBCursorStreamDeps groups the cursor stream's parameters.
 type DBCursorStreamDeps struct {
-	Store         DBKeyLister
-	BackendName   string
-	BucketPrefix  string
-	OtherPrefixes []string
+	Store       DBKeyLister
+	BackendName string
 }
 
 // NewDBCursorStream prepares the iterator without issuing any query yet  -
 // the first next call pulls the first page.
 func NewDBCursorStream(deps DBCursorStreamDeps) *DBCursorStream {
 	return &DBCursorStream{
-		store:         deps.Store,
-		backendName:   deps.BackendName,
-		bucketPrefix:  deps.BucketPrefix,
-		otherPrefixes: deps.OtherPrefixes,
+		store:       deps.Store,
+		backendName: deps.BackendName,
 	}
 }
 
-// next returns the next bucket-scoped row from the DB cursor, fetching
-// a fresh bounded page when the in-memory buffer drains. Rows for
-// sibling buckets stored on the same backend are skipped silently.
-// Returns (zero, false, nil) at end-of-stream, never blocks on the DB
-// once exhausted.
+// Next returns the next row from the DB cursor, fetching a fresh bounded page
+// when the in-memory buffer drains. Returns (zero, false, nil) at
+// end-of-stream, and never blocks on the DB once exhausted.
 func (d *DBCursorStream) Next(ctx context.Context) (Entry, bool, error) {
 	for {
 		// Drain the in-memory page first.
-		for d.idx < len(d.page) {
+		if d.idx < len(d.page) {
 			row := d.page[d.idx]
 			d.idx++
 			d.cursor = row.ObjectKey
-			if d.belongs(row.ObjectKey) {
-				return Entry{key: row.ObjectKey, size: row.SizeBytes}, true, nil
-			}
+			return Entry{key: row.ObjectKey, size: row.SizeBytes}, true, nil
 		}
 		if d.exhausted {
 			return Entry{}, false, nil
@@ -386,21 +431,6 @@ func (d *DBCursorStream) Stop() {
 	// down a producer goroutine.
 }
 
-// belongs reports whether a DB-side key falls within the current bucket
-// prefix. Keys owned by sibling buckets are skipped so a single-bucket
-// reconcile does not delete other buckets' rows on the same backend.
-func (d *DBCursorStream) belongs(key string) bool {
-	if !strings.HasPrefix(key, d.bucketPrefix) {
-		return false
-	}
-	for _, p := range d.otherPrefixes {
-		if strings.HasPrefix(key, p) {
-			return false
-		}
-	}
-	return true
-}
-
 // -------------------------------------------------------------------------
 // RECONCILE HANDLERS
 // -------------------------------------------------------------------------
@@ -410,13 +440,24 @@ func (d *DBCursorStream) belongs(key string) bool {
 // failure should not stop the diff for thousands of other keys.
 func ImportHandler(log *slog.Logger, backendName string, importer ImporterFn, result *Result) func(context.Context, Entry) error {
 	return func(ctx context.Context, e Entry) error {
-		imported, err := importer(ctx, e.key, backendName, e.size)
+		outcome, err := importer(ctx, &core.ImportObjectRequest{
+			Key:       e.key,
+			Backend:   backendName,
+			Size:      e.size,
+			Unmanaged: e.unmanaged,
+			WrittenAt: e.lastModified,
+		})
 		if err != nil {
 			log.WarnContext(ctx, "import failed", "key", e.key, "backend", backendName, "error", err)
 			return nil
 		}
-		if imported {
+		switch outcome {
+		case core.ImportInserted:
 			result.Imported++
+		case core.ImportSkippedPendingCleanup:
+			log.WarnContext(ctx, "skipping key with an outstanding delete",
+				"key", e.key, "backend", backendName)
+			result.SuppressedPendingCleanup++
 		}
 		return nil
 	}
@@ -440,30 +481,17 @@ func DeleteHandler(log *slog.Logger, backendName string, deleter DeleterFn, resu
 // delete callbacks. Promoted to a struct so tests can assert on it
 // without importing internal/worker.
 type Result struct {
-	Imported int64
-	Removed  int64
+	Imported                 int64
+	Removed                  int64
+	SuppressedPendingCleanup int64
 }
 
 // ImporterFn imports a backend-listed key into the metadata store.
-// Returns (inserted, error). inserted is false when the row already
-// existed, which the reconciler treats as a benign no-op. Carrier
-// type so tests can substitute a fake importer.
-type ImporterFn func(ctx context.Context, key, backendName string, size int64) (bool, error)
+// A row that already existed is a benign no-op; a key whose delete is
+// still outstanding is refused rather than imported. Carrier type so
+// tests can substitute a fake importer.
+type ImporterFn func(ctx context.Context, req *core.ImportObjectRequest) (core.ImportOutcome, error)
 
 // DeleterFn removes a metadata row whose backend confirmed it does not
 // hold the key. Carrier type so tests can substitute a fake deleter.
 type DeleterFn func(ctx context.Context, key, backendName string) error
-
-// SiblingPrefixes returns the bucket-prefix list (each suffixed with '/')
-// for every known bucket except the one currently being reconciled. Used
-// by ReconcileBackend so the merge skips keys that belong to sibling
-// virtual buckets stored on the same backend.
-func SiblingPrefixes(knownBuckets []string, current string) []string {
-	out := make([]string, 0, len(knownBuckets))
-	for _, b := range knownBuckets {
-		if b != current {
-			out = append(out, b+"/")
-		}
-	}
-	return out
-}

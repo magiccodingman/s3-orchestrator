@@ -1,0 +1,2306 @@
+openapi: 3.1.0
+info:
+    title: s3-orchestrator Admin API
+    version: 1.0.0
+    description: Operational control plane for a running s3-orchestrator instance. Every endpoint requires a signed request; long-running operations can stream newline-delimited progress events when the caller asks for them.
+security:
+    - sigv4: []
+paths:
+    /admin/api/backends/{name}:
+        delete:
+            summary: Remove a backend, optionally purging its objects
+            operationId: deleteBackendsName
+            parameters:
+                - name: name
+                  in: path
+                  description: Backend name
+                  required: true
+                  schema:
+                    type: string
+                - name: purge
+                  in: query
+                  description: Also delete the backend's objects from its storage
+                  required: false
+                  schema:
+                    type: boolean
+                - name: confirm
+                  in: query
+                  description: Confirmation token from the preview call; required to execute a purge
+                  required: false
+                  schema:
+                    type: string
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/json:
+                            schema:
+                                oneOf:
+                                    - $ref: '#/components/schemas/BackendOperationResponse'
+                                    - $ref: '#/components/schemas/RemoveBackendPreview'
+                        application/x-ndjson:
+                            description: One JSON object per line while the operation runs
+                            schema:
+                                $ref: '#/components/schemas/Event'
+                "401":
+                    description: Missing or invalid admin token
+    /admin/api/backends/{name}/drain:
+        delete:
+            summary: Cancel an active drain
+            operationId: deleteBackendsNameDrain
+            parameters:
+                - name: name
+                  in: path
+                  description: Backend name
+                  required: true
+                  schema:
+                    type: string
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/BackendOperationResponse'
+                "401":
+                    description: Missing or invalid admin token
+        get:
+            summary: Progress of an in-flight drain
+            operationId: getBackendsNameDrain
+            parameters:
+                - name: name
+                  in: path
+                  description: Backend name
+                  required: true
+                  schema:
+                    type: string
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/DrainProgressResponse'
+                "401":
+                    description: Missing or invalid admin token
+        post:
+            summary: Start draining a backend
+            operationId: postBackendsNameDrain
+            parameters:
+                - name: name
+                  in: path
+                  description: Backend name
+                  required: true
+                  schema:
+                    type: string
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/BackendOperationResponse'
+                "401":
+                    description: Missing or invalid admin token
+    /admin/api/backfill-checksums:
+        post:
+            summary: Compute content hashes for objects missing one
+            operationId: postBackfillChecksums
+            parameters:
+                - name: backend
+                  in: query
+                  description: Restrict the pass to one backend
+                  required: false
+                  schema:
+                    type: string
+                - name: batch_size
+                  in: query
+                  description: Objects hashed per pass
+                  required: false
+                  schema:
+                    type: integer
+                - name: max
+                  in: query
+                  description: Cap the objects processed by this request; 0 drains the backlog
+                  required: false
+                  schema:
+                    type: integer
+                - name: delay_ms
+                  in: query
+                  description: Pause between passes to rate-limit backend reads
+                  required: false
+                  schema:
+                    type: integer
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/BackfillChecksumsResponse'
+                        application/x-ndjson:
+                            description: One JSON object per line while the operation runs
+                            schema:
+                                $ref: '#/components/schemas/Event'
+                "401":
+                    description: Missing or invalid admin token
+    /admin/api/cache:
+        get:
+            summary: Object data cache utilization
+            operationId: getCache
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/CacheStatsResponse'
+                "401":
+                    description: Missing or invalid admin token
+    /admin/api/cache/flush:
+        post:
+            summary: Drop every entry from the object data cache
+            operationId: postCacheFlush
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/CacheInvalidateResponse'
+                "401":
+                    description: Missing or invalid admin token
+    /admin/api/cache/keys/{key}:
+        delete:
+            summary: Drop one key from the object data cache
+            operationId: deleteCacheKeysKey
+            parameters:
+                - name: key
+                  in: path
+                  description: Full internal object key, slashes included
+                  required: true
+                  schema:
+                    type: string
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/CacheInvalidateKeyResponse'
+                "401":
+                    description: Missing or invalid admin token
+    /admin/api/cache/prefix:
+        delete:
+            summary: Drop every cache entry under a key prefix
+            operationId: deleteCachePrefix
+            parameters:
+                - name: prefix
+                  in: query
+                  description: Key prefix to invalidate
+                  required: true
+                  schema:
+                    type: string
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/CacheInvalidateResponse'
+                "401":
+                    description: Missing or invalid admin token
+    /admin/api/cleanup-dlq:
+        get:
+            summary: Dead-lettered cleanup depth and a page of rows
+            operationId: getCleanupDlq
+            parameters:
+                - name: backend
+                  in: query
+                  description: Restrict the listing to one backend
+                  required: false
+                  schema:
+                    type: string
+                - name: limit
+                  in: query
+                  description: Maximum rows to return
+                  required: false
+                  schema:
+                    type: integer
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/CleanupDLQResponse'
+                "401":
+                    description: Missing or invalid admin token
+    /admin/api/cleanup-dlq/requeue:
+        post:
+            summary: Move dead-lettered cleanups back into the queue
+            operationId: postCleanupDlqRequeue
+            parameters:
+                - name: backend
+                  in: query
+                  description: Restrict the requeue to one backend
+                  required: false
+                  schema:
+                    type: string
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/CleanupDLQRequeueResponse'
+                "401":
+                    description: Missing or invalid admin token
+    /admin/api/cleanup-queue:
+        get:
+            summary: Pending cleanup depth and a page of rows
+            operationId: getCleanupQueue
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/CleanupQueueResponse'
+                "401":
+                    description: Missing or invalid admin token
+    /admin/api/compress-existing:
+        post:
+            summary: Store every uncompressed object as chunked zstd
+            operationId: postCompressExisting
+            parameters:
+                - name: backend
+                  in: query
+                  description: Restrict the pass to one backend
+                  required: false
+                  schema:
+                    type: string
+                - name: max
+                  in: query
+                  description: Cap the objects rewritten by this request; 0 converts the whole fleet
+                  required: false
+                  schema:
+                    type: integer
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/CompressExistingResponse'
+                        application/x-ndjson:
+                            description: One JSON object per line while the operation runs
+                            schema:
+                                $ref: '#/components/schemas/Event'
+                "401":
+                    description: Missing or invalid admin token
+    /admin/api/decompress-existing:
+        post:
+            summary: Rewrite every compressed object back to its stored bytes
+            operationId: postDecompressExisting
+            parameters:
+                - name: backend
+                  in: query
+                  description: Restrict the pass to one backend
+                  required: false
+                  schema:
+                    type: string
+                - name: max
+                  in: query
+                  description: Cap the objects rewritten by this request; 0 converts the whole fleet
+                  required: false
+                  schema:
+                    type: integer
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/DecompressExistingResponse'
+                        application/x-ndjson:
+                            description: One JSON object per line while the operation runs
+                            schema:
+                                $ref: '#/components/schemas/Event'
+                "401":
+                    description: Missing or invalid admin token
+    /admin/api/decrypt-existing:
+        post:
+            summary: Rewrite every encrypted object back to plaintext
+            operationId: postDecryptExisting
+            parameters:
+                - name: backend
+                  in: query
+                  description: Restrict the pass to one backend
+                  required: false
+                  schema:
+                    type: string
+                - name: max
+                  in: query
+                  description: Cap the objects rewritten by this request; 0 converts the whole fleet
+                  required: false
+                  schema:
+                    type: integer
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/DecryptExistingResponse'
+                        application/x-ndjson:
+                            description: One JSON object per line while the operation runs
+                            schema:
+                                $ref: '#/components/schemas/Event'
+                "401":
+                    description: Missing or invalid admin token
+    /admin/api/encrypt-existing:
+        post:
+            summary: Encrypt every plaintext object in place
+            operationId: postEncryptExisting
+            parameters:
+                - name: backend
+                  in: query
+                  description: Restrict the pass to one backend
+                  required: false
+                  schema:
+                    type: string
+                - name: max
+                  in: query
+                  description: Cap the objects rewritten by this request; 0 converts the whole fleet
+                  required: false
+                  schema:
+                    type: integer
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/EncryptExistingResponse'
+                        application/x-ndjson:
+                            description: One JSON object per line while the operation runs
+                            schema:
+                                $ref: '#/components/schemas/Event'
+                "401":
+                    description: Missing or invalid admin token
+    /admin/api/lifecycle:
+        post:
+            summary: Run one lifecycle expiration sweep
+            operationId: postLifecycle
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/LifecycleResponse'
+                        application/x-ndjson:
+                            description: One JSON object per line while the operation runs
+                            schema:
+                                $ref: '#/components/schemas/Event'
+                "401":
+                    description: Missing or invalid admin token
+    /admin/api/log-level:
+        get:
+            summary: Current runtime log level
+            operationId: getLogLevel
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/LogLevelResponse'
+                "401":
+                    description: Missing or invalid admin token
+        put:
+            summary: Set the runtime log level
+            operationId: putLogLevel
+            requestBody:
+                required: true
+                content:
+                    application/json:
+                        schema:
+                            $ref: '#/components/schemas/SetLogLevelRequest'
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/LogLevelResponse'
+                "401":
+                    description: Missing or invalid admin token
+    /admin/api/logs:
+        get:
+            summary: Recent records from the in-memory log buffer
+            operationId: getLogs
+            parameters:
+                - name: level
+                  in: query
+                  description: 'Minimum level to return: debug, info, warn or error'
+                  required: false
+                  schema:
+                    type: string
+                - name: limit
+                  in: query
+                  description: Maximum records to return
+                  required: false
+                  schema:
+                    type: integer
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/LogsResponse'
+                "401":
+                    description: Missing or invalid admin token
+    /admin/api/object-locations:
+        get:
+            summary: Backend placement for one object key
+            operationId: getObjectLocations
+            parameters:
+                - name: key
+                  in: query
+                  description: Object key to resolve
+                  required: true
+                  schema:
+                    type: string
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ObjectLocationsResponse'
+                "401":
+                    description: Missing or invalid admin token
+    /admin/api/object-scrub:
+        post:
+            summary: Verify every copy of one object now
+            operationId: postObjectScrub
+            parameters:
+                - name: key
+                  in: query
+                  description: Object key to verify
+                  required: true
+                  schema:
+                    type: string
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ScrubKeyResponse'
+                "401":
+                    description: Missing or invalid admin token
+    /admin/api/objects:
+        delete:
+            summary: Delete every object under a prefix
+            operationId: deleteObjects
+            parameters:
+                - name: prefix
+                  in: query
+                  description: Prefix whose objects are removed
+                  required: true
+                  schema:
+                    type: string
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ObjectDeleteResponse'
+                "401":
+                    description: Missing or invalid admin token
+        get:
+            summary: Page of stored objects
+            operationId: getObjects
+            parameters:
+                - name: prefix
+                  in: query
+                  description: Restrict the listing to keys under this prefix
+                  required: false
+                  schema:
+                    type: string
+                - name: delimiter
+                  in: query
+                  description: Grouping delimiter; omitted defaults to /, empty lists every key flat
+                  required: false
+                  schema:
+                    type: string
+                - name: continuation
+                  in: query
+                  description: Continuation token from a previous page
+                  required: false
+                  schema:
+                    type: string
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ObjectListResponse'
+                "401":
+                    description: Missing or invalid admin token
+    /admin/api/objects/{key}:
+        delete:
+            summary: Delete one object
+            operationId: deleteObjectsKey
+            parameters:
+                - name: key
+                  in: path
+                  description: Object key, including its bucket prefix
+                  required: true
+                  schema:
+                    type: string
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ObjectDeleteResponse'
+                "401":
+                    description: Missing or invalid admin token
+        get:
+            summary: Download one object
+            operationId: getObjectsKey
+            parameters:
+                - name: key
+                  in: path
+                  description: Object key, including its bucket prefix
+                  required: true
+                  schema:
+                    type: string
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/octet-stream:
+                            schema:
+                                format: binary
+                                type: string
+                "401":
+                    description: Missing or invalid admin token
+        put:
+            summary: Upload one object
+            operationId: putObjectsKey
+            parameters:
+                - name: key
+                  in: path
+                  description: Object key, including its bucket prefix
+                  required: true
+                  schema:
+                    type: string
+            requestBody:
+                required: true
+                content:
+                    application/octet-stream:
+                        schema:
+                            format: binary
+                            type: string
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ObjectUploadResponse'
+                "401":
+                    description: Missing or invalid admin token
+    /admin/api/objects/tags/{key}:
+        delete:
+            summary: Clear one object's tag set
+            operationId: deleteObjectsTagsKey
+            parameters:
+                - name: key
+                  in: path
+                  description: Object key, including its bucket prefix
+                  required: true
+                  schema:
+                    type: string
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ObjectTagsResponse'
+                "401":
+                    description: Missing or invalid admin token
+        get:
+            summary: Read one object's tag set
+            operationId: getObjectsTagsKey
+            parameters:
+                - name: key
+                  in: path
+                  description: Object key, including its bucket prefix
+                  required: true
+                  schema:
+                    type: string
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ObjectTagsResponse'
+                "401":
+                    description: Missing or invalid admin token
+        put:
+            summary: Replace one object's tag set
+            operationId: putObjectsTagsKey
+            parameters:
+                - name: key
+                  in: path
+                  description: Object key, including its bucket prefix
+                  required: true
+                  schema:
+                    type: string
+            requestBody:
+                required: true
+                content:
+                    application/json:
+                        schema:
+                            $ref: '#/components/schemas/ObjectTagsRequest'
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ObjectTagsResponse'
+                "401":
+                    description: Missing or invalid admin token
+    /admin/api/over-replication:
+        get:
+            summary: Count of objects holding surplus copies
+            operationId: getOverReplication
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/OverReplicationStatusResponse'
+                "401":
+                    description: Missing or invalid admin token
+        post:
+            summary: Run one over-replication cleanup pass
+            operationId: postOverReplication
+            parameters:
+                - name: batch_size
+                  in: query
+                  description: Override the configured batch size for this run
+                  required: false
+                  schema:
+                    type: integer
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/OverReplicationCleanResponse'
+                        application/x-ndjson:
+                            description: One JSON object per line while the operation runs
+                            schema:
+                                $ref: '#/components/schemas/Event'
+                "401":
+                    description: Missing or invalid admin token
+    /admin/api/provisioning:
+        get:
+            summary: Buckets, users and credentials from both the config file and the store
+            operationId: getProvisioning
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ProvisioningResponse'
+                "401":
+                    description: Missing or invalid admin token
+    /admin/api/provisioning/buckets:
+        post:
+            summary: Declare a virtual bucket
+            operationId: postProvisioningBuckets
+            requestBody:
+                required: true
+                content:
+                    application/json:
+                        schema:
+                            $ref: '#/components/schemas/CreateBucketRequest'
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ProvisioningOperationResponse'
+                "401":
+                    description: Missing or invalid admin token
+    /admin/api/provisioning/buckets/{name}:
+        delete:
+            summary: Remove a virtual bucket that holds no objects and no grants
+            operationId: deleteProvisioningBucketsName
+            parameters:
+                - name: name
+                  in: path
+                  description: Virtual bucket name
+                  required: true
+                  schema:
+                    type: string
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ProvisioningOperationResponse'
+                "401":
+                    description: Missing or invalid admin token
+        patch:
+            summary: Replace what a virtual bucket carries
+            operationId: patchProvisioningBucketsName
+            parameters:
+                - name: name
+                  in: path
+                  description: Virtual bucket name
+                  required: true
+                  schema:
+                    type: string
+            requestBody:
+                required: true
+                content:
+                    application/json:
+                        schema:
+                            $ref: '#/components/schemas/UpdateBucketRequest'
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ProvisioningOperationResponse'
+                "401":
+                    description: Missing or invalid admin token
+    /admin/api/provisioning/credentials:
+        post:
+            summary: Register a keypair for a user, minting one when none is supplied
+            operationId: postProvisioningCredentials
+            requestBody:
+                required: true
+                content:
+                    application/json:
+                        schema:
+                            $ref: '#/components/schemas/CreateCredentialRequest'
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/CreateCredentialResponse'
+                "401":
+                    description: Missing or invalid admin token
+    /admin/api/provisioning/credentials/{id}:
+        delete:
+            summary: Revoke one keypair, leaving its siblings working
+            operationId: deleteProvisioningCredentialsId
+            parameters:
+                - name: id
+                  in: path
+                  description: Access key ID to revoke
+                  required: true
+                  schema:
+                    type: string
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ProvisioningOperationResponse'
+                "401":
+                    description: Missing or invalid admin token
+    /admin/api/provisioning/grants:
+        post:
+            summary: Let a user reach a resource
+            operationId: postProvisioningGrants
+            requestBody:
+                required: true
+                content:
+                    application/json:
+                        schema:
+                            $ref: '#/components/schemas/CreateGrantRequest'
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ProvisioningOperationResponse'
+                "401":
+                    description: Missing or invalid admin token
+    /admin/api/provisioning/grants/{id}/{name}:
+        delete:
+            summary: Withdraw one user's access to one resource
+            operationId: deleteProvisioningGrantsIdName
+            parameters:
+                - name: id
+                  in: path
+                  description: User ID
+                  required: true
+                  schema:
+                    type: string
+                - name: name
+                  in: path
+                  description: Name of the granted resource, or * for every one of its kind
+                  required: true
+                  schema:
+                    type: string
+                - name: kind
+                  in: query
+                  description: 'Kind of the granted resource: bucket, backend or orchestrator; defaults to bucket'
+                  required: false
+                  schema:
+                    type: string
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ProvisioningOperationResponse'
+                "401":
+                    description: Missing or invalid admin token
+        put:
+            summary: Declare exactly what one user reaches on one resource
+            operationId: putProvisioningGrantsIdName
+            parameters:
+                - name: id
+                  in: path
+                  description: User ID
+                  required: true
+                  schema:
+                    type: string
+                - name: name
+                  in: path
+                  description: Name of the granted resource, or * for every one of its kind
+                  required: true
+                  schema:
+                    type: string
+                - name: kind
+                  in: query
+                  description: 'Kind of the granted resource: bucket, backend or orchestrator; defaults to bucket'
+                  required: false
+                  schema:
+                    type: string
+            requestBody:
+                required: true
+                content:
+                    application/json:
+                        schema:
+                            $ref: '#/components/schemas/SetGrantRequest'
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ProvisioningOperationResponse'
+                "401":
+                    description: Missing or invalid admin token
+    /admin/api/provisioning/users:
+        post:
+            summary: Declare an identity credentials can be issued against
+            operationId: postProvisioningUsers
+            requestBody:
+                required: true
+                content:
+                    application/json:
+                        schema:
+                            $ref: '#/components/schemas/CreateUserRequest'
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ProvisioningOperationResponse'
+                "401":
+                    description: Missing or invalid admin token
+    /admin/api/provisioning/users/{id}:
+        delete:
+            summary: Remove an identity that holds no credentials and no grants
+            operationId: deleteProvisioningUsersId
+            parameters:
+                - name: id
+                  in: path
+                  description: User ID
+                  required: true
+                  schema:
+                    type: string
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ProvisioningOperationResponse'
+                "401":
+                    description: Missing or invalid admin token
+        patch:
+            summary: Rename an identity, leaving the ID its credentials and grants reference
+            operationId: patchProvisioningUsersId
+            parameters:
+                - name: id
+                  in: path
+                  description: User ID
+                  required: true
+                  schema:
+                    type: string
+            requestBody:
+                required: true
+                content:
+                    application/json:
+                        schema:
+                            $ref: '#/components/schemas/RenameUserRequest'
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ProvisioningOperationResponse'
+                "401":
+                    description: Missing or invalid admin token
+    /admin/api/rebalance:
+        post:
+            summary: Run one rebalance cycle
+            operationId: postRebalance
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/RebalanceResponse'
+                        application/x-ndjson:
+                            description: One JSON object per line while the operation runs
+                            schema:
+                                $ref: '#/components/schemas/Event'
+                "401":
+                    description: Missing or invalid admin token
+    /admin/api/reconcile:
+        post:
+            summary: Reconcile backend storage against the object ledger
+            operationId: postReconcile
+            parameters:
+                - name: backend
+                  in: query
+                  description: Restrict the pass to one backend
+                  required: false
+                  schema:
+                    type: string
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ReconcileResponse'
+                        application/x-ndjson:
+                            description: One JSON object per line while the operation runs
+                            schema:
+                                $ref: '#/components/schemas/Event'
+                "401":
+                    description: Missing or invalid admin token
+    /admin/api/reload-status:
+        get:
+            summary: Outcome of the most recent config reload
+            operationId: getReloadStatus
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ReloadStatusResponse'
+                "401":
+                    description: Missing or invalid admin token
+    /admin/api/replicate:
+        post:
+            summary: Run one replication cycle
+            operationId: postReplicate
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ReplicateResponse'
+                        application/x-ndjson:
+                            description: One JSON object per line while the operation runs
+                            schema:
+                                $ref: '#/components/schemas/Event'
+                "401":
+                    description: Missing or invalid admin token
+    /admin/api/replication:
+        get:
+            summary: Replication backlog snapshot
+            operationId: getReplication
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ReplicationStatusResponse'
+                "401":
+                    description: Missing or invalid admin token
+    /admin/api/rotate-encryption-key:
+        post:
+            summary: Re-wrap sealed DEKs under the current primary key
+            operationId: postRotateEncryptionKey
+            requestBody:
+                required: true
+                content:
+                    application/json:
+                        schema:
+                            $ref: '#/components/schemas/RotateEncryptionKeyRequest'
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/RotateEncryptionKeyResponse'
+                "401":
+                    description: Missing or invalid admin token
+    /admin/api/scrub:
+        post:
+            summary: Verify stored content hashes against backend data
+            operationId: postScrub
+            parameters:
+                - name: backend
+                  in: query
+                  description: Restrict the pass to one backend
+                  required: false
+                  schema:
+                    type: string
+                - name: batch_size
+                  in: query
+                  description: Objects verified in this pass
+                  required: false
+                  schema:
+                    type: integer
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ScrubResponse'
+                        application/x-ndjson:
+                            description: One JSON object per line while the operation runs
+                            schema:
+                                $ref: '#/components/schemas/Event'
+                "401":
+                    description: Missing or invalid admin token
+    /admin/api/status:
+        get:
+            summary: Instance and per-backend operational state
+            operationId: getStatus
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/StatusResponse'
+                "401":
+                    description: Missing or invalid admin token
+    /admin/api/trace/snapshot:
+        post:
+            summary: Download a flight-recorder trace snapshot
+            operationId: postTraceSnapshot
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/octet-stream:
+                            schema:
+                                format: binary
+                                type: string
+                "401":
+                    description: Missing or invalid admin token
+    /admin/api/usage-flush:
+        post:
+            summary: Force a flush of usage counters to the database
+            operationId: postUsageFlush
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/UsageFlushResponse'
+                "401":
+                    description: Missing or invalid admin token
+    /admin/api/usage-reconcile:
+        post:
+            summary: Recompute per-backend bytes_used from the object ledger
+            operationId: postUsageReconcile
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/UsageReconcileResponse'
+                "401":
+                    description: Missing or invalid admin token
+    /admin/api/workers:
+        get:
+            summary: Last-tick health of every background service
+            operationId: getWorkers
+            responses:
+                "200":
+                    description: Success
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/WorkersResponse'
+                "401":
+                    description: Missing or invalid admin token
+components:
+    schemas:
+        BackendOperationResponse:
+            properties:
+                backend:
+                    type: string
+                status:
+                    type: string
+            required:
+                - status
+                - backend
+            type: object
+        BackendStatus:
+            properties:
+                api_requests:
+                    format: int64
+                    type: integer
+                bytes_limit:
+                    format: int64
+                    type: integer
+                bytes_used:
+                    format: int64
+                    type: integer
+                compression_saved_bytes:
+                    format: int64
+                    type: integer
+                draining:
+                    type: boolean
+                egress_bytes:
+                    format: int64
+                    type: integer
+                healthy:
+                    type: boolean
+                ingress_bytes:
+                    format: int64
+                    type: integer
+                name:
+                    type: string
+                object_count:
+                    format: int64
+                    type: integer
+            required:
+                - name
+                - healthy
+                - draining
+                - bytes_used
+                - bytes_limit
+                - object_count
+                - api_requests
+                - egress_bytes
+                - ingress_bytes
+                - compression_saved_bytes
+            type: object
+        BackfillChecksumsResponse:
+            properties:
+                done:
+                    type: boolean
+                processed:
+                    format: int64
+                    type: integer
+                reason:
+                    type: string
+                status:
+                    type: string
+            required:
+                - status
+                - processed
+                - done
+            type: object
+        Bucket:
+            properties:
+                cors:
+                    items:
+                        $ref: '#/components/schemas/CORSRule'
+                    type: array
+                max_multipart_uploads:
+                    format: int64
+                    type: integer
+                name:
+                    type: string
+                source:
+                    type: string
+            required:
+                - name
+                - max_multipart_uploads
+                - source
+            type: object
+        CORSRule:
+            properties:
+                allowed_headers:
+                    items:
+                        type: string
+                    type: array
+                allowed_methods:
+                    items:
+                        type: string
+                    type: array
+                allowed_origins:
+                    items:
+                        type: string
+                    type: array
+                expose_headers:
+                    items:
+                        type: string
+                    type: array
+                max_age:
+                    format: int64
+                    type: integer
+            required:
+                - allowed_origins
+                - allowed_methods
+            type: object
+        CacheInvalidateKeyResponse:
+            properties:
+                key:
+                    type: string
+                status:
+                    type: string
+            required:
+                - status
+                - key
+            type: object
+        CacheInvalidateResponse:
+            properties:
+                entries_dropped:
+                    format: int64
+                    type: integer
+                prefix:
+                    type: string
+                status:
+                    type: string
+            required:
+                - status
+                - entries_dropped
+            type: object
+        CacheStatsResponse:
+            properties:
+                entries:
+                    format: int64
+                    type: integer
+                hits:
+                    format: int64
+                    type: integer
+                max_bytes:
+                    format: int64
+                    type: integer
+                misses:
+                    format: int64
+                    type: integer
+                size_bytes:
+                    format: int64
+                    type: integer
+            required:
+                - entries
+                - size_bytes
+                - max_bytes
+                - hits
+                - misses
+            type: object
+        CleanupDLQItem:
+            properties:
+                attempts:
+                    format: int32
+                    type: integer
+                backend:
+                    type: string
+                first_enqueued_at:
+                    format: date-time
+                    type: string
+                last_error:
+                    type: string
+                moved_at:
+                    format: date-time
+                    type: string
+                object_key:
+                    type: string
+                reason:
+                    type: string
+                size_bytes:
+                    format: int64
+                    type: integer
+            required:
+                - backend
+                - object_key
+                - reason
+                - size_bytes
+                - attempts
+                - first_enqueued_at
+                - moved_at
+            type: object
+        CleanupDLQRequeueResponse:
+            properties:
+                backend:
+                    type: string
+                requeued:
+                    format: int64
+                    type: integer
+            required:
+                - requeued
+            type: object
+        CleanupDLQResponse:
+            properties:
+                depth:
+                    format: int64
+                    type: integer
+                items:
+                    items:
+                        $ref: '#/components/schemas/CleanupDLQItem'
+                    type: array
+            required:
+                - depth
+                - items
+            type: object
+        CleanupQueueItem:
+            properties:
+                attempts:
+                    format: int32
+                    type: integer
+                backend:
+                    type: string
+                claimed_at:
+                    format: date-time
+                    type: string
+                claimed_by:
+                    type: string
+                id:
+                    format: int64
+                    type: integer
+                object_key:
+                    type: string
+                reason:
+                    type: string
+                size_bytes:
+                    format: int64
+                    type: integer
+            required:
+                - id
+                - backend
+                - object_key
+                - reason
+                - size_bytes
+                - attempts
+            type: object
+        CleanupQueueResponse:
+            properties:
+                depth:
+                    format: int64
+                    type: integer
+                items:
+                    items:
+                        $ref: '#/components/schemas/CleanupQueueItem'
+                    type: array
+            required:
+                - depth
+                - items
+            type: object
+        CompressExistingResponse:
+            properties:
+                changed:
+                    format: int64
+                    type: integer
+                compressed:
+                    format: int64
+                    type: integer
+                failed:
+                    format: int64
+                    type: integer
+                skipped:
+                    format: int64
+                    type: integer
+                status:
+                    type: string
+                total:
+                    format: int64
+                    type: integer
+            required:
+                - status
+                - skipped
+                - changed
+                - failed
+                - total
+                - compressed
+            type: object
+        CopyScrubResult:
+            properties:
+                backend:
+                    type: string
+                detail:
+                    type: string
+                outcome:
+                    type: string
+            required:
+                - backend
+                - outcome
+            type: object
+        CreateBucketRequest:
+            properties:
+                cors:
+                    items:
+                        $ref: '#/components/schemas/CORSRule'
+                    type: array
+                max_multipart_uploads:
+                    format: int64
+                    type: integer
+                name:
+                    type: string
+            required:
+                - name
+            type: object
+        CreateCredentialRequest:
+            properties:
+                access_key_id:
+                    type: string
+                label:
+                    type: string
+                secret_access_key:
+                    type: string
+                user_id:
+                    type: string
+            required:
+                - user_id
+            type: object
+        CreateCredentialResponse:
+            properties:
+                access_key_id:
+                    type: string
+                label:
+                    type: string
+                secret_access_key:
+                    type: string
+                user_id:
+                    type: string
+            required:
+                - access_key_id
+                - secret_access_key
+                - user_id
+            type: object
+        CreateGrantRequest:
+            properties:
+                kind:
+                    type: string
+                name:
+                    type: string
+                permissions:
+                    items:
+                        type: string
+                    type: array
+                user_id:
+                    type: string
+            required:
+                - user_id
+            type: object
+        CreateUserRequest:
+            properties:
+                name:
+                    type: string
+            required:
+                - name
+            type: object
+        Credential:
+            properties:
+                access_key_id:
+                    type: string
+                label:
+                    type: string
+                source:
+                    type: string
+                user_id:
+                    type: string
+            required:
+                - access_key_id
+                - user_id
+                - source
+            type: object
+        DecompressExistingResponse:
+            properties:
+                changed:
+                    format: int64
+                    type: integer
+                decompressed:
+                    format: int64
+                    type: integer
+                failed:
+                    format: int64
+                    type: integer
+                skipped:
+                    format: int64
+                    type: integer
+                status:
+                    type: string
+                total:
+                    format: int64
+                    type: integer
+            required:
+                - status
+                - skipped
+                - changed
+                - failed
+                - total
+                - decompressed
+            type: object
+        DecryptExistingResponse:
+            properties:
+                changed:
+                    format: int64
+                    type: integer
+                decrypted:
+                    format: int64
+                    type: integer
+                failed:
+                    format: int64
+                    type: integer
+                skipped:
+                    format: int64
+                    type: integer
+                status:
+                    type: string
+                total:
+                    format: int64
+                    type: integer
+            required:
+                - status
+                - skipped
+                - changed
+                - failed
+                - total
+                - decrypted
+            type: object
+        DrainProgressResponse:
+            properties:
+                active:
+                    type: boolean
+                bytes_remaining:
+                    format: int64
+                    type: integer
+                error:
+                    type: string
+                objects_moved:
+                    format: int64
+                    type: integer
+                objects_remaining:
+                    format: int64
+                    type: integer
+            required:
+                - active
+                - objects_remaining
+                - bytes_remaining
+                - objects_moved
+            type: object
+        EncryptExistingResponse:
+            properties:
+                changed:
+                    format: int64
+                    type: integer
+                encrypted:
+                    format: int64
+                    type: integer
+                failed:
+                    format: int64
+                    type: integer
+                skipped:
+                    format: int64
+                    type: integer
+                status:
+                    type: string
+                total:
+                    format: int64
+                    type: integer
+            required:
+                - status
+                - skipped
+                - changed
+                - failed
+                - total
+                - encrypted
+            type: object
+        Event:
+            properties:
+                duration_ms:
+                    format: int64
+                    type: integer
+                error:
+                    type: string
+                event:
+                    type: string
+                fields:
+                    additionalProperties: {}
+                    type: object
+                message:
+                    type: string
+                op:
+                    type: string
+                outcome:
+                    type: string
+                processed:
+                    format: int64
+                    type: integer
+            required:
+                - event
+            type: object
+        Grant:
+            properties:
+                kind:
+                    type: string
+                name:
+                    type: string
+                permissions:
+                    items:
+                        type: string
+                    type: array
+            required:
+                - kind
+                - permissions
+            type: object
+        IntegrityStatus:
+            properties:
+                deferred_copies:
+                    format: int64
+                    type: integer
+                never_verified_copies:
+                    format: int64
+                    type: integer
+                oldest_unverified_seconds:
+                    format: int64
+                    type: integer
+                plaintext_copies:
+                    format: int64
+                    type: integer
+            required:
+                - oldest_unverified_seconds
+                - never_verified_copies
+                - deferred_copies
+                - plaintext_copies
+            type: object
+        LifecycleResponse:
+            properties:
+                deleted:
+                    format: int64
+                    type: integer
+                failed:
+                    format: int64
+                    type: integer
+                reason:
+                    type: string
+                status:
+                    type: string
+            required:
+                - status
+                - deleted
+                - failed
+            type: object
+        LogEntry:
+            properties:
+                attrs:
+                    additionalProperties: {}
+                    type: object
+                component:
+                    type: string
+                level:
+                    type: string
+                message:
+                    type: string
+                time:
+                    format: date-time
+                    type: string
+            required:
+                - time
+                - level
+                - message
+            type: object
+        LogLevelResponse:
+            properties:
+                level:
+                    type: string
+            required:
+                - level
+            type: object
+        LogsResponse:
+            properties:
+                entries:
+                    items:
+                        $ref: '#/components/schemas/LogEntry'
+                    type: array
+            required:
+                - entries
+            type: object
+        Notice:
+            properties:
+                detail:
+                    type: string
+                kind:
+                    type: string
+            required:
+                - kind
+                - detail
+            type: object
+        ObjectDeleteResponse:
+            properties:
+                deleted:
+                    format: int64
+                    type: integer
+                failed:
+                    format: int64
+                    type: integer
+                total:
+                    format: int64
+                    type: integer
+            required:
+                - deleted
+            type: object
+        ObjectEntry:
+            properties:
+                key:
+                    type: string
+                size:
+                    format: int64
+                    type: integer
+            required:
+                - key
+                - size
+            type: object
+        ObjectListResponse:
+            properties:
+                common_prefixes:
+                    items:
+                        type: string
+                    type: array
+                next:
+                    type: string
+                objects:
+                    items:
+                        $ref: '#/components/schemas/ObjectEntry'
+                    type: array
+                truncated:
+                    type: boolean
+            required:
+                - common_prefixes
+                - objects
+                - truncated
+            type: object
+        ObjectLocation:
+            properties:
+                backend:
+                    type: string
+                compression_algorithm:
+                    type: string
+                content_hash:
+                    type: string
+                created_at:
+                    format: date-time
+                    type: string
+                encrypted:
+                    type: boolean
+                key_id:
+                    type: string
+                last_scrubbed_at:
+                    format: date-time
+                    type: string
+                logical_size:
+                    format: int64
+                    type: integer
+                plaintext_size:
+                    format: int64
+                    type: integer
+                size_bytes:
+                    format: int64
+                    type: integer
+            required:
+                - backend
+                - size_bytes
+                - created_at
+                - encrypted
+                - plaintext_size
+            type: object
+        ObjectLocationsResponse:
+            properties:
+                key:
+                    type: string
+                locations:
+                    items:
+                        $ref: '#/components/schemas/ObjectLocation'
+                    type: array
+            required:
+                - key
+                - locations
+            type: object
+        ObjectTag:
+            properties:
+                key:
+                    type: string
+                value:
+                    type: string
+            required:
+                - key
+                - value
+            type: object
+        ObjectTagsRequest:
+            properties:
+                tags:
+                    items:
+                        $ref: '#/components/schemas/ObjectTag'
+                    type: array
+            required:
+                - tags
+            type: object
+        ObjectTagsResponse:
+            properties:
+                tags:
+                    items:
+                        $ref: '#/components/schemas/ObjectTag'
+                    type: array
+            required:
+                - tags
+            type: object
+        ObjectUploadResponse:
+            properties:
+                etag:
+                    type: string
+            required:
+                - etag
+            type: object
+        OverReplicationCleanResponse:
+            properties:
+                copies_removed:
+                    format: int64
+                    type: integer
+                failed:
+                    format: int64
+                    type: integer
+                reason:
+                    type: string
+                status:
+                    type: string
+            required:
+                - status
+                - copies_removed
+            type: object
+        OverReplicationStatusResponse:
+            properties:
+                factor:
+                    format: int64
+                    type: integer
+                pending:
+                    format: int64
+                    type: integer
+                reason:
+                    type: string
+                status:
+                    type: string
+            required:
+                - status
+                - factor
+                - pending
+            type: object
+        ProvisioningOperationResponse:
+            properties:
+                bucket:
+                    type: string
+                resource:
+                    type: string
+                status:
+                    type: string
+                user_id:
+                    type: string
+                user_name:
+                    type: string
+            required:
+                - status
+            type: object
+        ProvisioningResponse:
+            properties:
+                buckets:
+                    items:
+                        $ref: '#/components/schemas/Bucket'
+                    type: array
+                credentials:
+                    items:
+                        $ref: '#/components/schemas/Credential'
+                    type: array
+                notices:
+                    items:
+                        $ref: '#/components/schemas/Notice'
+                    type: array
+                users:
+                    items:
+                        $ref: '#/components/schemas/User'
+                    type: array
+            required:
+                - buckets
+                - users
+                - credentials
+            type: object
+        RebalanceResponse:
+            properties:
+                moved:
+                    format: int64
+                    type: integer
+                reason:
+                    type: string
+                status:
+                    type: string
+            required:
+                - status
+                - moved
+            type: object
+        ReconcileResponse:
+            properties:
+                backends_scanned:
+                    format: int64
+                    type: integer
+                imported:
+                    format: int64
+                    type: integer
+                reason:
+                    type: string
+                removed:
+                    format: int64
+                    type: integer
+                status:
+                    type: string
+            required:
+                - status
+                - imported
+                - removed
+                - backends_scanned
+            type: object
+        ReloadHookOutcome:
+            properties:
+                error:
+                    type: string
+                name:
+                    type: string
+                status:
+                    type: string
+            required:
+                - name
+                - status
+            type: object
+        ReloadStatusResponse:
+            properties:
+                ended_at:
+                    format: date-time
+                    type: string
+                generation:
+                    format: int64
+                    type: integer
+                load_error:
+                    type: string
+                outcomes:
+                    items:
+                        $ref: '#/components/schemas/ReloadHookOutcome'
+                    type: array
+                requires_restart:
+                    items:
+                        type: string
+                    type: array
+                started_at:
+                    format: date-time
+                    type: string
+                status:
+                    type: string
+            required:
+                - status
+            type: object
+        RemoveBackendPreview:
+            properties:
+                backend:
+                    type: string
+                confirm_token:
+                    type: string
+                expires_in:
+                    format: int64
+                    type: integer
+                object_count:
+                    format: int64
+                    type: integer
+                status:
+                    type: string
+                total_bytes:
+                    format: int64
+                    type: integer
+            required:
+                - status
+                - backend
+                - object_count
+                - total_bytes
+                - confirm_token
+                - expires_in
+            type: object
+        RenameUserRequest:
+            properties:
+                name:
+                    type: string
+            required:
+                - name
+            type: object
+        ReplicateResponse:
+            properties:
+                copies_created:
+                    format: int64
+                    type: integer
+                failed:
+                    format: int64
+                    type: integer
+                reason:
+                    type: string
+                status:
+                    type: string
+            required:
+                - status
+                - copies_created
+            type: object
+        ReplicationStatusResponse:
+            properties:
+                computed_at:
+                    format: date-time
+                    type: string
+                factor:
+                    format: int64
+                    type: integer
+                over_replicated:
+                    format: int64
+                    type: integer
+                under_replicated:
+                    format: int64
+                    type: integer
+            required:
+                - factor
+                - under_replicated
+                - over_replicated
+                - computed_at
+            type: object
+        RotateEncryptionKeyRequest:
+            properties:
+                old_key_id:
+                    type: string
+            required:
+                - old_key_id
+            type: object
+        RotateEncryptionKeyResponse:
+            properties:
+                failed:
+                    format: int64
+                    type: integer
+                rotated:
+                    format: int64
+                    type: integer
+                status:
+                    type: string
+                total:
+                    format: int64
+                    type: integer
+            required:
+                - status
+                - failed
+                - total
+                - rotated
+            type: object
+        ScrubKeyResponse:
+            properties:
+                copies:
+                    items:
+                        $ref: '#/components/schemas/CopyScrubResult'
+                    type: array
+                key:
+                    type: string
+            required:
+                - key
+                - copies
+            type: object
+        ScrubResponse:
+            properties:
+                checked:
+                    format: int64
+                    type: integer
+                deferred:
+                    format: int64
+                    type: integer
+                failed:
+                    format: int64
+                    type: integer
+                reason:
+                    type: string
+                status:
+                    type: string
+                unreadable:
+                    format: int64
+                    type: integer
+            required:
+                - status
+                - checked
+                - failed
+                - unreadable
+                - deferred
+            type: object
+        SetGrantRequest:
+            properties:
+                permissions:
+                    items:
+                        type: string
+                    type: array
+            required:
+                - permissions
+            type: object
+        SetLogLevelRequest:
+            properties:
+                level:
+                    type: string
+            required:
+                - level
+            type: object
+        StatusResponse:
+            properties:
+                backends:
+                    items:
+                        $ref: '#/components/schemas/BackendStatus'
+                    type: array
+                db_healthy:
+                    type: boolean
+                integrity:
+                    $ref: '#/components/schemas/IntegrityStatus'
+                usage_period:
+                    type: string
+            required:
+                - db_healthy
+                - usage_period
+                - backends
+                - integrity
+            type: object
+        UpdateBucketRequest:
+            properties:
+                cors:
+                    items:
+                        $ref: '#/components/schemas/CORSRule'
+                    type: array
+                max_multipart_uploads:
+                    format: int64
+                    type: integer
+            type: object
+        UsageFlushResponse:
+            properties:
+                status:
+                    type: string
+            required:
+                - status
+            type: object
+        UsageReconcileResponse:
+            properties:
+                adjustments:
+                    additionalProperties:
+                        format: int64
+                        type: integer
+                    type: object
+                status:
+                    type: string
+            required:
+                - status
+                - adjustments
+            type: object
+        User:
+            properties:
+                buckets:
+                    items:
+                        type: string
+                    type: array
+                grants:
+                    items:
+                        $ref: '#/components/schemas/Grant'
+                    type: array
+                id:
+                    type: string
+                name:
+                    type: string
+                source:
+                    type: string
+            required:
+                - id
+                - name
+                - buckets
+                - grants
+                - source
+            type: object
+        WorkerHealth:
+            properties:
+                consecutive_failures:
+                    format: int64
+                    type: integer
+                last_error:
+                    type: string
+                last_failure:
+                    format: date-time
+                    type: string
+                last_success:
+                    format: date-time
+                    type: string
+                name:
+                    type: string
+            required:
+                - name
+                - last_success
+                - last_failure
+                - consecutive_failures
+            type: object
+        WorkersResponse:
+            properties:
+                workers:
+                    items:
+                        $ref: '#/components/schemas/WorkerHealth'
+                    type: array
+            required:
+                - workers
+            type: object
+    securitySchemes:
+        sigv4:
+            type: http
+            scheme: aws4-hmac-sha256
+            description: AWS SigV4 signature over the request, using an access key the deployment holds. What a credential reaches is decided by the grants its user carries.

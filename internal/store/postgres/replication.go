@@ -23,6 +23,10 @@ import (
 	db "github.com/afreidah/s3-orchestrator/internal/store/postgres/sqlc"
 )
 
+// -------------------------------------------------------------------------
+// COPY LOOKUP
+// -------------------------------------------------------------------------
+
 // GetAllObjectLocations returns all copies of an object, ordered by created_at
 // ascending (oldest/primary first). Used for read failover.
 func (s *Store) GetAllObjectLocations(ctx context.Context, key string) ([]core.ObjectLocation, error) {
@@ -35,7 +39,7 @@ func (s *Store) GetAllObjectLocations(ctx context.Context, key string) ([]core.O
 		return nil, core.ErrObjectNotFound
 	}
 
-	return toFatObjectLocations(rows), nil
+	return toIdentifiedObjectLocations(rows), nil
 }
 
 // GetObjectBackendsForKeys returns a map from each supplied object_key to
@@ -57,6 +61,10 @@ func (s *Store) GetObjectBackendsForKeys(ctx context.Context, keys []string) (ma
 	}
 	return out, nil
 }
+
+// -------------------------------------------------------------------------
+// UNDER-REPLICATION
+// -------------------------------------------------------------------------
 
 // GetUnderReplicatedObjects finds objects with fewer copies than the target
 // replication factor. Returns all rows for those objects so callers know which
@@ -89,11 +97,9 @@ func (s *Store) GetUnderReplicatedObjectsExcluding(ctx context.Context, factor, 
 	return toFatObjectLocations(rows), nil
 }
 
-// RecordReplica inserts a replica copy of an object, but only if the
-// source copy still exists. Delegates to core.RecordReplica.
-func (s *Store) RecordReplica(ctx context.Context, key, targetBackend, sourceBackend string) (int64, bool, error) {
-	return core.RecordReplica(ctx, s, key, targetBackend, sourceBackend)
-}
+// -------------------------------------------------------------------------
+// OVER-REPLICATION
+// -------------------------------------------------------------------------
 
 // GetOverReplicatedObjects finds objects with more copies than the target
 // replication factor. Returns all rows for those objects so callers can
@@ -128,11 +134,4 @@ func (s *Store) CountOverReplicatedObjects(ctx context.Context, factor int) (int
 		return 0, fmt.Errorf("failed to count over-replicated objects: %w", err)
 	}
 	return count, nil
-}
-
-// RemoveExcessCopy delegates to core.RemoveExcessCopy, which acquires
-// the key-scoped FOR-UPDATE lock and only deletes when the live copy
-// count still exceeds factor.
-func (s *Store) RemoveExcessCopy(ctx context.Context, key, backendName string, factor int) (bool, error) {
-	return core.RemoveExcessCopy(ctx, s, key, backendName, factor)
 }

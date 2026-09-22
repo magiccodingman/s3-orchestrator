@@ -9,10 +9,6 @@
 // The CLI Run is a thin wrapper that constructs a Runtime and calls Run.
 // -------------------------------------------------------------------------------
 
-// Package runtime is the daemon composition root. It assembles every
-// long-lived subsystem - observability, DI, the HTTP listener, background
-// workers, the reload coordinator - and owns the shutdown order so the
-// CLI entry point does not.
 package runtime
 
 import (
@@ -33,17 +29,24 @@ import (
 	"github.com/afreidah/s3-orchestrator/internal/di"
 	"github.com/afreidah/s3-orchestrator/internal/encryption"
 	"github.com/afreidah/s3-orchestrator/internal/lifecycle"
+	"github.com/afreidah/s3-orchestrator/internal/observe/event"
 	"github.com/afreidah/s3-orchestrator/internal/observe/logfmt"
 	"github.com/afreidah/s3-orchestrator/internal/observe/telemetry"
-	"github.com/afreidah/s3-orchestrator/internal/proxy"
+	"github.com/afreidah/s3-orchestrator/internal/proxy/writepath"
 	"github.com/afreidah/s3-orchestrator/internal/reload"
 	"github.com/afreidah/s3-orchestrator/internal/store/core"
 	"github.com/afreidah/s3-orchestrator/internal/transport/admin"
+	"github.com/afreidah/s3-orchestrator/internal/transport/admin/adminapi"
 	"github.com/afreidah/s3-orchestrator/internal/transport/httpserver"
 	"github.com/afreidah/s3-orchestrator/internal/transport/httputil"
 	"github.com/afreidah/s3-orchestrator/internal/transport/s3api"
+	"github.com/afreidah/s3-orchestrator/internal/util/materialize"
 	"github.com/afreidah/s3-orchestrator/internal/util/syncutil"
 )
+
+// -------------------------------------------------------------------------
+// TYPES
+// -------------------------------------------------------------------------
 
 // Options carries the inputs the CLI Run passes through to runtime.
 type Options struct {
@@ -65,7 +68,7 @@ type Runtime struct {
 	log      *slog.Logger
 
 	inj      do.Injector
-	manager  *proxy.BackendManager
+	svc      bootstrapped
 	http     *httpserver.Server
 	reload   *reload.Coordinator
 	lifecyc  *lifecycle.Manager
@@ -74,6 +77,10 @@ type Runtime struct {
 
 	ready atomic.Bool
 }
+
+// -------------------------------------------------------------------------
+// CONSTRUCTOR
+// -------------------------------------------------------------------------
 
 // New assembles the runtime. Order matters: config -> observability ->
 // DI -> required services -> HTTP -> reload coordinator -> lifecycle
@@ -95,13 +102,19 @@ func New(opts Options, cfg *config.Config) (*Runtime, error) {
 	// handler) rather than the bare default.
 	r.log = slog.Default().With(logfmt.Component("runtime"))
 
+	// Applied here, before anything is wired that could serve a PUT. Config
+	// validation has already established the directory exists, so a failure
+	// past this point is a runtime one worth surfacing per write, not a
+	// startup misconfiguration.
+	materialize.SetSpillDir(cfg.Server.SpillDir)
+
 	r.inj = di.NewInjector(di.InjectorDeps{Config: cfg, Mode: opts.Mode, LogLevel: &r.logLevel, LogBuffer: obs.LogBuffer})
 
-	manager, err := resolveRequiredServices(r.inj, cfg)
+	svc, err := resolveRequiredServices(r.inj, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("resolve services: %w", err)
 	}
-	r.manager = manager
+	r.svc = svc
 	r.cfgPtr.Store(cfg)
 
 	httpSrv, err := httpserver.New(httpserver.Deps{
@@ -128,7 +141,9 @@ func New(opts Options, cfg *config.Config) (*Runtime, error) {
 	// the coordinator exists. Routing through a post-construction
 	// setter avoids the admin -> reload -> ui -> admin import cycle.
 	if adminHandler, _ := do.Invoke[*admin.Handler](r.inj); adminHandler != nil {
-		adminHandler.SetReloadStatusProvider(func() any { return r.reload.LastResult() })
+		adminHandler.SetReloadStatusProvider(func() *adminapi.ReloadStatusResponse {
+			return toAdminReloadStatus(r.reload.LastResult())
+		})
 	}
 
 	lifecyc, err := do.Invoke[*lifecycle.Manager](r.inj)
@@ -140,16 +155,43 @@ func New(opts Options, cfg *config.Config) (*Runtime, error) {
 	return r, nil
 }
 
+// -------------------------------------------------------------------------
+// PUBLIC API
+// -------------------------------------------------------------------------
+
 // Run starts background services, the SIGHUP watcher, and the HTTP
 // listener; blocks until ctx is cancelled or the HTTP listener errors;
 // then performs ordered shutdown. The returned error is the listener's
 // error if it surfaced one before ctx was cancelled, otherwise nil.
 func (r *Runtime) Run(ctx context.Context) error {
+	// Before anything can be written: admission judges every write against the
+	// baseline this loads, and an instance that started with an empty one would
+	// refuse each write as though no backend had room.
+	if err := r.svc.usage.RefreshQuotaBaselines(ctx); err != nil {
+		return fmt.Errorf("prime quota baselines: %w", err)
+	}
+
 	r.startBackgroundServices()
 	r.reload.Watch()
 
+	// Bound before readiness is announced, so an address already in use fails
+	// startup here rather than surfacing after the orchestrator has told its
+	// load balancer it is taking traffic.
+	if err := r.http.Listen(ctx); err != nil {
+		return fmt.Errorf("bind listeners: %w", err)
+	}
+
 	r.ready.Store(true)
 	r.logStartup()
+
+	// Published after the notifier is among the started services, so the
+	// first event a subscriber sees is the one saying the instance is up.
+	event.Publish(event.ServiceStarted, "", map[string]any{
+		"version":     telemetry.Version,
+		"mode":        r.opts.Mode,
+		"listen_addr": r.cfg.Server.ListenAddr,
+		"backends":    len(r.cfg.Backends),
+	})
 
 	serverErr := make(chan error, 1)
 	go func() {
@@ -172,7 +214,7 @@ func (r *Runtime) Run(ctx context.Context) error {
 	// Drain any late listener error so the goroutine exits cleanly.
 	select {
 	case err := <-serverErr:
-		if err != nil && err != http.ErrServerClosed {
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			return err
 		}
 	default:
@@ -181,6 +223,10 @@ func (r *Runtime) Run(ctx context.Context) error {
 	r.log.InfoContext(ctx, "server stopped")
 	return nil
 }
+
+// -------------------------------------------------------------------------
+// INTERNALS
+// -------------------------------------------------------------------------
 
 // dbBreaker resolves the database circuit breaker from the injector for
 // the /health handler. Returns nil when the breaker has not been
@@ -212,6 +258,10 @@ func (r *Runtime) shutdown() {
 	ctx := context.Background()
 	r.log.InfoContext(ctx, "shutting down")
 
+	// Published first: the notifier is one of the services stopped below, and
+	// an event queued after it stops has nothing to deliver it.
+	event.Publish(event.ServiceStopping, "", map[string]any{"version": telemetry.Version})
+
 	// Deferred so DI-managed resources (providers implementing
 	// do.Shutdownable) are always released, even if an earlier step
 	// panics or aborts.
@@ -233,6 +283,7 @@ func (r *Runtime) shutdown() {
 	defer cancel()
 
 	r.http.Shutdown(shutdownCtx)
+	r.drainDetachedUploads(ctx)
 
 	if rl, _ := do.Invoke[*s3api.RateLimiter](r.inj); rl != nil {
 		rl.Close()
@@ -246,9 +297,12 @@ func (r *Runtime) shutdown() {
 	r.lifecyc.Stop(10 * time.Second)
 
 	closeEncryptionProvider(r.inj)
-	r.manager.Close()
+	// Caches close before the final flush: the eviction goroutines are what
+	// would otherwise still be running while the counters are read.
+	r.svc.objects.LocationCache().Close()
+	r.svc.multipart.Close()
 
-	if err := r.manager.FlushUsage(shutdownCtx); err != nil {
+	if err := r.svc.usage.FlushUsage(shutdownCtx); err != nil {
 		r.log.WarnContext(shutdownCtx, "final usage flush failed", "error", err)
 	}
 
@@ -260,6 +314,36 @@ func (r *Runtime) shutdown() {
 
 	if err := r.obs.ShutdownTracer(shutdownCtx); err != nil {
 		r.log.ErrorContext(ctx, "tracer shutdown error", "error", err)
+	}
+}
+
+// drainDetachedUploads waits for the copies a fan-out write left running after
+// answering its client. They belong to no request, so the HTTP drain above
+// returns without them; this is the other half of that wait.
+//
+// Placed after the HTTP drain and before the background services stop, because
+// each of those copies still has a row to commit and bytes to account for, and
+// the final usage flush further down is what carries them. Whatever is still
+// running when the deadline expires is left exactly as a kill would leave it:
+// the intents stay, and the reaper resolves them on a later tick.
+func (r *Runtime) drainDetachedUploads(ctx context.Context) {
+	detached, err := do.Invoke[*writepath.DetachedUploads](r.inj)
+	if err != nil || detached == nil {
+		return
+	}
+	depth := detached.Depth()
+	if depth == 0 {
+		return
+	}
+	r.log.InfoContext(ctx, "waiting for copies still uploading after their response",
+		"in_flight", depth, "timeout", writepath.DetachedDrainTimeout)
+
+	drainCtx, cancel := context.WithTimeout(ctx, writepath.DetachedDrainTimeout)
+	defer cancel()
+
+	if remaining := detached.Wait(drainCtx); remaining > 0 {
+		r.log.WarnContext(ctx, "shutdown deadline reached with copies still uploading; leaving them to the reaper",
+			"in_flight", remaining)
 	}
 }
 
@@ -304,4 +388,29 @@ func (r *Runtime) logStartup() {
 		"backends", len(r.cfg.Backends),
 		"routing_strategy", r.cfg.RoutingStrategy,
 	)
+}
+
+// toAdminReloadStatus copies a reload result into the admin wire type so no
+// internal/reload type reaches the API surface. Returns nil before the first
+// reload, which the handler reports as its not-yet placeholder.
+func toAdminReloadStatus(res *reload.Result) *adminapi.ReloadStatusResponse {
+	if res == nil {
+		return nil
+	}
+	out := &adminapi.ReloadStatusResponse{
+		Status:          string(res.Status),
+		Generation:      &res.Generation,
+		RequiresRestart: res.RequiresRestart,
+		LoadError:       res.LoadError,
+		StartedAt:       &res.StartedAt,
+		EndedAt:         &res.EndedAt,
+	}
+	for _, o := range res.Outcomes {
+		out.Outcomes = append(out.Outcomes, adminapi.ReloadHookOutcome{
+			Name:   o.Name,
+			Status: string(o.Status),
+			Error:  o.Error,
+		})
+	}
+	return out
 }

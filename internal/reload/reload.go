@@ -8,14 +8,10 @@
 // the Apply pass collecting per-hook outcomes. A monotonic generation
 // counter advances on every successful Apply pass (full or partial) so
 // operators can correlate reload events with the version each component
-// is running. The most recent ReloadResult is held atomically and
+// is running. The most recent Result is held atomically and
 // exposed via LastResult() for admin status surfaces.
 // -------------------------------------------------------------------------------
 
-// Package reload owns SIGHUP-driven configuration reload. The
-// coordinator runs a two-phase Check / Apply pass over a sequence of
-// hooks, swaps the atomic config on success, and reports full /
-// partial / validation / load outcomes via ReloadResult.
 package reload
 
 import (
@@ -31,34 +27,36 @@ import (
 	"github.com/samber/do/v2"
 
 	"github.com/afreidah/s3-orchestrator/internal/config"
+	"github.com/afreidah/s3-orchestrator/internal/observe/event"
 	"github.com/afreidah/s3-orchestrator/internal/observe/logfmt"
 	"github.com/afreidah/s3-orchestrator/internal/transport/httputil"
 	"github.com/afreidah/s3-orchestrator/internal/util/syncutil"
 )
+
+// -------------------------------------------------------------------------
+// CONSTANTS
+// -------------------------------------------------------------------------
 
 // applyTimeout caps the Apply phase so a hook that hangs on an outbound
 // call (quota sync, quota metrics refresh) cannot stall the SIGHUP
 // goroutine. The Check phase is in-memory and not timeboxed.
 const applyTimeout = 10 * time.Second
 
+// -------------------------------------------------------------------------
+// TYPES
+// -------------------------------------------------------------------------
+
 // Deps groups everything the coordinator mutates or reads on reload.
+// CfgPtr is the atomic config the rest of the process reads; the coordinator
+// swaps the new one in after a successful Apply pass. Hooks is nil in
+// production, where the default set is used, and set by tests injecting fakes.
 type Deps struct {
-	// ConfigPath is the on-disk YAML the SIGHUP handler reloads.
-	ConfigPath string
-	// Injector is consulted by hooks for optional subsystems (rate
-	// limiter, UI handler) that may not be registered in every mode.
-	Injector do.Injector
-	// CfgPtr is the atomic config the rest of the process reads. The
-	// coordinator swaps in the new config after a successful Apply pass.
-	CfgPtr *syncutil.AtomicConfig[config.Config]
-	// LogLevel is updated by the log_level hook when Server.LogLevel
-	// changes.
-	LogLevel *slog.LevelVar
-	// CertReloader rotates the TLS certificate; nil when TLS is off.
-	CertReloader *httputil.CertReloader
-	// Hooks overrides the default hook set. Production callers leave
-	// it nil; tests use this to inject fakes.
-	Hooks []Hook
+	ConfigPath   string      // the on-disk YAML SIGHUP reloads
+	Injector     do.Injector // consulted by hooks for optional subsystems
+	CfgPtr       *syncutil.AtomicConfig[config.Config]
+	LogLevel     *slog.LevelVar         // updated by the log_level hook
+	CertReloader *httputil.CertReloader // rotates the TLS certificate; nil when TLS is off
+	Hooks        []Hook
 }
 
 // Coordinator owns the SIGHUP goroutine, the hook sequence, and the
@@ -71,7 +69,7 @@ type Coordinator struct {
 	log   *slog.Logger
 
 	generation atomic.Int64
-	lastResult atomic.Pointer[ReloadResult]
+	lastResult atomic.Pointer[Result]
 
 	hupChan chan os.Signal
 	hupDone chan struct{}
@@ -95,6 +93,10 @@ func New(deps *Deps) *Coordinator {
 		log:   slog.Default().With(logfmt.Component("reload")),
 	}
 }
+
+// -------------------------------------------------------------------------
+// PUBLIC API
+// -------------------------------------------------------------------------
 
 // Watch installs a SIGHUP handler and spawns the reload goroutine. The
 // goroutine runs until Shutdown is called.
@@ -129,12 +131,17 @@ func (c *Coordinator) Shutdown() {
 
 // LastResult returns the most recent reload result, or nil if no
 // reload has been attempted yet.
-func (c *Coordinator) LastResult() *ReloadResult {
+func (c *Coordinator) LastResult() *Result {
 	return c.lastResult.Load()
 }
 
 // Generation returns the monotonic generation counter. Starts at 0;
 // advances on every successful Apply pass (full or partial).
+//
+// The admin API reports the same number through LastResult, which carries the
+// rest of the pass with it. This accessor answers the narrower question without
+// a result to unpack, and is nil-safe before the first reload, where
+// LastResult is not.
 func (c *Coordinator) Generation() int64 {
 	return c.generation.Load()
 }
@@ -143,7 +150,7 @@ func (c *Coordinator) Generation() int64 {
 // surfaces can trigger a reload without sending a real signal.
 // Returns the result of the pass; the same value is stored on the
 // coordinator and reachable via LastResult.
-func (c *Coordinator) Reload() *ReloadResult {
+func (c *Coordinator) Reload() *Result {
 	started := time.Now()
 	ctx := context.Background()
 	currentGen := c.generation.Load()
@@ -153,7 +160,7 @@ func (c *Coordinator) Reload() *ReloadResult {
 
 	newCfg, err := config.LoadConfig(c.deps.ConfigPath)
 	if err != nil {
-		return c.finalize(ctx, &ReloadResult{
+		return c.finalize(ctx, &Result{
 			Generation: currentGen,
 			Status:     ReloadLoadFailed,
 			LoadError:  err.Error(),
@@ -161,7 +168,7 @@ func (c *Coordinator) Reload() *ReloadResult {
 		})
 	}
 
-	result := &ReloadResult{
+	result := &Result{
 		Generation:      currentGen,
 		StartedAt:       started,
 		RequiresRestart: config.NonReloadableFieldsChanged(c.deps.CfgPtr.Load(), newCfg),
@@ -169,7 +176,6 @@ func (c *Coordinator) Reload() *ReloadResult {
 
 	currentCfg := c.deps.CfgPtr.Load()
 
-	// --- Check pass: any error aborts before any Apply runs ---
 	for _, h := range c.hooks {
 		if err := h.Check(currentCfg, newCfg); err != nil {
 			result.Status = ReloadValidationFailed
@@ -182,7 +188,6 @@ func (c *Coordinator) Reload() *ReloadResult {
 		}
 	}
 
-	// --- Apply pass: best-effort, collect outcomes ---
 	applyCtx, cancel := context.WithTimeout(ctx, applyTimeout)
 	defer cancel()
 
@@ -213,9 +218,13 @@ func (c *Coordinator) Reload() *ReloadResult {
 	return c.finalize(ctx, result)
 }
 
+// -------------------------------------------------------------------------
+// INTERNALS
+// -------------------------------------------------------------------------
+
 // finalize stamps EndedAt, logs the outcome at the appropriate level,
 // stores the result, and returns it.
-func (c *Coordinator) finalize(ctx context.Context, r *ReloadResult) *ReloadResult {
+func (c *Coordinator) finalize(ctx context.Context, r *Result) *Result {
 	r.EndedAt = time.Now()
 	c.lastResult.Store(r)
 
@@ -241,17 +250,27 @@ func (c *Coordinator) finalize(ctx context.Context, r *ReloadResult) *ReloadResu
 			"generation", r.Generation,
 			"failed_hook", firstFailedHookName(r),
 		)
+		event.Publish(event.ConfigReloadFailed, "", map[string]any{
+			"generation":   r.Generation,
+			"status":       string(r.Status),
+			"failed_hooks": failedHookNames(r),
+		})
 	case ReloadLoadFailed:
 		c.log.ErrorContext(ctx, "config reload aborted, keeping current config",
 			"generation", r.Generation,
 			"error", r.LoadError,
 		)
+		event.Publish(event.ConfigReloadFailed, "", map[string]any{
+			"generation": r.Generation,
+			"status":     string(r.Status),
+			"error":      r.LoadError,
+		})
 	}
 	return r
 }
 
 // failedHookNames returns the names of hooks whose outcome is Failed.
-func failedHookNames(r *ReloadResult) []string {
+func failedHookNames(r *Result) []string {
 	var names []string
 	for _, o := range r.Outcomes {
 		if o.Status == HookFailed {
@@ -264,7 +283,7 @@ func failedHookNames(r *ReloadResult) []string {
 // firstFailedHookName returns the name of the first failed hook in the
 // outcomes slice. Used in the validation-failure log line where there
 // is exactly one failure.
-func firstFailedHookName(r *ReloadResult) string {
+func firstFailedHookName(r *Result) string {
 	for _, o := range r.Outcomes {
 		if o.Status == HookFailed {
 			return o.Name
@@ -272,4 +291,3 @@ func firstFailedHookName(r *ReloadResult) string {
 	}
 	return ""
 }
-

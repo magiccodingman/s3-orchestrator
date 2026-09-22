@@ -1,5 +1,6 @@
 ---
 title: "s3-orchestrator go api reference"
+description: "Generated Go package documentation: the object path, the metadata store, the backend abstraction, the transports, and the background workers."
 linkTitle: "Go API Reference"
 chapter: true
 weight: 40
@@ -11,11 +12,18 @@ weight: 40
 ### Core
 
 <div class="landing-grid">
-  <a class="landing-card" href="proxy/">
+  <a class="landing-card" href="object/">
     <i class="fas fa-database landing-card-icon" style="color: #93c5fd;"></i>
     <div>
-      <strong>proxy</strong>
-      <p>Multi-backend S3 object orchestration with quota enforcement, replication, and rebalancing.</p>
+      <strong>object</strong>
+      <p>Multi-backend object CRUD with read failover, broadcast reads, and location caching.</p>
+    </div>
+  </a>
+  <a class="landing-card" href="infra/">
+    <i class="fas fa-network-wired landing-card-icon" style="color: #93c5fd;"></i>
+    <div>
+      <strong>infra</strong>
+      <p>Backend runtime shared by every proxy subpackage: registry, usage limits, timeouts, admission.</p>
     </div>
   </a>
   <a class="landing-card" href="store/">
@@ -98,6 +106,13 @@ weight: 40
     <div>
       <strong>auth</strong>
       <p>SigV4 request signing, presigned URLs, and credential validation.</p>
+    </div>
+  </a>
+  <a class="landing-card" href="provisioning/">
+    <i class="fas fa-id-card landing-card-icon" style="color: #86efac;"></i>
+    <div>
+      <strong>provisioning</strong>
+      <p>Merges the buckets and credentials the config file and the store each declare into one view.</p>
     </div>
   </a>
   <a class="landing-card" href="httputil/">

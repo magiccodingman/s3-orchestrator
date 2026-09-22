@@ -15,7 +15,13 @@ import (
 	"html/template"
 	"io/fs"
 	"strings"
+
+	"github.com/afreidah/s3-orchestrator/internal/util/humanize"
 )
+
+// -------------------------------------------------------------------------
+// CONSTANTS
+// -------------------------------------------------------------------------
 
 //go:embed templates/*.html static/*
 var embeddedFS embed.FS
@@ -27,39 +33,43 @@ var embeddedFS embed.FS
 // problem the binary cannot recover from.
 var staticFS, _ = fs.Sub(embeddedFS, "static")
 
+// -------------------------------------------------------------------------
+// INTERNALS
+// -------------------------------------------------------------------------
+
 // loadTemplates parses every dashboard HTML template into a single
 // template tree with the funcMap registered (formatBytes, pct, etc).
 // Run once at handler construction time so render hot-paths skip the
 // parse step.
 func loadTemplates() *template.Template {
 	funcMap := template.FuncMap{
-		"formatBytes":  formatBytes,
-		"formatNumber": formatNumber,
-		"pct":          pct,
-		"pctFloat":     pctFloat,
-		"barColor":     barColor,
-		"joinStrings":  strings.Join,
+		"formatBytes":    humanize.Bytes,
+		"formatNumber":   formatNumber,
+		"formatDuration": humanize.Duration,
+		"pct":            pct,
+		"pctFloat":       pctFloat,
+		"barColor":       barColor,
+		"joinStrings":    strings.Join,
+		"sub":            sub,
+		"ratio":          ratio,
 	}
 	return template.Must(
 		template.New("").Funcs(funcMap).ParseFS(embeddedFS, "templates/*.html"),
 	)
 }
 
-// formatBytes converts a byte count to a human-readable string.
-func formatBytes(b int64) string {
+// sub subtracts b from a. Templates cannot do arithmetic, and the alternative
+// is precomputing every difference the page shows into its own view field.
+func sub(a, b int64) int64 { return a - b }
+
+// ratio renders a as a fraction of b, to two decimals. A zero denominator has
+// no ratio to report, which is a dash rather than a zero: nothing was measured,
+// as opposed to something measuring nothing.
+func ratio(a, b int64) string {
 	if b == 0 {
-		return "0 B"
+		return "-"
 	}
-	const unit = 1024
-	if b < unit {
-		return fmt.Sprintf("%d B", b)
-	}
-	div, exp := int64(unit), 0
-	for n := b / unit; n >= unit; n /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f %ciB", float64(b)/float64(div), "KMGTPE"[exp])
+	return fmt.Sprintf("%.2f", float64(a)/float64(b))
 }
 
 // formatNumber formats an integer with comma separators.

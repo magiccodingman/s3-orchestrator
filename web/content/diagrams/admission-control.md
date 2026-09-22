@@ -1,4 +1,5 @@
 ---
+description: "Interactive diagram of the request lifecycle through the admission control pipeline, with upstream and downstream paths shown on hover."
 title: "Admission Control Flow"
 linkTitle: "Admission Control"
 weight: 1
@@ -102,8 +103,27 @@ This interactive diagram shows the complete request lifecycle through the S3 Orc
 
   mermaid.initialize({
     startOnLoad: false,
-    theme: 'dark',
-    flowchart: { nodeSpacing: 14, rankSpacing: 22, curve: 'basis', padding: 5, diagramPadding: 8, useMaxWidth: true }
+    theme: 'base',
+    themeVariables: {
+      darkMode: true,
+      background: '#191c23',
+      fontFamily: 'Inter, ui-sans-serif, system-ui, sans-serif',
+      fontSize: '15px',
+      primaryColor: '#26332f',
+      primaryTextColor: '#f8fafc',
+      primaryBorderColor: '#2a9d73',
+      secondaryColor: '#3a2e20',
+      secondaryTextColor: '#e8dfd0',
+      secondaryBorderColor: '#c4a35a',
+      tertiaryColor: '#20262d',
+      tertiaryTextColor: '#e8dfd0',
+      tertiaryBorderColor: '#4aaa8a',
+      lineColor: '#7f8b86',
+      edgeLabelBackground: '#191c23',
+      clusterBkg: '#1d2229',
+      clusterBorder: '#39443f'
+    },
+    flowchart: { nodeSpacing: 32, rankSpacing: 46, curve: 'linear', padding: 12, diagramPadding: 16, useMaxWidth: true, htmlLabels: true }
   });
 
   mermaid.render('ac-mermaid-svg', diagramSrc).then(function(result) {
@@ -115,7 +135,7 @@ This interactive diagram shows the complete request lifecycle through the S3 Orc
     REQ: {
       title: 'S3 Request',
       badge: 'process', badgeText: 'entry point',
-      body: '<p>Incoming HTTP request to the S3-compatible API endpoint.</p><p>Carries AWS SigV4 <code>Authorization</code> header, presigned URL query parameters, or legacy <code>X-Proxy-Token</code> header, along with HTTP method and <code>/{bucket}/{key}</code> path.</p><p>A unique <code>X-Amz-Request-Id</code> is assigned (or honoured from an upstream <code>X-Request-Id</code> header) for audit correlation through the entire pipeline.</p>'
+      body: '<p>Incoming HTTP request to the S3-compatible API endpoint.</p><p>Carries an AWS SigV4 <code>Authorization</code> header or presigned URL query parameters, along with HTTP method and <code>/{bucket}/{key}</code> path.</p><p>A unique <code>X-Amz-Request-Id</code> is assigned (or honoured from an upstream <code>X-Request-Id</code> header) for audit correlation through the entire pipeline.</p>'
     },
     AC: {
       title: 'Admission Controller',
@@ -178,9 +198,9 @@ This interactive diagram shows the complete request lifecycle through the S3 Orc
       body: '<p>Per-IP rate limit exceeded. The token bucket for this client IP is empty.</p><p>Response: <code>429 Too Many Requests</code> with <code>Retry-After: 1</code>.</p><p class="ac-metric">Metric: s3o_rate_limit_rejections_total</p>'
     },
     AUTH: {
-      title: 'SigV4 / Presigned / Token Auth',
+      title: 'SigV4 / Presigned Auth',
       badge: 'process', badgeText: 'authentication',
-      body: '<p>Verifies AWS Signature Version 4 from either the <code>Authorization</code> header or presigned URL query parameters (<code>X-Amz-Algorithm</code>, <code>X-Amz-Credential</code>, <code>X-Amz-Signature</code>, etc.). Reconstructs the canonical request + string-to-sign and derives the signing key via the HMAC-SHA256 chain:</p><p><code>secret &rarr; dateKey &rarr; dateRegionKey &rarr; dateRegionServiceKey &rarr; signingKey</code></p><p>The signing key is derived per request rather than cached so the timing of known-vs-unknown access keys remains constant. Header auth: &plusmn;15 minute clock skew tolerance. Presigned URLs: expiry enforced via <code>X-Amz-Expires</code> (max 7 days).</p><p>The canonical URI is taken from the request\'s wire form (<code>r.URL.RawPath</code>, falling back to <code>r.URL.Path</code> when the URL parser preserved the encoding verbatim) so percent-encoded path segments are matched byte-for-byte. Object keys containing <code>%2F</code> (a literal <code>/</code> as part of the key, not a directory separator) round-trip correctly through the AWS SDK signers, and an upstream proxy that normalises one encoding to another after the client signed cannot have the substituted form silently accepted.</p><p>Streaming-payload PUTs (<code>STREAMING-AWS4-HMAC-SHA256-PAYLOAD</code>, <code>STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER</code>, <code>STREAMING-UNSIGNED-PAYLOAD-TRAILER</code>) are supported: the seed signature in the <code>Authorization</code> header authenticates the request envelope, and a chunk-validating reader takes over the request body to verify each chained per-chunk signature (or the trailer signature for the unsigned-trailer variant) before bytes reach storage.</p><p>Also supports legacy <code>X-Proxy-Token</code> header for simple clients.</p>'
+      body: '<p>Verifies AWS Signature Version 4 from either the <code>Authorization</code> header or presigned URL query parameters (<code>X-Amz-Algorithm</code>, <code>X-Amz-Credential</code>, <code>X-Amz-Signature</code>, etc.). Reconstructs the canonical request + string-to-sign and derives the signing key via the HMAC-SHA256 chain:</p><p><code>secret &rarr; dateKey &rarr; dateRegionKey &rarr; dateRegionServiceKey &rarr; signingKey</code></p><p>The signing key is derived per request rather than cached so the timing of known-vs-unknown access keys remains constant. Header auth: &plusmn;15 minute clock skew tolerance. Presigned URLs: expiry enforced via <code>X-Amz-Expires</code> (max 7 days).</p><p>The canonical URI is taken from the request\'s wire form (<code>r.URL.RawPath</code>, falling back to <code>r.URL.Path</code> when the URL parser preserved the encoding verbatim) so percent-encoded path segments are matched byte-for-byte. Object keys containing <code>%2F</code> (a literal <code>/</code> as part of the key, not a directory separator) round-trip correctly through the AWS SDK signers, and an upstream proxy that normalises one encoding to another after the client signed cannot have the substituted form silently accepted.</p><p>Streaming-payload PUTs (<code>STREAMING-AWS4-HMAC-SHA256-PAYLOAD</code>, <code>STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER</code>, <code>STREAMING-UNSIGNED-PAYLOAD-TRAILER</code>) are supported: the seed signature in the <code>Authorization</code> header authenticates the request envelope, and a chunk-validating reader takes over the request body to verify each chained per-chunk signature (or the trailer signature for the unsigned-trailer variant) before bytes reach storage.</p>'
     },
     AUTHOK: {
       title: 'Signature Valid?',
@@ -297,9 +317,22 @@ This interactive diagram shows the complete request lifecycle through the S3 Orc
 
   function positionTooltip() {
     var pad = 12;
-    var x = mouseX + pad, y = mouseY + pad;
-    if (x + tooltip.offsetWidth > window.innerWidth - pad) x = mouseX - tooltip.offsetWidth - pad;
-    if (y + tooltip.offsetHeight > window.innerHeight - pad) y = mouseY - tooltip.offsetHeight - pad;
+    var w = tooltip.offsetWidth, h = tooltip.offsetHeight;
+    var vw = window.innerWidth, vh = window.innerHeight;
+
+    var x = mouseX + pad;
+    if (x + w > vw - pad) x = mouseX - w - pad;
+    x = Math.max(pad, Math.min(x, vw - w - pad));
+
+    // Prefer below the cursor, and flip above only when above genuinely has
+    // more room. Clamping afterwards is what keeps a tall panel on screen: an
+    // unclamped flip puts its top edge above the viewport, and a panel taller
+    // than the viewport pins to the top and scrolls instead.
+    var below = vh - mouseY - pad * 2;
+    var above = mouseY - pad * 2;
+    var y = (h <= below || below >= above) ? mouseY + pad : mouseY - h - pad;
+    y = Math.max(pad, Math.min(y, vh - h - pad));
+
     tooltip.style.left = x + 'px';
     tooltip.style.top = y + 'px';
   }

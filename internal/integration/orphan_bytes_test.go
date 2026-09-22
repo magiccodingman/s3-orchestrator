@@ -25,9 +25,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
 	"github.com/afreidah/s3-orchestrator/internal/config"
-	"github.com/afreidah/s3-orchestrator/internal/proxy"
 	"github.com/afreidah/s3-orchestrator/internal/proxy/proxytest"
-	"github.com/afreidah/s3-orchestrator/internal/transport/auth"
 	"github.com/afreidah/s3-orchestrator/internal/transport/s3api"
 )
 
@@ -57,7 +55,7 @@ func TestOrphanBytes_OrphanBytesBlockWrite(t *testing.T) {
 	}
 
 	setOrphanBytes(t, "minio-1", 10)
-	testManager.ClearCache()
+	testStack.Objects.LocationCache().Clear()
 
 	overflowKey := uniqueKey(t, "orphan-block")
 	_, err = client.PutObject(ctx, &s3.PutObjectInput{
@@ -110,7 +108,7 @@ func TestOrphanBytes_OrphanBytesBlockAllBackends507(t *testing.T) {
 
 	setOrphanBytes(t, "minio-1", 24)
 	setOrphanBytes(t, "minio-2", 48)
-	testManager.ClearCache()
+	testStack.Objects.LocationCache().Clear()
 
 	tinyKey := uniqueKey(t, "orphan-507")
 	_, err = client.PutObject(ctx, &s3.PutObjectInput{
@@ -436,19 +434,19 @@ func TestOrphanBytes_ReplicationRespectsOrphanBytes(t *testing.T) {
 	}
 
 	setOrphanBytes(t, "minio-2", 148)
-	testManager.ClearCache()
+	testStack.Objects.LocationCache().Clear()
 
 	replCfg := config.ReplicationConfig{
 		Factor:    2,
 		BatchSize: 10,
 	}
-	created, err := testWorkers.Replicator.Replicate(ctx, replCfg, nil)
+	replSum, err := testWorkers.Replicator.Replicate(ctx, replCfg, nil)
 	if err != nil {
 		t.Fatalf("Replicate: %v", err)
 	}
 
-	if created != 0 {
-		t.Errorf("expected 0 replicas created (minio-2 full with orphan_bytes), got %d", created)
+	if replSum.CopiesCreated != 0 {
+		t.Errorf("expected 0 replicas created (minio-2 full with orphan_bytes), got %d", replSum.CopiesCreated)
 	}
 
 	copies := queryObjectCopies(t, key)
@@ -483,12 +481,12 @@ func TestOrphanBytes_OverwriteDisplacedCopiesCleanedUp(t *testing.T) {
 		Factor:    2,
 		BatchSize: 10,
 	}
-	created, err := testWorkers.Replicator.Replicate(ctx, replCfg, nil)
+	replSum, err := testWorkers.Replicator.Replicate(ctx, replCfg, nil)
 	if err != nil {
 		t.Fatalf("Replicate: %v", err)
 	}
-	if created != 1 {
-		t.Fatalf("expected 1 replica created, got %d", created)
+	if replSum.CopiesCreated != 1 {
+		t.Fatalf("expected 1 replica created, got %d", replSum.CopiesCreated)
 	}
 
 	copies := queryObjectCopies(t, key)
@@ -548,31 +546,25 @@ func TestOrphanBytesSpreadRouting_SpreadRoutingRespectsOrphanBytes(t *testing.T)
 	ctx := context.Background()
 	_ = ctx
 	stores := newStores(testStore)
-	spreadManager := proxytest.NewManager(t, &proxy.BackendManagerConfig{
-		Storage: proxy.StorageDeps{
-			Backends: testBackends,
-			Order:    testBackendOrder,
-		},
-		Stores: proxy.StoreDeps{
-			Metadata:  stores,
-			Dashboard: testStore,
-		},
-		Policies: proxy.PolicyConfig{
-			CacheTTL:        60 * time.Second,
+	spreadStack := proxytest.New(t, stores, &proxytest.StackOptions{
+		Runtime: proxytest.NewRuntime(&proxytest.RuntimeOptions{
+			Backends:        testBackends,
+			Order:           testBackendOrder,
 			BackendTimeout:  30 * time.Second,
 			RoutingStrategy: config.RoutingSpread,
-		},
-		Operations: proxy.OperationalDeps{
-			Metrics: newMetricsAdapter(testStore),
-		},
+			Metrics:         newMetricsAdapter(testStore),
+		}),
+		CacheTTL:       60 * time.Second,
+		BackendTimeout: 30 * time.Second,
 	})
-	_ = spreadManager
-	_ = proxytest.BuildWorkers(spreadManager, stores)
+	registerStack(t, spreadStack)
+	_ = proxytest.BuildWorkers(spreadStack, stores)
 	spreadSrv := &s3api.Server{
-		Manager: spreadManager,
+		Objects:   spreadStack.Objects,
+		Multipart: spreadStack.Multipart,
 	}
 	_ = spreadSrv
-	spreadSrv.SetBucketAuth(auth.NewBucketRegistry([]config.BucketConfig{{
+	spreadSrv.SetBucketAuth(mustBucketRegistry(t, []config.BucketConfig{{
 		Name: virtualBucket,
 		Credentials: []config.CredentialConfig{{
 			AccessKeyID:     "test",
@@ -617,7 +609,7 @@ func TestOrphanBytesSpreadRouting_SpreadRoutingRespectsOrphanBytes(t *testing.T)
 	}
 
 	setOrphanBytes(t, "minio-2", 1500)
-	spreadManager.ClearCache()
+	spreadStack.Objects.LocationCache().Clear()
 
 	spreadKey := uniqueKey(t, "spread-orphan")
 	_, err = spreadClient.PutObject(ctx, &s3.PutObjectInput{

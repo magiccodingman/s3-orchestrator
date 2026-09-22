@@ -20,9 +20,13 @@ import (
 	"github.com/afreidah/s3-orchestrator/internal/store/core"
 )
 
+// -------------------------------------------------------------------------
+// QUEUE
+// -------------------------------------------------------------------------
+
 // EnqueueCleanup adds a failed cleanup operation to the retry queue.
 func (s *Store) EnqueueCleanup(ctx context.Context, backendName, objectKey, reason string, sizeBytes int64) error {
-	now := time.Now().UTC().Format(time.RFC3339Nano)
+	now := now()
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO cleanup_queue (backend_name, object_key, reason, size_bytes, created_at, next_retry)
 		 VALUES (?, ?, ?, ?, ?, ?)`,
@@ -39,7 +43,7 @@ func (s *Store) EnqueueCleanup(ctx context.Context, backendName, objectKey, reas
 // instead. claimed_at is parsed back from RFC3339Nano text since SQLite has
 // no native timestamp type.
 func (s *Store) GetPendingCleanups(ctx context.Context, limit int) ([]core.CleanupItem, error) {
-	now := time.Now().UTC().Format(time.RFC3339Nano)
+	now := now()
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, backend_name, object_key, reason, attempts, size_bytes,
 		        claimed_at, claimed_by
@@ -52,24 +56,22 @@ func (s *Store) GetPendingCleanups(ctx context.Context, limit int) ([]core.Clean
 	if err != nil {
 		return nil, fmt.Errorf("failed to get pending cleanups: %w", err)
 	}
-	defer rows.Close()
-
-	var items []core.CleanupItem
-	for rows.Next() {
-		var item core.CleanupItem
-		var claimedAt sql.NullString
-		var claimedBy sql.NullString
+	return collectRows(rows, "cleanup items", func(rows *sql.Rows) (core.CleanupItem, error) {
+		var (
+			item      core.CleanupItem
+			claimedAt sql.NullString
+			claimedBy sql.NullString
+		)
 		if err := rows.Scan(&item.ID, &item.BackendName, &item.ObjectKey, &item.Reason, &item.Attempts, &item.SizeBytes, &claimedAt, &claimedBy); err != nil {
-			return nil, fmt.Errorf("failed to scan cleanup item: %w", err)
+			return core.CleanupItem{}, fmt.Errorf("failed to scan cleanup item: %w", err)
 		}
 		item.ClaimedAt = parseNullableTime(claimedAt)
 		if claimedBy.Valid {
 			cb := claimedBy.String
 			item.ClaimedBy = &cb
 		}
-		items = append(items, item)
-	}
-	return items, rows.Err()
+		return item, nil
+	})
 }
 
 // ClaimPendingCleanups atomically claims a batch of pending rows for the
@@ -79,8 +81,8 @@ func (s *Store) GetPendingCleanups(ctx context.Context, limit int) ([]core.Clean
 // path apply (next_retry due, attempts < 10, claim NULL or older than
 // graceCutoff). The reclaimed flag is computed at SELECT time.
 func (s *Store) ClaimPendingCleanups(ctx context.Context, limit int, instanceID string, graceCutoff time.Time) ([]core.CleanupItem, error) {
-	now := time.Now().UTC().Format(time.RFC3339Nano)
-	cutoff := graceCutoff.UTC().Format(time.RFC3339Nano)
+	now := now()
+	cutoff := formatTime(graceCutoff)
 
 	var items []core.CleanupItem
 	err := cbWithTx(ctx, s.rawDB, s.cb, func(tx *sql.Tx) error {
@@ -118,27 +120,20 @@ func selectClaimableRows(ctx context.Context, tx *sql.Tx, now, cutoff string, li
 	if err != nil {
 		return nil, fmt.Errorf("select cleanup candidates: %w", err)
 	}
-	defer rows.Close()
-
-	var items []core.CleanupItem
-	for rows.Next() {
+	return collectRows(rows, "cleanup candidates", func(rows *sql.Rows) (core.CleanupItem, error) {
 		var item core.CleanupItem
 		if err := rows.Scan(&item.ID, &item.BackendName, &item.ObjectKey, &item.Reason, &item.Attempts, &item.SizeBytes, &item.Reclaimed); err != nil {
-			return nil, fmt.Errorf("scan cleanup candidate: %w", err)
+			return core.CleanupItem{}, fmt.Errorf("scan cleanup candidate: %w", err)
 		}
-		items = append(items, item)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate cleanup candidates: %w", err)
-	}
-	return items, nil
+		return item, nil
+	})
 }
 
 // stampClaims marks each row in items as claimed by instanceID. The
 // caller wraps both the SELECT and these UPDATEs in one transaction so
 // the claim is atomic against concurrent workers.
 func stampClaims(ctx context.Context, tx *sql.Tx, items []core.CleanupItem, instanceID string) error {
-	stamp := time.Now().UTC().Format(time.RFC3339Nano)
+	stamp := now()
 	for i := range items {
 		if _, err := tx.ExecContext(ctx,
 			`UPDATE cleanup_queue
@@ -151,6 +146,10 @@ func stampClaims(ctx context.Context, tx *sql.Tx, items []core.CleanupItem, inst
 	}
 	return nil
 }
+
+// -------------------------------------------------------------------------
+// COMPLETION AND RETRY
+// -------------------------------------------------------------------------
 
 // CompleteCleanupItem atomically deletes a successfully-processed row and
 // decrements the backing backend's orphan_bytes by the row's size. The two
@@ -191,7 +190,7 @@ func (s *Store) CompleteCleanupItem(ctx context.Context, id int64) error {
 // and clears the claim so the row is immediately re-eligible for the next
 // worker tick.
 func (s *Store) RetryCleanupItem(ctx context.Context, id int64, backoff time.Duration, lastError string) error {
-	nextRetry := time.Now().Add(backoff).UTC().Format(time.RFC3339Nano)
+	nextRetry := formatTime(time.Now().Add(backoff))
 	_, err := s.db.ExecContext(ctx,
 		`UPDATE cleanup_queue
 		 SET attempts = attempts + 1,
@@ -221,44 +220,22 @@ func parseNullableTime(s sql.NullString) *time.Time {
 	return &t
 }
 
-// SweepStaleCleanupQueueRows delegates to core.SweepStaleCleanupQueueRows.
-func (s *Store) SweepStaleCleanupQueueRows(ctx context.Context, key, backend string) (int64, error) {
-	return core.SweepStaleCleanupQueueRows(ctx, s, key, backend)
-}
+// -------------------------------------------------------------------------
+// DEPTHS AND DLQ
+// -------------------------------------------------------------------------
 
 // CleanupQueueDepth returns the number of items still pending in the queue
 // (fewer than 10 attempts).
 func (s *Store) CleanupQueueDepth(ctx context.Context) (int64, error) {
-	var count int64
-	err := s.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM cleanup_queue WHERE attempts < 10`,
-	).Scan(&count)
-	if err != nil {
-		return 0, fmt.Errorf("failed to count pending cleanups: %w", err)
-	}
-	return count, nil
+	return s.countRows(ctx, "pending cleanups",
+		`SELECT COUNT(*) FROM cleanup_queue WHERE attempts < 10`)
 }
 
 // CleanupDLQDepth returns the number of rows currently in cleanup_dlq.
 // Surfaces the count of unrecoverable orphans so the dashboard and the
 // cleanup_dlq_depth gauge can flag operator-visible work.
 func (s *Store) CleanupDLQDepth(ctx context.Context) (int64, error) {
-	var count int64
-	err := s.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM cleanup_dlq`,
-	).Scan(&count)
-	if err != nil {
-		return 0, fmt.Errorf("failed to count cleanup DLQ rows: %w", err)
-	}
-	return count, nil
-}
-
-// MoveCleanupToDLQ atomically graduates an exhausted cleanup_queue row
-// to the dead-letter table. Delegates to core.MoveCleanupToDLQ so both
-// engines share the move semantics - notably that orphan_bytes is left
-// untouched because the backend object is still on disk.
-func (s *Store) MoveCleanupToDLQ(ctx context.Context, id int64, lastError string) (bool, error) {
-	return core.MoveCleanupToDLQ(ctx, s, id, lastError)
+	return s.countRows(ctx, "cleanup DLQ rows", `SELECT COUNT(*) FROM cleanup_dlq`)
 }
 
 // ListCleanupDLQ returns dead-lettered cleanup rows for operator inspection,
@@ -274,10 +251,7 @@ func (s *Store) ListCleanupDLQ(ctx context.Context, backend string, limit int) (
 	if err != nil {
 		return nil, fmt.Errorf("list cleanup dlq: %w", err)
 	}
-	defer func() { _ = rows.Close() }()
-
-	var out []core.CleanupDLQItem
-	for rows.Next() {
+	return collectRows(rows, "cleanup dlq rows", func(rows *sql.Rows) (core.CleanupDLQItem, error) {
 		var (
 			it              core.CleanupDLQItem
 			firstEnq, moved string
@@ -285,14 +259,13 @@ func (s *Store) ListCleanupDLQ(ctx context.Context, backend string, limit int) (
 		)
 		if err := rows.Scan(&it.BackendName, &it.ObjectKey, &it.Reason, &it.SizeBytes,
 			&it.Attempts, &firstEnq, &moved, &lastErr); err != nil {
-			return nil, fmt.Errorf("scan cleanup dlq row: %w", err)
+			return core.CleanupDLQItem{}, fmt.Errorf("scan cleanup dlq row: %w", err)
 		}
 		it.FirstEnqueued, _ = time.Parse(time.RFC3339Nano, firstEnq)
 		it.MovedAt, _ = time.Parse(time.RFC3339Nano, moved)
 		it.LastError = lastErr.String
-		out = append(out, it)
-	}
-	return out, rows.Err()
+		return it, nil
+	})
 }
 
 // RequeueCleanupDLQ moves dead-lettered rows back into cleanup_queue inside a
@@ -304,7 +277,7 @@ func (s *Store) RequeueCleanupDLQ(ctx context.Context, backend string) (int64, e
 	// EnqueueCleanup and GetPendingCleanups' comparison format; the column
 	// default's millisecond form sorts inconsistently (a trailing 'Z' outranks
 	// digits), which would delay eligibility of the requeued rows.
-	now := time.Now().UTC().Format(time.RFC3339Nano)
+	now := now()
 	var n int64
 	err := cbWithTx(ctx, s.rawDB, s.cb, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `

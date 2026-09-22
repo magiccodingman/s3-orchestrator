@@ -24,14 +24,49 @@ import (
 	"github.com/afreidah/s3-orchestrator/internal/config"
 )
 
+// -------------------------------------------------------------------------
+// TYPES
+// -------------------------------------------------------------------------
+
 // fakePipeliner collects pipeline commands without executing them against
-// a real Redis. Exec returns a configurable error.
+// a real Redis. Exec returns a configurable error. Pool counters live in a
+// hash per backend and period, so the pool paths record HIncrBy and HGetAll
+// rather than the string commands.
 type fakePipeliner struct {
 	redis.Pipeliner
 	incrByKeys []string
 	incrByVals []int64
 	expireKeys []string
 	execErr    error
+
+	hIncrByKeys   []string
+	hIncrByFields []string
+	hIncrByVals   []int64
+	delKeys       []string
+	hgetAll       map[string]string
+}
+
+// -------------------------------------------------------------------------
+// PUBLIC API
+// -------------------------------------------------------------------------
+
+// HIncrBy records a pool counter increment.
+func (f *fakePipeliner) HIncrBy(_ context.Context, key, field string, val int64) *redis.IntCmd {
+	f.hIncrByKeys = append(f.hIncrByKeys, key)
+	f.hIncrByFields = append(f.hIncrByFields, field)
+	f.hIncrByVals = append(f.hIncrByVals, val)
+	return redis.NewIntCmd(context.Background())
+}
+
+// HGetAll returns the test-configured pool hash.
+func (f *fakePipeliner) HGetAll(_ context.Context, _ string) *redis.MapStringStringCmd {
+	return redis.NewMapStringStringResult(f.hgetAll, nil)
+}
+
+// Del records the keys a swap cleared.
+func (f *fakePipeliner) Del(_ context.Context, keys ...string) *redis.IntCmd {
+	f.delKeys = append(f.delKeys, keys...)
+	return redis.NewIntCmd(context.Background())
 }
 
 // IncrBy satisfies the redis pipeline interface for the fake

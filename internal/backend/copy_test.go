@@ -3,7 +3,7 @@
 //
 // Author: Alex Freidah
 //
-// Verifies the BackendCopier capability interface and the
+// Verifies the Copier capability interface and the
 // CircuitBreakerBackend's CopyObject forwarding behavior. Pins the
 // fallback contract for decorators whose underlying backend lacks
 // native copy support.
@@ -19,8 +19,12 @@ import (
 	"time"
 )
 
+// -------------------------------------------------------------------------
+// TYPES
+// -------------------------------------------------------------------------
+
 // copyingMockBackend embeds *mockBackend and adds a CopyObject method so
-// it satisfies BackendCopier. Counts calls and exposes an injectable
+// it satisfies Copier. Counts calls and exposes an injectable
 // error so tests can drive success and failure paths without spinning
 // up a real S3 server.
 type copyingMockBackend struct {
@@ -32,6 +36,10 @@ type copyingMockBackend struct {
 func newCopyingMockBackend() *copyingMockBackend {
 	return &copyingMockBackend{mockBackend: newMockBackend()}
 }
+
+// -------------------------------------------------------------------------
+// PUBLIC API
+// -------------------------------------------------------------------------
 
 // CopyObject records the call and either returns the injected error or
 // copies the source object's bytes in-memory so existence checks pass.
@@ -51,7 +59,7 @@ func (c *copyingMockBackend) CopyObject(_ context.Context, srcKey, dstKey, _ str
 }
 
 // TestCircuitBreakerBackend_CopyObject_ForwardsWhenSupported verifies
-// that a wrapped backend implementing BackendCopier receives the call
+// that a wrapped backend implementing Copier receives the call
 // through the circuit breaker.
 func TestCircuitBreakerBackend_CopyObject_ForwardsWhenSupported(t *testing.T) {
 	t.Parallel()
@@ -75,11 +83,11 @@ func TestCircuitBreakerBackend_CopyObject_ForwardsWhenSupported(t *testing.T) {
 
 // TestCircuitBreakerBackend_CopyObject_ReturnsNotSupportedWhenInnerLacksIt
 // pins the fallback contract: a decorator wrapping a backend that does
-// not implement BackendCopier must return ErrCopyNotSupported so the
+// not implement Copier must return ErrCopyNotSupported so the
 // proxy can fall back to materialized copy.
 func TestCircuitBreakerBackend_CopyObject_ReturnsNotSupportedWhenInnerLacksIt(t *testing.T) {
 	t.Parallel()
-	inner := newMockBackend() // does not implement BackendCopier
+	inner := newMockBackend() // does not implement Copier
 	cb := NewCircuitBreakerBackend(inner, CircuitBreakerConfig{Name: "test", Threshold: 3, Timeout: time.Minute})
 	_, err := cb.CopyObject(context.Background(), "src", "dst", "", nil)
 	if !errors.Is(err, ErrCopyNotSupported) {

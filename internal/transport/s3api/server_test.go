@@ -14,14 +14,17 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
 
+	"go.uber.org/mock/gomock"
+
 	"github.com/afreidah/s3-orchestrator/internal/config"
-	"github.com/afreidah/s3-orchestrator/internal/proxy"
+	"github.com/afreidah/s3-orchestrator/internal/provisioning"
 	"github.com/afreidah/s3-orchestrator/internal/proxy/proxytest"
-	"github.com/afreidah/s3-orchestrator/internal/testutil"
+	"github.com/afreidah/s3-orchestrator/internal/store/storetest"
 	"github.com/afreidah/s3-orchestrator/internal/transport/auth"
 )
 
@@ -54,18 +57,11 @@ func TestServer_LoggerReturnsCustomLog(t *testing.T) {
 // under coverage.
 func TestNewServer_AssignsScopedLogger(t *testing.T) {
 	t.Parallel()
-	mockStore := testutil.NewMockStore(t)
-	mgr := proxytest.NewManager(t, &proxy.BackendManagerConfig{
-		Stores: proxy.StoreDeps{
-			Metadata:  mockStore,
-			Dashboard: mockStore,
-		},
-		Operations: proxy.OperationalDeps{
-			Metrics: mockStore,
-		},
+	mockStore := storetest.NewMockMetadataStore(gomock.NewController(t))
+	st := proxytest.New(t, mockStore, &proxytest.StackOptions{
+		Runtime: proxytest.NewRuntime(&proxytest.RuntimeOptions{Metrics: mockStore}),
 	})
-	t.Cleanup(mgr.Close)
-	srv := NewServer(mgr, 1024)
+	srv := NewServer(st.Objects, st.Multipart, 1024)
 	if srv.log == nil {
 		t.Fatal("NewServer left log field nil")
 	}
@@ -81,7 +77,7 @@ func TestSetGetBucketAuth_RoundTrip(t *testing.T) {
 			{AccessKeyID: "AKID1", SecretAccessKey: "secret1"},
 		}},
 	}
-	br := auth.NewBucketRegistry(buckets)
+	br := mustBucketRegistry(t, buckets)
 	srv.SetBucketAuth(br)
 
 	got := srv.GetBucketAuth()
@@ -96,7 +92,7 @@ func TestSetBucketAuth_ConcurrentAccess(t *testing.T) {
 	srv := &Server{}
 
 	// Set an initial registry
-	initial := auth.NewBucketRegistry([]config.BucketConfig{
+	initial := mustBucketRegistry(t, []config.BucketConfig{
 		{Name: "init", Credentials: []config.CredentialConfig{
 			{AccessKeyID: "AKID0", SecretAccessKey: "secret0"},
 		}},
@@ -127,7 +123,7 @@ func TestSetBucketAuth_ConcurrentAccess(t *testing.T) {
 		go func(n int) {
 			defer wg.Done()
 			for range 100 {
-				br := auth.NewBucketRegistry([]config.BucketConfig{
+				br := mustBucketRegistry(t, []config.BucketConfig{
 					{Name: "b", Credentials: []config.CredentialConfig{
 						{AccessKeyID: "AKID", SecretAccessKey: "secret"},
 					}},
@@ -153,7 +149,7 @@ func TestBucketOnlyPUT_MethodNotAllowed(t *testing.T) {
 
 	// PUT to a bucket-only path (no key) should hit the default case
 	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPut, ts.URL+"/mybucket/", nil)
-	req.Header.Set("X-Proxy-Token", "test-token")
+	signRequest(t, req)
 	resp, err := ts.Client().Do(req) //nolint:gosec // G704: test server URL
 	if err != nil {
 		t.Fatal(err)
@@ -177,7 +173,7 @@ func TestMultipartUpload_UnsupportedMethod(t *testing.T) {
 
 	// PATCH to a key path with uploadId should hit the multipart default case
 	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPatch, ts.URL+"/mybucket/testkey?uploadId=upload-1", nil)
-	req.Header.Set("X-Proxy-Token", "test-token")
+	signRequest(t, req)
 	resp, err := ts.Client().Do(req) //nolint:gosec // G704: test server URL
 	if err != nil {
 		t.Fatal(err)
@@ -202,7 +198,7 @@ func TestInvalidPath_Returns400(t *testing.T) {
 	// POST to "/"  -  not intercepted as ListBuckets, so parsePath returns
 	// false for the empty path and the server returns 400.
 	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, ts.URL+"/", nil)
-	req.Header.Set("X-Proxy-Token", "test-token")
+	signRequest(t, req)
 	resp, err := ts.Client().Do(req) //nolint:gosec // G704: test server URL
 	if err != nil {
 		t.Fatal(err)
@@ -216,4 +212,35 @@ func TestInvalidPath_Returns400(t *testing.T) {
 	if !strings.Contains(string(body), "InvalidRequest") {
 		t.Error("response should contain InvalidRequest error code")
 	}
+}
+
+// newOpsServer builds a Server over mocked ObjectOps/MultipartOps, with no
+// proxy stack, store, or backend behind it. Use it for the handler
+// behaviour that depends only on what the ops layer returns - status
+// mapping, header handling, response shape - so the test states the one
+// call it cares about instead of steering a whole fleet into that state.
+func newOpsServer(t *testing.T) (*httptest.Server, *MockObjectOps, *MockMultipartOps) {
+	t.Helper()
+	ctrl := gomock.NewController(t)
+	objects, multipart := NewMockObjectOps(ctrl), NewMockMultipartOps(ctrl)
+
+	srv := &Server{Objects: objects, Multipart: multipart, MaxObjectSize: 10 * 1024 * 1024}
+	srv.SetBucketAuth(mustBucketRegistry(t, []config.BucketConfig{
+		{Name: "mybucket", Credentials: []config.CredentialConfig{testCredential()}},
+	}))
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+	return ts, objects, multipart
+}
+
+// mustBucketRegistry builds a registry from config the test controls, failing
+// the test if that config turns out to be ambiguous.
+func mustBucketRegistry(tb testing.TB, buckets []config.BucketConfig) *auth.BucketRegistry {
+	tb.Helper()
+	v := provisioning.Merge(buckets, config.AuthConfig{}, &provisioning.Snapshot{})
+	br, err := auth.NewBucketRegistry(&v)
+	if err != nil {
+		tb.Fatalf("NewBucketRegistry: %v", err)
+	}
+	return br
 }

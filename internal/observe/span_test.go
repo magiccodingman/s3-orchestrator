@@ -105,7 +105,7 @@ func TestRun_RecorderFiresOnPanic(t *testing.T) {
 		}
 	}()
 
-	_, _ = Run(context.Background(), Server("op", nil, rec), func(_ context.Context) (int, error) {
+	_, _ = Run(context.Background(), Internal("op", nil, rec), func(_ context.Context) (int, error) {
 		panic("boom")
 	})
 }
@@ -133,6 +133,28 @@ func TestRunErr_PropagatesError(t *testing.T) {
 		return want
 	}); !errors.Is(err, want) {
 		t.Fatalf("got %v, want %v", err, want)
+	}
+}
+
+// TestRunValue_ReturnsResultAndReportsSuccess pins the variant the background
+// passes use: the result comes back untouched and the span always closes Ok,
+// since work that cannot fail has no failure to report.
+func TestRunValue_ReturnsResultAndReportsSuccess(t *testing.T) {
+	sr := newSpanRecorder(t)
+
+	got := RunValue(context.Background(), Internal("tick", nil, nil), func(_ context.Context) int {
+		return 42
+	})
+	if got != 42 {
+		t.Errorf("result = %d, want 42", got)
+	}
+
+	spans := sr.Ended()
+	if len(spans) != 1 {
+		t.Fatalf("recorded %d spans, want 1", len(spans))
+	}
+	if status := spans[0].Status(); status.Code != codes.Ok {
+		t.Errorf("status = %v, want Ok", status.Code)
 	}
 }
 
@@ -208,9 +230,6 @@ func TestConstructors_AssignSpanKind(t *testing.T) {
 	t.Parallel()
 	if Client("c", nil, nil).Kind.String() != "client" {
 		t.Error("Client kind != client")
-	}
-	if Server("s", nil, nil).Kind.String() != "server" {
-		t.Error("Server kind != server")
 	}
 	if Internal("i", nil, nil).Kind.String() != "internal" {
 		t.Error("Internal kind != internal")

@@ -19,22 +19,20 @@ import (
 	"github.com/afreidah/s3-orchestrator/internal/observe/event"
 	"github.com/afreidah/s3-orchestrator/internal/observe/logfmt"
 	"github.com/afreidah/s3-orchestrator/internal/observe/telemetry"
+	"github.com/afreidah/s3-orchestrator/internal/s3op"
 	"github.com/afreidah/s3-orchestrator/internal/store/core"
 	"github.com/afreidah/s3-orchestrator/internal/util/must"
 )
 
-// CleanupWorkerStore is the narrow persistence surface the cleanup worker
-// needs: the cleanup queue + DLQ operations. Declared locally so the
-// worker does not pull in the full MetadataStore.
-type CleanupWorkerStore interface {
-	core.CleanupStore
-}
+// -------------------------------------------------------------------------
+// TYPES
+// -------------------------------------------------------------------------
 
 // CleanupWorker processes the retry queue for failed object deletions.
 type CleanupWorker struct {
 	log              *slog.Logger
 	deps             CleanupOps
-	store            CleanupWorkerStore
+	store            core.CleanupStore
 	concurrency      int
 	instanceID       string
 	claimGracePeriod time.Duration
@@ -46,7 +44,7 @@ type CleanupWorker struct {
 // reclaimable by another worker tick (typically 5m).
 type CleanupWorkerDeps struct {
 	Ops              CleanupOps
-	Store            CleanupWorkerStore
+	Store            core.CleanupStore
 	Concurrency      int
 	InstanceID       string
 	ClaimGracePeriod time.Duration
@@ -66,6 +64,10 @@ func NewCleanupWorker(deps CleanupWorkerDeps) *CleanupWorker {
 	}
 }
 
+// -------------------------------------------------------------------------
+// CONSTANTS
+// -------------------------------------------------------------------------
+
 // maxCleanupAttempts is the retry ceiling. The 1-minute starting
 // backoff doubled 10 times yields ~17 hours of total retry runway,
 // which is enough to bridge the longest realistic backend outages.
@@ -78,6 +80,10 @@ const maxCleanupAttempts = 10
 // lockstep and the SonarQube duplicate-literal rule (S1192) stays
 // satisfied.
 const logMsgCompleteCleanupFailed = "failed to complete cleanup item"
+
+// -------------------------------------------------------------------------
+// PUBLIC API
+// -------------------------------------------------------------------------
 
 // CleanupBackoff returns the backoff duration for the given attempt number.
 // Uses exponential backoff: min(1m * 2^attempts, 24h). Short-circuits the
@@ -95,11 +101,15 @@ func CleanupBackoff(attempts int32) time.Duration {
 // ProcessCleanupQueue fetches pending cleanup items and attempts to
 // delete the orphaned objects from their respective backends.
 func (w *CleanupWorker) ProcessCleanupQueue(ctx context.Context) WorkSummary {
-	ctx, span := telemetry.StartSpan(ctx, "ProcessCleanupQueue",
-		telemetry.AttrOperation.String("cleanup_queue"),
-	)
-	defer span.End()
+	return runTickCycle(ctx, "ProcessCleanupQueue", "cleanup_queue", w.processCleanupQueue)
+}
 
+// -------------------------------------------------------------------------
+// INTERNALS
+// -------------------------------------------------------------------------
+
+// processCleanupQueue is the body of ProcessCleanupQueue after the span is open.
+func (w *CleanupWorker) processCleanupQueue(ctx context.Context) WorkSummary {
 	graceCutoff := time.Now().Add(-w.claimGracePeriod)
 	items, err := w.store.ClaimPendingCleanups(ctx, 50, w.instanceID, graceCutoff)
 	if err != nil {
@@ -149,7 +159,7 @@ func (w *CleanupWorker) processCleanupItem(ctx context.Context, item *core.Clean
 	}
 
 	delErr := w.deps.DeleteWithTimeout(ctx, be, item.ObjectKey)
-	w.deps.Acct().APICall(item.BackendName)
+	w.deps.Acct().APICall(s3op.DeleteObject, item.BackendName)
 
 	if delErr == nil {
 		w.completeCleanupSuccess(ctx, item)
@@ -257,20 +267,14 @@ func (w *CleanupWorker) exhaustCleanupToDLQ(
 			slog.Int64("size_bytes", item.SizeBytes),
 			slog.String("last_error", delErr.Error()),
 		)
-		if event.Emit != nil {
-			event.Emit(event.Event{
-				Type:    event.CleanupExhausted,
-				Subject: item.BackendName,
-				Data: map[string]any{
-					"backend":    item.BackendName,
-					"object_key": item.ObjectKey,
-					"reason":     item.Reason,
-					"attempts":   int(newAttempts),
-					"size_bytes": item.SizeBytes,
-					"last_error": delErr.Error(),
-				},
-			})
-		}
+		event.Publish(event.CleanupExhausted, item.BackendName, map[string]any{
+			"backend":    item.BackendName,
+			"object_key": item.ObjectKey,
+			"reason":     item.Reason,
+			"attempts":   int(newAttempts),
+			"size_bytes": item.SizeBytes,
+			"last_error": delErr.Error(),
+		})
 	}
 	telemetry.CleanupQueueProcessedTotal.WithLabelValues("exhausted").Inc()
 }

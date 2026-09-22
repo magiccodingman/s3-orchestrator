@@ -8,9 +8,6 @@
 // atomic operations to ensure quota limits are respected.
 // -------------------------------------------------------------------------------
 
-// Package store provides PostgreSQL metadata persistence for the S3 orchestrator.
-// metadata tracking, quota enforcement, circuit breaker protection, replication,
-// and rebalancing.
 package postgres
 
 import (
@@ -28,6 +25,7 @@ import (
 	"github.com/exaring/otelpgx"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
+
 	// Registers the pgx database/sql driver used by goose migrations below.
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/pressly/goose/v3"
@@ -49,8 +47,13 @@ var likeEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
 // TYPES
 // -------------------------------------------------------------------------
 
-// Store manages quota and object location data in PostgreSQL.
+// Store manages quota and object location data in PostgreSQL. The embedded
+// core.TxOps supplies the methods whose whole body is a core transaction over
+// this store as Runner; the methods declared here are the postgres-specific
+// queries.
 type Store struct {
+	core.TxOps
+
 	pool    *pgxpool.Pool
 	queries *db.Queries
 	cb      *breaker.CircuitBreaker
@@ -96,12 +99,14 @@ func NewStore(ctx context.Context, dbCfg *config.DatabaseConfig, cb *breaker.Cir
 			host, dbCfg.Database, err)
 	}
 
-	return &Store{
+	s := &Store{
 		pool:    pool,
 		queries: db.New(wrapDBTX(pool, cb)),
 		cb:      cb,
 		connStr: connStr,
-	}, nil
+	}
+	s.TxOps = core.NewTxOps(s)
+	return s, nil
 }
 
 // Close closes the connection pool.
@@ -144,7 +149,7 @@ func (s *Store) RunMigrations(ctx context.Context) error {
 
 // ExpectedSchemaVersion is the migration version this binary expects.
 // Updated when new migration files are added.
-const ExpectedSchemaVersion = 13
+const ExpectedSchemaVersion = 30
 
 // VerifySchemaVersion checks that the database schema version matches
 // what this binary expects. Returns an error if the schema is older
@@ -209,12 +214,8 @@ func (s *Store) WithTx(ctx context.Context, fn func(ctx context.Context, tx core
 	return nil
 }
 
-// Compile-time checks that *Store satisfies core.Runner and the wide
-// metadata-store contract every consumer depends on.
-var (
-	_ core.Runner        = (*Store)(nil)
-	_ core.MetadataStore = (*Store)(nil)
-)
+// Compile-time check that *Store implements every store role.
+var _ = core.AssertEngine[*Store]
 
 // slimObjectRow is the minimum surface of sqlc rows that project an
 // ObjectLocation without encryption columns. Implemented by the four list
@@ -226,8 +227,9 @@ type slimObjectRow interface {
 	GetCreatedAt() pgtype.Timestamptz
 }
 
-// fatObjectRow extends slimObjectRow with the encryption + content-hash
-// columns the seven encryption-aware queries return.
+// fatObjectRow extends slimObjectRow with the representation columns the
+// encryption-aware queries return: how the stored bytes were encrypted and
+// compressed, and the sizes and hash they reduce to.
 type fatObjectRow interface {
 	slimObjectRow
 	GetEncrypted() bool
@@ -235,6 +237,27 @@ type fatObjectRow interface {
 	GetKeyID() *string
 	GetPlaintextSize() *int64
 	GetContentHash() *string
+	GetCompressionAlgorithm() *string
+	GetCompressionLevel() *string
+	GetCompressionFormatVersion() *int16
+	GetLogicalSize() *int64
+}
+
+// verifiableObjectRow extends fatObjectRow with the last-verified timestamp,
+// which only the queries that report scrub coverage select.
+type verifiableObjectRow interface {
+	fatObjectRow
+	GetLastScrubbedAt() pgtype.Timestamptz
+}
+
+// identifiedObjectRow is a verifiable row that also selects the client-facing
+// identity columns. Only the read path's own query needs them: a replication
+// or scrub row is about the bytes, not about what a client is told they are.
+type identifiedObjectRow interface {
+	verifiableObjectRow
+	GetEtag() *string
+	GetContentType() *string
+	GetUserMetadata() []byte
 }
 
 // toSlimObjectLocations converts a slice of slim sqlc rows. Encryption and
@@ -276,7 +299,58 @@ func toFatObjectLocations[T fatObjectRow](rows []T) []core.ObjectLocation {
 		if h := r.GetContentHash(); h != nil {
 			loc.ContentHash = *h
 		}
+		if a := r.GetCompressionAlgorithm(); a != nil {
+			loc.CompressionAlgorithm = *a
+		}
+		if l := r.GetCompressionLevel(); l != nil {
+			loc.CompressionLevel = *l
+		}
+		if v := r.GetCompressionFormatVersion(); v != nil {
+			loc.CompressionFormatVersion = int(*v)
+		}
+		if s := r.GetLogicalSize(); s != nil {
+			loc.LogicalSize = *s
+		}
 		out[i] = loc
+	}
+	return out
+}
+
+// toVerifiableObjectLocations converts rows from the queries that also select
+// last_scrubbed_at.
+//
+// Separate from toFatObjectLocations because only some queries select that
+// column: it is meaningless on a replication row, and on a row with no hash
+// there is nothing to have verified against. Requiring the accessor here rather
+// than testing for it at runtime means a query that selects the column but
+// omits the accessor fails to compile, instead of silently reporting every copy
+// as never verified.
+// toIdentifiedObjectLocations converts rows from the read path's own query,
+// which selects the identity columns on top of everything the verifiable
+// conversion covers.
+//
+// A decode failure on the metadata column leaves that copy's identity nil,
+// which costs a backend round trip rather than failing the read: the object is
+// still perfectly readable, and the row can be re-learned.
+func toIdentifiedObjectLocations[T identifiedObjectRow](rows []T) []core.ObjectLocation {
+	out := toVerifiableObjectLocations(rows)
+	for i := range rows {
+		id, err := core.IdentityFromColumns(derefStr(rows[i].GetEtag()), derefStr(rows[i].GetContentType()), rows[i].GetUserMetadata())
+		if err != nil {
+			continue
+		}
+		out[i].Identity = id
+	}
+	return out
+}
+
+func toVerifiableObjectLocations[T verifiableObjectRow](rows []T) []core.ObjectLocation {
+	out := toFatObjectLocations(rows)
+	for i := range rows {
+		if ts := rows[i].GetLastScrubbedAt(); ts.Valid {
+			scrubbed := ts.Time
+			out[i].LastScrubbedAt = &scrubbed
+		}
 	}
 	return out
 }

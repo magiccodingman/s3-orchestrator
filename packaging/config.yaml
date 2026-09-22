@@ -11,7 +11,9 @@
 # --- HTTP server settings ---
 server:
   listen_addr: ":9000"
-  # max_object_size: 5368709120   # 5 GB (default); body buffered in memory for write failover
+  # max_object_size: 5368709120   # 5 GB (default); body buffered for write failover
+  # spill_dir: /var/lib/s3-orchestrator/spill  # bodies over 32 MiB buffer here (default: OS temp dir,
+                                               # which is tmpfs on most hosts - see docs/performance-tuning.md)
   # max_concurrent_requests: 1000 # Max concurrent S3 requests (default: 1000)
   # backend_timeout: 30s          # Per-operation timeout for backend S3 calls
 
@@ -49,6 +51,15 @@ buckets:
     credentials:
       - access_key_id: ${BUCKET_ACCESS_KEY}
         secret_access_key: ${BUCKET_SECRET_KEY}
+    # Browser origins allowed to reach this bucket cross-origin. Required for
+    # direct-from-browser uploads: a preflight arrives unsigned, so without a
+    # matching rule it is refused and the presigned PUT is never sent.
+    # cors:
+    #   - allowed_origins: ["https://app.example.com"]
+    #     allowed_methods: ["GET", "PUT"]
+    #     allowed_headers: ["content-type", "x-amz-*"]
+    #     expose_headers: ["ETag"]
+    #     max_age: 3600
 
 # --- Storage backends ---
 backends:
@@ -63,9 +74,23 @@ backends:
     # unsigned_payload: true       # Stream uploads without buffering (auto-enabled for HTTPS, set explicitly for HTTP)
     # quota_bytes: 0               # 0 = unlimited
     # max_object_size: 0           # Per-object size limit in bytes (0 = unlimited)
-    # api_request_limit: 0         # Monthly API request cap (0 = unlimited)
+    # api_request_limit: 0         # Monthly API request cap, all operations (0 = unlimited)
     # egress_byte_limit: 0         # Monthly egress cap (0 = unlimited)
     # ingress_byte_limit: 0        # Monthly ingress cap (0 = unlimited)
+    # unmetered: [DeleteObject]    # Operations the provider does not bill; charged to no budget
+    # request_limits:              # Per-class request budgets; mutually exclusive with api_request_limit
+    #   - name: class_a
+    #     operations: [PutObject, CopyObject, ListObjects, ListObjectsV2]
+    #     limit: 5000
+    #   - name: class_b
+    #     operations: [GetObject, HeadObject, GetParts]
+    #     limit: 50000
+    # http:                        # Per-backend transport tuning; 0 means "use the default"
+    #   max_idle_conns: 100
+    #   max_idle_conns_per_host: 100
+    #   max_conns_per_host: 200
+    #   response_header_timeout: 30s
+    #   force_http2: true          # false drops this backend to HTTP/1.1 (see docs/configuration.md)
 
   # Example: EC2 instance role / SSO / STS (no long-lived keys in YAML).
   # - name: aws-prod
@@ -102,6 +127,19 @@ backends:
 #   # previous_keys:
 #   #   - "${OLD_ENCRYPTION_KEY}"
 
+# --- At-rest compression (disabled by default) ---
+# Objects are stored as chunked zstd and served back as the bytes the client
+# wrote. The chunking is what keeps a range read cheap: one independently
+# decodable frame per chunk means a partial read fetches roughly the bytes it
+# asked for rather than the whole object. Enabling it affects new writes only:
+# nothing rewrites objects already stored.
+# compression:
+#   enabled: false
+#   level: "default"                 # fastest, default, better, or best
+#   chunk_size: 1048576              # 16KB-64MB (default: 1MB)
+#   min_size: 4096                   # Objects below this are stored uncompressed
+#   min_ratio: 0.95                  # Objects that do not shrink this far are stored uncompressed
+
 # --- Integrity verification (disabled by default, recommended for production) ---
 # SHA-256 content hashing for data integrity. When enabled, objects are
 # checksummed on write and optionally verified on read. The background
@@ -109,7 +147,7 @@ backends:
 # integrity:
 #   enabled: false
 #   verify_on_read: false            # Hash-check every GET response (streams through VerifyingReader)
-#   verify_on_replicate: true        # Verify hash when creating replicas (default: true when enabled)
+#   verify_on_replicate: false       # Read each new replica back and hash-check it (doubles replication egress)
 #   scrubber_interval: 6h            # Background verification interval (0 = disabled)
 #   scrubber_batch_size: 100         # Objects per scrub cycle
 
@@ -151,19 +189,47 @@ backends:
 #   batch_size: 50
 #   unhealthy_threshold: 10m     # Grace period before replacing copies on circuit-broken backends
 
+# --- Write path ---
+# Placing an object's copies during the write costs one upload each and no
+# read; leaving them to the replicator costs a read of the object plus the
+# source backend's egress for every copy. The saving lands at write time
+# instead of spread across replicator cycles, which can cost PUT throughput
+# on a constrained uplink, so it is off unless asked for.
+# write_path:
+#   parallel_copies:
+#     enabled: false             # Place further copies during the write
+#     count: 2                   # Copies per write (default: replication.factor, never above it)
+#     max_in_flight: 256         # Writes whose copies may outlive their response
+#                                # (default: server.max_concurrent_writes). A write that
+#                                # finds it full places one copy and leaves the rest to the
+#                                # replicator; watch s3o_detached_uploads_depth and
+#                                # s3o_replication_write_fanout_skipped_total.
+
 # --- Cleanup queue (orphaned object retry) ---
 # cleanup_queue:
 #   concurrency: 10              # Parallel deletion workers (default: 10)
 #   multipart_stale_timeout: 24h # Abandon multipart uploads older than this (default: 24h)
 
 # --- Lifecycle rules (object expiration) ---
-# Prefix is required (empty prefix would match all objects). Rules with
+# Each rule needs at least one of prefix or tags; a rule with neither would
+# match every object. Every condition set must match, so a rule carrying both
+# selects their intersection. Express "or" as a second rule. Rules with
 # expiration_days <= 0 are rejected at startup.
+#
+# The cutoff is the object's creation time, not when a tag was applied, so
+# tagging an object older than the window makes it eligible immediately.
 # lifecycle:
 #   batch_size: 100              # Objects per DB query (default: 100)
 #   rules:
 #     - prefix: "tmp/"
 #       expiration_days: 30
+#     - prefix: "logs/"
+#       tags:
+#         env: staging
+#       expiration_days: 7
+#     - tags:
+#         scratch: "true"
+#       expiration_days: 1
 
 # --- Per-IP rate limiting (disabled by default) ---
 # rate_limit:
@@ -205,18 +271,26 @@ backends:
 #     # listener. Bind to an internal-only interface (127.0.0.1 or a
 #     # private network address) for production deployments.
 #     # listen: "127.0.0.1:9001"
+#     # require_listener: true   # default; fail startup when that address cannot be bound.
+#     #                          # Set false for dev, where the port may be taken.
 #   tracing:
 #     enabled: false
 #     endpoint: ${TRACING_ENDPOINT}
 #     sample_rate: 1.0
 #     insecure: false
 
+# --- Root credential ---
+# The keypair this deployment administers itself with: it signs admin API
+# requests, logs into the dashboard, and reaches every bucket. Required when the
+# dashboard is enabled, because nothing else could log in.
+# auth:
+#   root:
+#     access_key_id: "${ROOT_ACCESS_KEY_ID}"
+#     secret_access_key: "${ROOT_SECRET_ACCESS_KEY}"
+
 # --- Web dashboard (disabled by default) ---
 # ui:
 #   enabled: false
 #   path: /ui
-#   admin_key: "${UI_ADMIN_KEY}"
-#   admin_secret: "${UI_ADMIN_SECRET}"
-#   session_secret: "${UI_SESSION_SECRET}" # Required — HMAC key for session cookies (independent of admin_secret)
-#   admin_token: "${UI_ADMIN_TOKEN}"       # Separate token for admin API (defaults to admin_key)
+#   session_secret: "${UI_SESSION_SECRET}" # Required - HMAC key for session cookies
 #   force_secure_cookies: true             # Always set Secure flag on cookies (use behind TLS proxy)

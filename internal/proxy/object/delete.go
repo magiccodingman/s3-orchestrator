@@ -19,6 +19,7 @@ import (
 
 	s3be "github.com/afreidah/s3-orchestrator/internal/backend"
 	"github.com/afreidah/s3-orchestrator/internal/observe/telemetry"
+	"github.com/afreidah/s3-orchestrator/internal/s3op"
 	"github.com/afreidah/s3-orchestrator/internal/store/core"
 	"github.com/afreidah/s3-orchestrator/internal/util/workerpool"
 
@@ -26,28 +27,33 @@ import (
 	"go.opentelemetry.io/otel/codes"
 )
 
+// -------------------------------------------------------------------------
+// PUBLIC API
+// -------------------------------------------------------------------------
+
 // DeleteObject removes an object from the backend where it's stored.
 func (o *Manager) DeleteObject(ctx context.Context, key string) error {
-	const operation = "DeleteObject"
+	const operation = s3op.DeleteObject
 	start := time.Now()
 
-	// --- Start tracing span ---
-	ctx, span := telemetry.StartSpan(ctx, managerSpanPrefix+operation,
+	ctx, span := telemetry.StartSpan(ctx, managerSpanPrefix+operation.String(),
 		telemetry.AttrObjectKey.String(key),
 	)
 	defer span.End()
 
-	// --- Delete all copies from store ---
-	copies, err := o.stores.DeleteObject(ctx, key)
+	copies, _, err := o.stores.DeleteObject(ctx, key)
 	if err != nil {
 		if errors.Is(err, core.ErrObjectNotFound) {
 			// Object not in our tracking - treat as success (idempotent delete)
 			span.SetStatus(codes.Ok, "object not found - treating as success")
 			return nil
 		}
-		return o.core.ClassifyWriteError(span, operation, err)
+		return o.core.ClassifyWriteError(span, operation.String(), err)
 	}
-
+	// Credited by the same transaction that removed the rows, so a write racing
+	// this delete sees the room the moment the ledger stops claiming the bytes.
+	// The physical delete that follows can fail and leave an orphan, which the
+	// cleanup queue owns.
 	span.SetAttributes(attribute.Int("copies.deleted", len(copies)))
 
 	// Drop the location cache entry up front so concurrent readers
@@ -57,7 +63,6 @@ func (o *Manager) DeleteObject(ctx context.Context, key string) error {
 	// this key but keeps every mutation path ending with one helper.
 	o.cache.Delete(key)
 
-	// --- Delete from each backend that held a copy (fan out concurrently) ---
 	workerpool.Run(ctx, len(copies), copies, func(ctx context.Context, cp core.DeletedCopy) {
 		backend, ok := o.core.Backends()[cp.BackendName]
 		if !ok {
@@ -78,6 +83,10 @@ func (o *Manager) DeleteObject(ctx context.Context, key string) error {
 // connection pool or burning API quota in a burst.
 const defaultBatchDeleteConcurrency = 10
 
+// -------------------------------------------------------------------------
+// TYPES
+// -------------------------------------------------------------------------
+
 // DeleteObjectResult holds the outcome of a single key within a batch delete.
 type DeleteObjectResult struct {
 	Key string `json:"key,omitempty"`
@@ -93,15 +102,19 @@ type batchDeleteItem struct {
 	sizeBytes int64
 }
 
+// -------------------------------------------------------------------------
+// PUBLIC API
+// -------------------------------------------------------------------------
+
 // DeleteObjects deletes multiple objects in a single request. Metadata
 // removal happens in a single transaction via DeleteObjectsBatch; backend
 // S3 deletes run concurrently with bounded parallelism to avoid
 // overwhelming backends.
 func (o *Manager) DeleteObjects(ctx context.Context, keys []string) []DeleteObjectResult {
-	const operation = "DeleteObjects"
+	const operation = s3op.DeleteObjects
 	start := time.Now()
 
-	ctx, span := telemetry.StartSpan(ctx, managerSpanPrefix+operation,
+	ctx, span := telemetry.StartSpan(ctx, managerSpanPrefix+operation.String(),
 		attribute.Int("s3o.batch_size", len(keys)),
 	)
 	defer span.End()
@@ -111,17 +124,16 @@ func (o *Manager) DeleteObjects(ctx context.Context, keys []string) []DeleteObje
 		results[i].Key = key
 	}
 
-	copiesByKey, err := o.stores.DeleteObjectsBatch(ctx, keys)
+	copiesByKey, _, err := o.stores.DeleteObjectsBatch(ctx, keys)
 	if err != nil {
 		// Whole-tx failure: every key surfaces the error. The cache and
 		// backend cleanup paths are skipped; nothing was changed.
-		classified := o.core.ClassifyWriteError(span, operation, err)
+		classified := o.core.ClassifyWriteError(span, operation.String(), err)
 		for i := range results {
 			results[i].Err = classified
 		}
 		return results
 	}
-
 	// A key absent from copiesByKey was already gone (not-found is silent
 	// success), so its cache entries are also stale and worth flushing.
 	for _, key := range keys {
@@ -136,6 +148,10 @@ func (o *Manager) DeleteObjects(ctx context.Context, keys []string) []DeleteObje
 	o.finalizeBatchDelete(ctx, span, len(keys), results, start)
 	return results
 }
+
+// -------------------------------------------------------------------------
+// INTERNALS
+// -------------------------------------------------------------------------
 
 // flattenBatchDeletes produces the worker-pool input slice from the
 // DeleteObjectsBatch result. Skips copies whose backend is unknown

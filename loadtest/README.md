@@ -13,6 +13,8 @@ make loadtest-put                                          # 100 PUT/s, 30s, 1KB
 make loadtest-get LOADTEST_SEED=1000                       # 100 GET/s, 1000 pre-seeded objects
 make loadtest-mixed LOADTEST_RATE=300 LOADTEST_DURATION=2m # 300 req/s mixed PUT/GET
 make loadtest-listobjects LOADTEST_SEED=10000              # 100 ListObjectsV2/s against 10k pre-seeded keys
+make loadtest-tagging LOADTEST_SEED=1000                   # 100 req/s over Put/Get/DeleteObjectTagging
+make loadtest-put-tagged                                   # 100 PUT/s carrying x-amz-tagging
 make loadtest-burst                                        # k6 burst to 100 VUs
 make loadtest-k6                                           # k6 mixed CRUD workflow
 ```
@@ -36,6 +38,29 @@ All vegeta targets accept these variables:
 | `LOADTEST_MPU_PART_COUNT` | `5` | Parts per multipart upload |
 | `LOADTEST_MPU_PART_SIZE` | `5242880` | Per-part size in bytes (5 MiB minimum) |
 
+## Credentials
+
+`make perf` signs as a provisioned identity rather than the credential the
+config file declares. `make nomad-demo` creates a `perf` user, mints it a
+keypair, grants it `list-buckets,list,read,write,delete` on `photos`, and writes
+the keypair to `deploy/nomad/local/.perf-credentials.env`; `run-suite.sh` reads
+it from there and passes it to every scenario.
+
+This is deliberate. A config-declared credential carries full access, because
+the config file has no syntax for narrowing it, so a suite run as one would
+measure the request path with the permission check trivially satisfied. Signing
+as a stored user puts a real grant lookup on the hot path of every request the
+suite issues.
+
+The grant carries no `tags` permission, since no scenario in the suite tags an
+object. A tagging scenario added later needs the grant widened to match, which
+is the point: the grant says what the workload actually does.
+
+Set `PERF_CREDENTIALS` to read the keypair from elsewhere, or
+`PERF_ACCESS_KEY`/`PERF_SECRET_KEY` to override it directly. With none of them
+set the suite falls back to `photoskey`/`photossecret`, so a run against a
+deployment that has provisioned nothing still works.
+
 ### List performance
 
 `loadtest-listobjects` benchmarks `ListObjectsV2` latency against a
@@ -46,6 +71,32 @@ pre-seeded namespace. Vary `LOADTEST_SEED` across runs (e.g. 10k, 100k,
 make loadtest-listobjects LOADTEST_SEED=10000   LOADTEST_OUTPUT_JSON=/tmp/list-10k.json
 make loadtest-listobjects LOADTEST_SEED=100000  LOADTEST_OUTPUT_JSON=/tmp/list-100k.json
 make loadtest-listobjects LOADTEST_SEED=1000000 LOADTEST_OUTPUT_JSON=/tmp/list-1m.json
+```
+
+### Object tagging
+
+Two scenarios, measuring different halves of the feature.
+
+`loadtest-tagging` rotates `PutObjectTagging`, `GetObjectTagging` and
+`DeleteObjectTagging` over a pre-seeded set, so one run covers the write, the
+read and the clear rather than whichever is cheapest. The tag write takes the
+per-key advisory lock and replaces the set as a delete plus insert inside one
+transaction, so this is the scenario that shows what that costs under
+contention - drive it against a small `LOADTEST_SEED` to concentrate several
+requests on the same keys:
+
+```bash
+make loadtest-tagging LOADTEST_SEED=1000 LOADTEST_OUTPUT_JSON=/tmp/tag-1k.json
+make loadtest-tagging LOADTEST_SEED=50   LOADTEST_OUTPUT_JSON=/tmp/tag-50.json   # lock contention
+```
+
+`loadtest-put-tagged` is a plain PUT carrying `x-amz-tagging`. Run it against
+`loadtest-put` at the same rate and size; the delta is what inline tagging adds
+to the write path, since the tags are inserted in the object's own transaction:
+
+```bash
+make loadtest-put        LOADTEST_RATE=200 LOADTEST_OUTPUT_JSON=/tmp/put.json
+make loadtest-put-tagged LOADTEST_RATE=200 LOADTEST_OUTPUT_JSON=/tmp/put-tagged.json
 ```
 
 ### Saturation-find ramp
@@ -70,10 +121,11 @@ per invocation).
 
 `-cache-flush-before` POSTs to `/admin/api/cache/flush` before each
 scenario step so cache-cold runs are not contaminated by previous
-steps' warm hits. Requires an admin token (`-admin-token` flag or
-`S3O_ADMIN_TOKEN` env var). 503 from the flush endpoint is treated
-as success - it just means the orchestrator has caching disabled,
-not that the call failed.
+steps' warm hits. The call is signed, so it needs a keypair holding
+admin permissions: `-admin-access-key` and `-admin-secret-key`, or
+`S3O_ACCESS_KEY_ID` and `S3O_SECRET_ACCESS_KEY`. 503 from the flush
+endpoint is treated as success - it just means the orchestrator has
+caching disabled, not that the call failed.
 
 ### Concurrent multipart
 
@@ -125,7 +177,7 @@ go build -o s3-loadtest .
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-op` | `put` | `put`, `get`, `mixed` (50/50 PUT/GET), or `listobjects` |
+| `-op` | `put` | `put`, `overwrite`, `get`, `mixed` (50/50 PUT/GET), or `listobjects` |
 | `-rate` | `100` | Requests per second |
 | `-duration` | `30s` | Test duration |
 | `-size` | `1024` | Object size in bytes |
@@ -137,14 +189,17 @@ go build -o s3-loadtest .
 | `-bucket` | `photos` | Target bucket |
 | `-region` | `us-east-1` | AWS region for SigV4 |
 | `-sizes` | (unset) | Comma-separated object sizes for sweep mode; overrides `-size` |
+| `-compressible` | `0` | Fraction of each body that is repetitive (0..1). 0 is random bytes, which no encoder can shrink |
+| `-overwrite-keys` | `1000` | Key-set size for `-op overwrite`; a key is rewritten every N requests |
 | `-output-json` | (unset) | Path to write structured per-size results matrix |
 | `-list-prefix` | `loadtest/` | Prefix for the listobjects scenario |
 | `-list-max-keys` | `1000` | `max-keys` query parameter for the listobjects scenario |
 | `-ramp-to` | `0` | Saturation-find: ramp from `-rate` up to this rate; stops when error rate exceeds `-ramp-error-threshold` (0 disables ramp) |
 | `-ramp-step` | `100` | Rate increment per ramp step |
 | `-ramp-error-threshold` | `0.05` | Error rate threshold (0..1) for ramp termination |
-| `-cache-flush-before` | `false` | POST `/admin/api/cache/flush` before each scenario step (requires `-admin-token`) |
-| `-admin-token` | (unset) | Admin token for cache-flush calls (or `S3O_ADMIN_TOKEN` env var) |
+| `-cache-flush-before` | `false` | POST `/admin/api/cache/flush` before each scenario step (requires an admin keypair) |
+| `-admin-access-key` | (unset) | Access key ID the cache-flush calls sign with (or `S3O_ACCESS_KEY_ID`) |
+| `-admin-secret-key` | (unset) | Secret access key the cache-flush calls sign with (or `S3O_SECRET_ACCESS_KEY`) |
 
 ### k6 — Scenario-based workflow simulation
 

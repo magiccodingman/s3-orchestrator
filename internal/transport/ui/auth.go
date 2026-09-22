@@ -3,11 +3,11 @@
 //
 // Author: Alex Freidah
 //
-// HMAC-signed session cookies, double-submit CSRF tokens, the bcrypt/plain
-// secret comparator, and the login/logout HTTP handlers. requireAuth is
-// the middleware every authenticated UI route is wrapped in; HTML
-// requests get redirected to the login page on auth failure, JSON
-// requests get a 401.
+// HMAC-signed session cookies, double-submit CSRF tokens, and the login/logout
+// HTTP handlers. A login is a credential the registry resolves to a user, and
+// the session carries that user. requireAuth is the middleware every
+// authenticated UI route is wrapped in; HTML requests get redirected to the
+// login page on auth failure, JSON requests get a 401.
 // -------------------------------------------------------------------------------
 
 package ui
@@ -25,8 +25,6 @@ import (
 	"strings"
 	"time"
 
-	"golang.org/x/crypto/bcrypt"
-
 	"github.com/afreidah/s3-orchestrator/internal/observe/telemetry"
 	"github.com/afreidah/s3-orchestrator/internal/transport/httputil"
 )
@@ -34,15 +32,6 @@ import (
 // -------------------------------------------------------------------------
 // SESSION AUTH
 // -------------------------------------------------------------------------
-
-// checkSecret compares a provided secret against the configured value.
-// Supports both bcrypt hashes (prefix "$2") and plaintext comparison.
-func checkSecret(configured, provided string) bool {
-	if strings.HasPrefix(configured, "$2") {
-		return bcrypt.CompareHashAndPassword([]byte(configured), []byte(provided)) == nil
-	}
-	return subtle.ConstantTimeCompare([]byte(configured), []byte(provided)) == 1
-}
 
 // requireAuth wraps a handler and enforces session authentication.
 // HTML requests are redirected to the login page; API requests get 401.
@@ -168,11 +157,11 @@ func (h *Handler) validSession(r *http.Request) bool {
 		return false
 	}
 
-	pipeIdx := strings.LastIndex(payload, "|")
-	if pipeIdx < 0 {
+	_, rawExpiry, ok := strings.CutLast(payload, "|")
+	if !ok {
 		return false
 	}
-	expiry, err := strconv.ParseInt(payload[pipeIdx+1:], 10, 64)
+	expiry, err := strconv.ParseInt(rawExpiry, 10, 64)
 	if err != nil {
 		return false
 	}
@@ -230,9 +219,8 @@ func (h *Handler) processLoginAttempt(w http.ResponseWriter, r *http.Request) {
 
 	key := r.FormValue("access_key")
 	secret := r.FormValue("secret_key")
-	keyMatch := subtle.ConstantTimeCompare([]byte(key), []byte(h.adminKey)) == 1
-	secretMatch := checkSecret(h.adminSecret, secret)
-	if !keyMatch || !secretMatch {
+	userID, ok := h.resolveLogin(key, secret)
+	if !ok {
 		if h.loginThrottle != nil {
 			h.loginThrottle.RecordFailure(clientIP)
 		}
@@ -244,9 +232,32 @@ func (h *Handler) processLoginAttempt(w http.ResponseWriter, r *http.Request) {
 	if h.loginThrottle != nil {
 		h.loginThrottle.RecordSuccess(clientIP)
 	}
-	h.log.InfoContext(r.Context(), "admin login", "client_addr", clientIP)
-	h.createSession(w, r, key)
+	h.log.InfoContext(r.Context(), "admin login", "client_addr", clientIP, "user", userID)
+	h.createSession(w, r, userID)
 	http.Redirect(w, r, h.prefix+"/", http.StatusSeeOther)
+}
+
+// resolveLogin verifies a submitted keypair and reports the user it proves.
+//
+// The keypair is checked against the same registry the S3 path authenticates
+// with, so one credential reaches the dashboard and the data, and the root
+// credential is a credential like any other rather than a dashboard-only login.
+//
+// Both halves are always compared, so a wrong access key takes the same work as
+// a wrong secret and the response cannot be used to learn which was which.
+func (h *Handler) resolveLogin(key, secret string) (string, bool) {
+	if h.registry == nil {
+		return "", false
+	}
+	registry := h.registry()
+	if registry == nil {
+		return "", false
+	}
+	user, err := registry.AuthenticateSecret(key, secret)
+	if err != nil {
+		return "", false
+	}
+	return user.ID, true
 }
 
 // renderLoginError writes the login form with status and an inline error

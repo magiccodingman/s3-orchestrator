@@ -23,6 +23,10 @@ import (
 	"github.com/afreidah/s3-orchestrator/internal/store/core"
 )
 
+// -------------------------------------------------------------------------
+// TYPES
+// -------------------------------------------------------------------------
+
 // xmlContent represents a single object in an S3 ListBucketResult response.
 // ETag and StorageClass are required by the S3 REST API spec; aws-sdk-go-v2
 // models ETag as *string and dereferences it without nil-checks, so omitting
@@ -77,15 +81,23 @@ type xmlListResultV2 struct {
 	CommonPrefixes        []xmlCommonPrefix `xml:"CommonPrefixes,omitempty"`
 }
 
+// -------------------------------------------------------------------------
+// INTERNALS
+// -------------------------------------------------------------------------
+
 // buildListContents converts storage objects and common prefixes to their XML
 // representations, stripping the internal bucket prefix from each key.
 // prefixLen is len(bucket + "/")  -  used for zero-copy string slicing.
 func buildListContents(objects []core.ObjectLocation, prefixes []string, prefixLen int) ([]xmlContent, []xmlCommonPrefix) {
 	contents := make([]xmlContent, 0, len(objects))
 	for i := range objects {
+		// The object's own ETag, not the integrity hash: that one is a SHA-256
+		// of the stored bytes and never was an ETag. An object that has not
+		// learned one yet reports the empty pair of quotes, which is what
+		// clients that dereference the element without a nil check need.
 		etag := `""`
-		if objects[i].ContentHash != "" {
-			etag = `"` + objects[i].ContentHash + `"`
+		if id := objects[i].Identity; id.Complete() {
+			etag = id.ETag
 		}
 		contents = append(contents, xmlContent{
 			Key:          objects[i].ObjectKey[prefixLen:],
@@ -123,7 +135,7 @@ func (s *Server) handleListObjectsV1(ctx context.Context, w http.ResponseWriter,
 		startAfter = bucketPrefix + marker
 	}
 
-	result, err := s.Manager.Objects().ListObjects(ctx, internalPrefix, delimiter, startAfter, maxKeys)
+	result, err := s.Objects.ListObjects(ctx, internalPrefix, delimiter, startAfter, maxKeys)
 	if err != nil {
 		return writeStorageError(w, err, "Failed to list objects"), err
 	}
@@ -178,7 +190,7 @@ func (s *Server) handleListObjectsV2(ctx context.Context, w http.ResponseWriter,
 		startAfter = bucketPrefix + startAfter
 	}
 
-	result, err := s.Manager.Objects().ListObjects(ctx, internalPrefix, delimiter, startAfter, maxKeys)
+	result, err := s.Objects.ListObjects(ctx, internalPrefix, delimiter, startAfter, maxKeys)
 	if err != nil {
 		return writeStorageError(w, err, "Failed to list objects"), err
 	}

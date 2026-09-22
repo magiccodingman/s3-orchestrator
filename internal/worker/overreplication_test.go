@@ -16,13 +16,14 @@ import (
 	"context"
 	"testing"
 
+	promtest "github.com/prometheus/client_golang/prometheus/testutil"
+	"go.uber.org/mock/gomock"
+
 	"github.com/afreidah/s3-orchestrator/internal/backend"
 	"github.com/afreidah/s3-orchestrator/internal/backend/backendtest"
 	"github.com/afreidah/s3-orchestrator/internal/config"
 	"github.com/afreidah/s3-orchestrator/internal/observe/telemetry"
 	"github.com/afreidah/s3-orchestrator/internal/store/core"
-	promtest "github.com/prometheus/client_golang/prometheus/testutil"
-	"go.uber.org/mock/gomock"
 )
 
 // TestOverReplicationCleaner_SetConfig_RoundTrip verifies the over replication cleaner set config round trip contract.
@@ -30,7 +31,7 @@ import (
 func TestOverReplicationCleaner_SetConfig_RoundTrip(t *testing.T) {
 	t.Parallel()
 	ctrl := gomock.NewController(t)
-	c := NewOverReplicationCleaner(NewMockOps(ctrl), NewMockPlacement(ctrl), &mockMetadataStore{})
+	c := NewOverReplicationCleaner(newMockOps(ctrl), NewMockPlacement(ctrl), &mockMetadataStore{})
 	if c.Config() != nil {
 		t.Fatal("expected nil config before set")
 	}
@@ -46,7 +47,7 @@ func TestOverReplicationCleaner_SetConfig_RoundTrip(t *testing.T) {
 func TestCountPending(t *testing.T) {
 	t.Parallel()
 	ctrl := gomock.NewController(t)
-	ops := NewMockOps(ctrl)
+	ops := newMockOps(ctrl)
 	pl := NewMockPlacement(ctrl)
 	ms := &mockMetadataStore{overReplicatedCount: 5}
 
@@ -65,7 +66,7 @@ func TestCountPending(t *testing.T) {
 func TestScoreCopy_DrainingBackend(t *testing.T) {
 	t.Parallel()
 	ctrl := gomock.NewController(t)
-	ops := NewMockOps(ctrl)
+	ops := newMockOps(ctrl)
 	pl := NewMockPlacement(ctrl)
 	ms := &mockMetadataStore{}
 
@@ -83,7 +84,7 @@ func TestScoreCopy_DrainingBackend(t *testing.T) {
 func TestScoreCopy_HealthyBackend(t *testing.T) {
 	t.Parallel()
 	ctrl := gomock.NewController(t)
-	ops := NewMockOps(ctrl)
+	ops := newMockOps(ctrl)
 	pl := NewMockPlacement(ctrl)
 	ms := &mockMetadataStore{}
 
@@ -108,7 +109,7 @@ func TestScoreCopy_HealthyBackend(t *testing.T) {
 func TestScoreCopy_UnknownBackend(t *testing.T) {
 	t.Parallel()
 	ctrl := gomock.NewController(t)
-	ops := NewMockOps(ctrl)
+	ops := newMockOps(ctrl)
 	pl := NewMockPlacement(ctrl)
 	ms := &mockMetadataStore{}
 
@@ -127,7 +128,7 @@ func TestScoreCopy_UnknownBackend(t *testing.T) {
 func TestCleanObject_RemovesLowestScored(t *testing.T) {
 	t.Parallel()
 	ctrl := gomock.NewController(t)
-	ops := NewMockOps(ctrl)
+	ops := newMockOps(ctrl)
 	pl := NewMockPlacement(ctrl)
 	ms := &mockMetadataStore{}
 
@@ -151,7 +152,7 @@ func TestCleanObject_RemovesLowestScored(t *testing.T) {
 		"b2": {BytesUsed: 100, BytesLimit: 1000}, // 10% -> higher score
 	}
 
-	removed := c.cleanObject(context.Background(), "key1", copies, 1, 1, stats)
+	removed, _ := c.cleanObject(context.Background(), "key1", copies, 1, 1, stats)
 	if removed != 1 {
 		t.Errorf("removed = %d, want 1", removed)
 	}
@@ -168,7 +169,7 @@ func TestCleanObject_RemovesLowestScored(t *testing.T) {
 func TestCleanObject_DoesNotDoubleCountAPICalls(t *testing.T) {
 	t.Parallel()
 	ctrl := gomock.NewController(t)
-	ops := NewMockOps(ctrl)
+	ops := newMockOps(ctrl)
 	pl := NewMockPlacement(ctrl)
 	ms := &mockMetadataStore{}
 
@@ -191,7 +192,7 @@ func TestCleanObject_DoesNotDoubleCountAPICalls(t *testing.T) {
 		"b2": {BytesUsed: 100, BytesLimit: 1000},
 	}
 
-	if removed := c.cleanObject(context.Background(), "key1", copies, 1, 1, stats); removed != 1 {
+	if removed, _ := c.cleanObject(context.Background(), "key1", copies, 1, 1, stats); removed != 1 {
 		t.Errorf("removed = %d, want 1", removed)
 	}
 }
@@ -204,7 +205,7 @@ func TestCleanObject_DoesNotDoubleCountAPICalls(t *testing.T) {
 func TestCleanObject_SkipsBackendDeleteOnRaceNoOp(t *testing.T) {
 	t.Parallel()
 	ctrl := gomock.NewController(t)
-	ops := NewMockOps(ctrl)
+	ops := newMockOps(ctrl)
 	pl := NewMockPlacement(ctrl)
 	ms := &mockMetadataStore{removeExcessNoOp: true}
 
@@ -223,7 +224,7 @@ func TestCleanObject_SkipsBackendDeleteOnRaceNoOp(t *testing.T) {
 		"b2": {BytesUsed: 100, BytesLimit: 1000},
 	}
 
-	if removed := c.cleanObject(context.Background(), "key1", copies, 1, 1, stats); removed != 0 {
+	if removed, _ := c.cleanObject(context.Background(), "key1", copies, 1, 1, stats); removed != 0 {
 		t.Errorf("removed = %d, want 0 on benign no-op", removed)
 	}
 }
@@ -233,35 +234,68 @@ func TestCleanObject_SkipsBackendDeleteOnRaceNoOp(t *testing.T) {
 func TestClean_FactorOne_Noop(t *testing.T) {
 	t.Parallel()
 	ctrl := gomock.NewController(t)
-	c := NewOverReplicationCleaner(NewMockOps(ctrl), NewMockPlacement(ctrl), &mockMetadataStore{})
+	c := NewOverReplicationCleaner(newMockOps(ctrl), NewMockPlacement(ctrl), &mockMetadataStore{})
 
-	removed, err := c.Clean(context.Background(), config.ReplicationConfig{Factor: 1}, nil)
+	sum, err := c.Clean(context.Background(), config.ReplicationConfig{Factor: 1}, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if removed != 0 {
-		t.Errorf("removed = %d, want 0", removed)
+	if sum.CopiesRemoved != 0 {
+		t.Errorf("removed = %d, want 0", sum.CopiesRemoved)
 	}
 }
 
 // TestClean_NothingOverReplicated verifies the clean nothing over replicated contract.
 // Asserts that unexpected error:.
+// Deliberately not parallel: asserts a process-wide gauge that other
+// over-replication tests overwrite, so a concurrent run reads whichever
+// cycle finished last.
 func TestClean_NothingOverReplicated(t *testing.T) {
-	t.Parallel()
 	ctrl := gomock.NewController(t)
-	ops := NewMockOps(ctrl)
+	ops := newMockOps(ctrl)
 	pl := NewMockPlacement(ctrl)
 	ms := &mockMetadataStore{}
 
 	c := NewOverReplicationCleaner(ops, pl, ms)
-	removed, err := c.Clean(context.Background(), config.ReplicationConfig{Factor: 2, BatchSize: 10, Concurrency: 1}, nil)
+	sum, err := c.Clean(context.Background(), config.ReplicationConfig{Factor: 2, BatchSize: 10, Concurrency: 1}, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if removed != 0 {
-		t.Errorf("removed = %d, want 0", removed)
+	if sum.CopiesRemoved != 0 {
+		t.Errorf("removed = %d, want 0", sum.CopiesRemoved)
 	}
 	if p := promtest.ToFloat64(telemetry.OverReplicationPending); p != 0 {
 		t.Errorf("OverReplicationPending = %v, want 0", p)
+	}
+}
+
+// TestCleanObject_SkipsVictimHoldingOnlyKey verifies a refusal from the store
+// is treated as a skip rather than a failure: the cleaner must not go on to
+// delete the backend object whose metadata row it was denied permission to
+// drop, or the only readable copy would be destroyed anyway.
+func TestCleanObject_SkipsVictimHoldingOnlyKey(t *testing.T) {
+	t.Parallel()
+	ctrl := gomock.NewController(t)
+	ops := newMockOps(ctrl)
+	pl := NewMockPlacement(ctrl)
+	ms := &mockMetadataStore{removeExcessErr: core.ErrCopyHoldsOnlyDEK}
+
+	be1 := backendtest.NewMockObjectBackend(ctrl)
+	be2 := backendtest.NewMockObjectBackend(ctrl)
+	ops.EXPECT().IsDraining(gomock.Any()).Return(false).AnyTimes()
+	ops.EXPECT().Backends().Return(map[string]backend.ObjectBackend{"b1": be1, "b2": be2}).AnyTimes()
+
+	c := NewOverReplicationCleaner(ops, pl, ms)
+	copies := []core.ObjectLocation{
+		{ObjectKey: "key1", BackendName: "b1", SizeBytes: 100},
+		{ObjectKey: "key1", BackendName: "b2", SizeBytes: 100},
+	}
+	stats := map[string]core.QuotaStat{
+		"b1": {BytesUsed: 900, BytesLimit: 1000},
+		"b2": {BytesUsed: 100, BytesLimit: 1000},
+	}
+
+	if removed, _ := c.cleanObject(context.Background(), "key1", copies, 1, 1, stats); removed != 0 {
+		t.Errorf("removed = %d, want 0 when the victim holds the only key", removed)
 	}
 }

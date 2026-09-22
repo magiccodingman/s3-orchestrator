@@ -17,91 +17,245 @@ import "time"
 // OBJECT METADATA
 // -------------------------------------------------------------------------
 
-// EncryptionMeta carries envelope-encryption metadata stored alongside an
-// object location. The zero value represents an unencrypted object.
-type EncryptionMeta struct {
-	Encrypted     bool
-	EncryptionKey []byte
-	KeyID         string
-	PlaintextSize int64
-	ContentHash   string
+// ObjectIdentity is what the client sees an object as, independent of which
+// copy answers: the validator conditional requests compare against, the
+// content type it was written with, and the user metadata it carries. The
+// counterpart to StoredForm, which describes the bytes on the backend instead.
+//
+// ETag is the MD5 of the bytes the client wrote, or the AWS composite for a
+// multipart upload, and is therefore not what the backend reports once the
+// stored bytes are compressed or encrypted.
+//
+// A nil *ObjectIdentity means unknown - a row written before identity was
+// recorded, or an object imported from a backend - and a read falls back to
+// asking the backend. That is distinct from a present identity with an empty
+// ContentType or an empty UserMetadata, which are answers in themselves.
+type ObjectIdentity struct {
+	ETag         string
+	ContentType  string
+	UserMetadata map[string]string
+}
+
+// Complete reports whether the identity answers a HEAD on its own. An identity
+// missing the ETag cannot: the response has to carry a validator, and the only
+// place left to get one is the backend.
+func (i *ObjectIdentity) Complete() bool {
+	return i != nil && i.ETag != ""
+}
+
+// StoredForm describes how the bytes on a backend differ from the logical
+// object a client sees: whether they are compressed, whether they are an
+// encryption envelope, the key needed to read them back, and the sizes and
+// hash they reduce to. The write path produces one per stored copy and the
+// store records it; the read path needs it to serve the object correctly.
+//
+// An empty CompressionAlgorithm means the bytes are not compressed, so there
+// is no separate flag that could drift out of step with it. LogicalSize is the
+// size of the object the client wrote and differs from PlaintextSize once both
+// features are on: the stored bytes are then ciphertext of compressed data, so
+// PlaintextSize is the pre-encryption (compressed) size while LogicalSize is
+// the original. CompressionLevel does not affect decoding and is carried for
+// diagnostics and for rewrite passes.
+//
+// The zero value describes bytes stored verbatim, which is also why Unmanaged
+// is negated: it is stored as the `managed` column, so a construction site that
+// omits the field cannot accidentally produce a row every worker ignores.
+type StoredForm struct {
+	Encrypted                bool
+	EncryptionKey            []byte
+	KeyID                    string
+	PlaintextSize            int64
+	ContentHash              string
+	CompressionAlgorithm     string
+	CompressionLevel         string
+	CompressionFormatVersion int
+	LogicalSize              int64
+
+	Unmanaged bool // on the backend but outside every virtual bucket prefix: real bytes no worker acts on
 }
 
 // ObjectLocation records that a backend currently holds a copy of a key,
 // along with the size and any encryption or integrity metadata.
+//
+// LastScrubbedAt is nil for a copy that has never been verified, which is a
+// different state from one verified long ago and has to stay distinguishable.
+// It is also nil on rows from queries that do not select the column, so a
+// caller reading it wants a query that does.
+//
+// Unmanaged marks an object that exists on the backend but outside every
+// configured virtual bucket prefix: real bytes the orchestrator did not write
+// and does not act on. It is stored as the negated `managed` column, so the
+// zero value means managed and a construction site that omits it cannot
+// accidentally produce a row the workers ignore.
+//
+// The compression columns follow StoredForm: an empty algorithm means the
+// bytes are stored verbatim, and they are zero on rows from queries that do
+// not select them.
+//
+// CompressionProbeSize and CompressionProbeLevel are bookkeeping about the copy
+// rather than a description of its content, like LastScrubbedAt: they record
+// what the encoder measured for a copy it declined, so a later pass need not
+// download it to measure again.
 type ObjectLocation struct {
-	ObjectKey     string
-	BackendName   string
-	SizeBytes     int64
-	CreatedAt     time.Time
-	Encrypted     bool
-	EncryptionKey []byte
-	KeyID         string
-	PlaintextSize int64
-	ContentHash   string
+	ObjectKey                string
+	BackendName              string
+	SizeBytes                int64
+	CreatedAt                time.Time
+	Encrypted                bool
+	EncryptionKey            []byte
+	KeyID                    string
+	PlaintextSize            int64
+	ContentHash              string
+	CompressionAlgorithm     string
+	CompressionLevel         string
+	CompressionFormatVersion int
+	LogicalSize              int64
+	CompressionProbeSize     int64
+	CompressionProbeLevel    string
+	LastScrubbedAt           *time.Time
+	Unmanaged                bool
+	Identity                 *ObjectIdentity
 }
 
 // ExistingCopy is the projection of an object_locations row that promotion
 // and overwrite logic needs from a SELECT-for-update read.
+//
+// Encrypted and HasDEK say whether the row claims the bytes are an envelope and
+// whether the key that reads them is still present. They are carried here so a
+// decision about which copy to drop cannot destroy the last row able to decrypt
+// the object.
 type ExistingCopy struct {
 	BackendName string
 	SizeBytes   int64
 	CreatedAt   time.Time
+	Encrypted   bool
+	HasDEK      bool
 }
 
-// DeletedCopy describes a copy displaced by an overwrite or delete. The
-// caller enqueues these for physical orphan cleanup.
+// DeletedCopy describes bytes that no longer belong at a key and now need
+// removing from their backend, either a copy displaced by an overwrite or
+// delete, or the target of an intent that write superseded.
+//
+// Reason is the cleanup-queue label the removal is recorded under if it has to
+// be retried, so an operator reading the queue can tell the two apart. An empty
+// Reason means the caller's own default.
 type DeletedCopy struct {
 	BackendName string
 	SizeBytes   int64
+	Reason      string
 }
+
+// CleanupReasonSupersededIntent labels bytes removed because the write that
+// superseded their intent cleared it. CleanupReasonCompanionDiscarded labels
+// the bytes of an extra-copy intent the reaper could not vouch for.
+// CleanupReasonCompanionUntrusted labels an extra copy whose upload finished
+// after a newer write had already taken the key. None of the three was ever
+// committed, so the backend may well not hold them at all.
+const (
+	CleanupReasonSupersededIntent   = "superseded_intent"
+	CleanupReasonCompanionDiscarded = "companion_discarded"
+	CleanupReasonCompanionUntrusted = "companion_untrusted"
+)
 
 // -------------------------------------------------------------------------
 // PENDING OBJECTS
 // -------------------------------------------------------------------------
+
+// SupersededIntent is an intent a write cleared because it replaced the object
+// the intent was for. The backend and size are what the removal of its bytes
+// needs; the intent itself is already gone by the time a caller sees this.
+type SupersededIntent struct {
+	IntentID    string
+	BackendName string
+	SizeBytes   int64
+}
+
+// PendingRole says what promoting an intent means. A primary intent is the
+// write itself, so promoting it replaces whatever the key held. A companion
+// intent is one of the further copies a write places at the same time, so it
+// must never displace the copies its siblings committed.
+type PendingRole string
+
+// The two meanings an intent can carry. An empty role reads as primary, which
+// is what every intent written before roles existed meant.
+const (
+	PendingRolePrimary   PendingRole = "primary"
+	PendingRoleCompanion PendingRole = "companion"
+)
 
 // PendingObject is an in-flight PUT intent recorded before the backend
 // upload. The reaper resolves intents that survive a failed metadata
 // commit so a DB outage between PUT and RecordObject cannot silently
 // destroy the prior copy of an overwritten key.
 type PendingObject struct {
-	IntentID      string
-	ObjectKey     string
-	BackendName   string
-	SizeBytes     int64
-	Encrypted     bool
-	EncryptionKey []byte
-	KeyID         string
-	PlaintextSize int64
-	ContentHash   string
-	CreatedAt     time.Time
+	IntentID                 string
+	ObjectKey                string
+	BackendName              string
+	SizeBytes                int64
+	Encrypted                bool
+	EncryptionKey            []byte
+	KeyID                    string
+	PlaintextSize            int64
+	ContentHash              string
+	CompressionAlgorithm     string
+	CompressionLevel         string
+	CompressionFormatVersion int
+	LogicalSize              int64
+	Identity                 *ObjectIdentity
+	CreatedAt                time.Time
+	Role                     PendingRole
+}
+
+// IsCompanion reports whether promoting this intent adds a copy rather than
+// replacing the key's copy set.
+func (p *PendingObject) IsCompanion() bool {
+	return p.Role == PendingRoleCompanion
+}
+
+// RoleOrDefault names the role to store, so a caller that left it unset writes
+// the same value the column defaults to rather than an empty string the CHECK
+// constraint would reject.
+func (p *PendingObject) RoleOrDefault() PendingRole {
+	if p.Role == "" {
+		return PendingRolePrimary
+	}
+	return p.Role
 }
 
 // PendingPromoteResult describes how PromotePending resolved an intent.
 type PendingPromoteResult int
 
-// PendingPromoteCommitted and related constants used by this package.
+// The outcomes of promoting a pending write intent.
+//
+// Ambiguous is reserved and never produced: the timestamp comparison resolves
+// every case it was meant for as Superseded instead. It stays declared so the
+// metric label and the constant keep their values across releases.
+//
+// The two companion outcomes never record a copy. Kept means the backend
+// already holds one, so its bytes stay; Discarded means it does not, so they go
+// and replication rebuilds the copy.
 const (
-	// PendingPromoteCommitted means the pending row was promoted into
-	// object_locations and removed in the same transaction.
-	PendingPromoteCommitted PendingPromoteResult = iota
+	PendingPromoteCommitted          PendingPromoteResult = iota // promoted and the intent removed, one transaction
+	PendingPromoteAmbiguous                                      // reserved; see above
+	PendingPromoteAlreadyResolved                                // another reaper got there first, a benign no-op
+	PendingPromoteSuperseded                                     // a later write for the key committed, so the intent is provably stale
+	PendingPromoteCompanionKept                                  // an extra-copy intent whose backend already holds a recorded copy
+	PendingPromoteCompanionDiscarded                             // an extra-copy intent whose bytes are unaccounted for and now removed
+)
 
-	// PendingPromoteAmbiguous is reserved for pathological cases the
-	// resolver cannot decide between promotion and dropping. The current
-	// resolver does not produce this result; the timestamp comparison
-	// covers every previously-ambiguous case as Superseded instead. Kept
-	// so the metric label and constant stay stable across releases.
-	PendingPromoteAmbiguous
+// CompanionCommitResult describes how an upload that outlived its response
+// settled the copy it was placing.
+//
+// Untrusted is not a failure. It says a newer write took the key while this
+// upload was still running, so the bytes it just wrote cannot be told apart
+// from that write's own copy at the same path, and the safe reading is that
+// neither they nor any row claiming a copy there describes the current object.
+type CompanionCommitResult int
 
-	// PendingPromoteAlreadyResolved means the pending row was gone by
-	// the time the transaction acquired its lock - another reaper
-	// instance already resolved it. Benign no-op.
-	PendingPromoteAlreadyResolved
-
-	// PendingPromoteSuperseded means a successful write for the same
-	// key committed after this intent was inserted. The intent is
-	// provably stale, so the resolver deletes the pending row.
-	PendingPromoteSuperseded
+// The outcomes of committing an extra copy after the client has been answered.
+const (
+	CompanionCopyCommitted CompanionCommitResult = iota // the intent was still there, so the copy is recorded
+	CompanionCopyUntrusted                              // a newer write cleared the intent; the copy is dropped and replication rebuilds it
 )
 
 // -------------------------------------------------------------------------
@@ -117,19 +271,52 @@ type QuotaStat struct {
 	UpdatedAt   time.Time
 }
 
-// UsageLimits holds configurable monthly usage limits for a single backend.
-// Zero in a field means unlimited for that dimension.
-type UsageLimits struct {
-	APIRequestLimit  int64
-	EgressByteLimit  int64
-	IngressByteLimit int64
+// QuotaDeltas is the signed per-backend byte change a committed mutation made,
+// keyed by backend name.
+//
+// Returned to the caller rather than written inside the transaction: the
+// counter these feed is held in memory and flushed on an interval, and a
+// transaction that also updated backend_quotas would hold that row's lock
+// until commit, which is what every concurrent write to a backend used to
+// serialize on.
+type QuotaDeltas map[string]int64
+
+// Add accumulates a signed delta for one backend. A nil map is left alone, so
+// a path that never allocated one is not forced to.
+func (q QuotaDeltas) Add(backendName string, delta int64) {
+	if q == nil {
+		return
+	}
+	q[backendName] += delta
 }
 
-// UsageStat holds usage statistics for a single backend in a given period.
-type UsageStat struct {
-	APIRequests  int64
-	EgressBytes  int64
-	IngressBytes int64
+// BackendQuotaUsage is one backend's quota row together with the bytes that
+// occupy the backend without appearing in bytes_used: orphans awaiting cleanup,
+// and the parts of multipart uploads that have not completed. Both are
+// subtracted when a write target is chosen, so a view carrying only the row
+// would route to a backend that is fuller than it reports.
+//
+// This is the baseline the in-memory quota tracker holds between flushes, which
+// is why it is a value rather than a live query: the tracker adds its own
+// unflushed delta on top of it.
+type BackendQuotaUsage struct {
+	BackendName   string
+	BytesLimit    int64
+	BytesUsed     int64
+	OrphanBytes   int64
+	InflightBytes int64
+}
+
+// Unlimited reports whether the backend has no byte ceiling. A zero
+// bytes_limit is how the schema spells "no quota enforcement".
+func (b BackendQuotaUsage) Unlimited() bool {
+	return b.BytesLimit <= 0
+}
+
+// Occupied is the byte total a write is judged against: what the ledger has
+// recorded, plus what is on the backend but not yet recorded.
+func (b BackendQuotaUsage) Occupied() int64 {
+	return b.BytesUsed + b.OrphanBytes + b.InflightBytes
 }
 
 // -------------------------------------------------------------------------
@@ -153,6 +340,7 @@ type MultipartUpload struct {
 	Encrypted     bool
 	EncryptionKey []byte
 	KeyID         string
+	Tags          []Tag
 	CreatedAt     time.Time
 }
 
@@ -161,15 +349,43 @@ type MultipartUpload struct {
 // sqlc row's int32 value is widened by the engine adapter on read.
 // UploadID is omitted because parts are always queried in the context
 // of a specific upload.
+// ETag is what the backend returned for the part as stored; PlaintextETag is
+// the MD5 of the bytes the client sent for it. They differ once the stored
+// part is an encryption envelope, and only the second one can build the
+// object's composite ETag. PlaintextETag is empty for parts uploaded before it
+// was recorded.
 type MultipartPart struct {
 	PartNumber    int
 	ETag          string
+	PlaintextETag string
 	SizeBytes     int64
 	CreatedAt     time.Time
 	Encrypted     bool
 	EncryptionKey []byte
 	KeyID         string
 	PlaintextSize int64
+}
+
+// RecordPartParams is one RecordPart call's inputs. Bundled rather than passed
+// positionally: the two ETags and the two sizes are adjacent values of the same
+// types, which is exactly the shape a transposition hides in.
+type RecordPartParams struct {
+	UploadID      string
+	PartNumber    int
+	ETag          string
+	PlaintextETag string
+	SizeBytes     int64
+	Form          *StoredForm
+}
+
+// CompletePart is one entry of a client's CompleteMultipartUpload manifest:
+// the part it wants assembled and the ETag it believes that part carries.
+// Carrying the ETag alongside the number is what lets completion reject a
+// stale manifest instead of assembling whatever happens to be stored under
+// that number now.
+type CompletePart struct {
+	PartNumber int
+	ETag       string
 }
 
 // -------------------------------------------------------------------------
@@ -240,6 +456,25 @@ type NotificationRow struct {
 }
 
 // -------------------------------------------------------------------------
+// INTEGRITY COVERAGE
+// -------------------------------------------------------------------------
+
+// CoverageStat says how far behind integrity verification is, split by whether
+// the sweep can reach the copy at all.
+//
+// OldestUnverifiedAge and NeverVerified describe reachable copies only. A copy
+// on a backend the sweep may not read can never be stamped, so counting it in
+// the age pins that figure to a fixed timestamp and it then climbs by a day
+// every day no matter how much is verified. Deferred is the count it excludes,
+// reported rather than dropped so a fleet holding most of its copies on a
+// backend over its usage limit cannot read as healthy.
+type CoverageStat struct {
+	OldestUnverifiedAge time.Duration
+	NeverVerified       int64
+	Deferred            int64
+}
+
+// -------------------------------------------------------------------------
 // ENCRYPTION ADMIN
 // -------------------------------------------------------------------------
 
@@ -252,14 +487,24 @@ type EncryptedLocation struct {
 }
 
 // UnencryptedLocation represents an unencrypted object location.
+//
+// Etag is what the copy carried when the listing selected it, and the
+// conversion commits only while the row still reports it. A client writing the
+// key mid-pass changes it, which is how the commit knows the bytes it is about
+// to describe are no longer the bytes stored.
 type UnencryptedLocation struct {
 	ObjectKey   string
 	BackendName string
 	SizeBytes   int64
+	Etag        string
 }
 
 // DecryptableLocation represents an encrypted object location with all
 // metadata needed for decryption.
+//
+// Etag carries the same meaning it does on UnencryptedLocation: what the copy
+// reported when the listing selected it, tested again at commit so a conversion
+// cannot describe bytes a client replaced mid-pass.
 type DecryptableLocation struct {
 	ObjectKey     string
 	BackendName   string
@@ -267,6 +512,143 @@ type DecryptableLocation struct {
 	EncryptionKey []byte
 	KeyID         string
 	PlaintextSize int64
+	Etag          string
+}
+
+// Cursor is the position a paged admin listing resumes from: the last
+// (object_key, backend_name) it returned. The zero value starts at the
+// beginning.
+//
+// It exists because the bulk rewrite passes mutate the rows they walk. Each
+// object a pass rewrites leaves the predicate its listing selects on, so the
+// set shrinks mid-walk; an offset advanced against that steps over the rows
+// that moved up and the run reports success having skipped them. A cursor names
+// a row rather than a position, so rows leaving the set behind it change
+// nothing.
+type Cursor struct {
+	ObjectKey   string
+	BackendName string
+}
+
+// CompressionStat reports what compression is worth on one backend: how many
+// copies are stored encoded, what those objects are, and what they occupy.
+//
+// The saving is LogicalBytes - StoredBytes, derived rather than stored so it
+// cannot disagree with the two figures it comes from. Copies stored verbatim
+// are excluded: counting them would report a ratio no encoder produced.
+type CompressionStat struct {
+	Objects      int64
+	LogicalBytes int64
+	StoredBytes  int64
+}
+
+// RewritableLocation is one copy a bulk compression pass may rewrite. It
+// carries the encryption metadata as well, because compression sits inside
+// encryption: an encrypted copy has to be decrypted before its bytes can be
+// encoded, and re-encrypted afterwards under the same key.
+//
+// An empty CompressionAlgorithm means the stored bytes are not encoded, which
+// is what the compress direction selects on and the decompress direction
+// excludes.
+//
+// Etag is what the copy reported when the listing selected it, tested again at
+// commit so a pass cannot describe bytes a client replaced while it ran.
+type RewritableLocation struct {
+	ObjectKey                string
+	BackendName              string
+	SizeBytes                int64
+	Encrypted                bool
+	EncryptionKey            []byte
+	KeyID                    string
+	PlaintextSize            int64
+	CompressionAlgorithm     string
+	CompressionLevel         string
+	CompressionFormatVersion int
+	LogicalSize              int64
+	Etag                     string
+}
+
+// CompressionThresholds are the settings that decide whether a copy is worth
+// encoding, passed to the uncompressed listing so it selects only candidates.
+//
+// The listing applies them rather than the pass filtering afterwards, because
+// both answers are durable: a copy under MinSize is never a candidate, and a
+// copy already measured as unable to reach MinRatio stays declined until one of
+// these values changes. Judging a recorded measurement against the current
+// settings is what lets a loosened threshold return those copies to the pass
+// with no read at all.
+//
+// Level names the level a recorded measurement must have been taken at to count
+// against MinRatio. A measurement from a different level describes an encoding
+// the pass would no longer produce.
+type CompressionThresholds struct {
+	MinSize  int64
+	MinRatio float64
+	Level    string
+}
+
+// CompressionProbe is what the encoder measured for a copy it declined to store
+// compressed: the size it produced and the level it produced it at.
+//
+// A zero Size means the copy has never been probed. Only the ratio decision is
+// recorded, because it is the only one that costs a download and an encode to
+// reach: a size floor is answered from the row, and a copy declined by usage
+// limits never reached the encoder.
+type CompressionProbe struct {
+	ObjectKey   string
+	BackendName string
+	Size        int64
+	Level       string
+}
+
+// CompressedUpdate is the new description of a copy a compression pass has
+// rewritten. SizeBytes is what now occupies the backend, PlaintextSize is what
+// the encryptor was handed (the encoded stream, when the copy is encrypted),
+// and LogicalSize is the object the client wrote.
+//
+// A zero Algorithm records the copy as no longer encoded, which is what the
+// decompress direction writes.
+//
+// EncryptionKey and KeyID are set when the rewrite re-encrypted the copy, and
+// they are not optional there: re-encryption produces a new base nonce and a
+// new wrapped key, so a row still holding the old ones describes bytes nothing
+// can decrypt. They are empty for a copy that was never encrypted.
+type CompressedUpdate struct {
+	ObjectKey     string
+	BackendName   string
+	Algorithm     string
+	Level         string
+	FormatVersion int
+	SizeBytes     int64
+	PlaintextSize int64
+	LogicalSize   int64
+	EncryptionKey []byte
+	KeyID         string
+	ExpectedEtag  string
+}
+
+// EncryptedUpdate is the new description of a copy an encryption pass has
+// rewritten. PlaintextSize is what the encryptor was handed and CiphertextSize
+// is what now occupies the backend, so the difference between them is what the
+// envelope cost and what the backend's counter has to move by.
+type EncryptedUpdate struct {
+	ObjectKey      string
+	BackendName    string
+	EncryptionKey  []byte
+	KeyID          string
+	PlaintextSize  int64
+	CiphertextSize int64
+	ExpectedEtag   string
+}
+
+// DecryptedUpdate is the new description of a copy a decryption pass has
+// rewritten back to plaintext. PlaintextSize is what now occupies the backend,
+// and the envelope columns the row still holds are cleared.
+type DecryptedUpdate struct {
+	ObjectKey     string
+	BackendName   string
+	PlaintextSize int64
+	ExpectedEtag  string
 }
 
 // -------------------------------------------------------------------------

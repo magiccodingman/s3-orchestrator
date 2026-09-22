@@ -24,16 +24,17 @@ import (
 	"github.com/afreidah/s3-orchestrator/internal/encryption"
 )
 
+// -------------------------------------------------------------------------
+// TYPES
+// -------------------------------------------------------------------------
+
 // Resolution classifies the outcome of an optional dependency lookup.
 type Resolution string
 
 const (
-	// ResolutionDisabled means no provider was registered for T.
-	ResolutionDisabled Resolution = "disabled"
-	// ResolutionApplied means the provider resolved cleanly.
-	ResolutionApplied Resolution = "applied"
-	// ResolutionFailed means the provider was registered but construction failed.
-	ResolutionFailed Resolution = "failed"
+	ResolutionDisabled Resolution = "disabled" // no provider registered for T
+	ResolutionApplied  Resolution = "applied"  // the provider resolved cleanly
+	ResolutionFailed   Resolution = "failed"   // registered, but construction failed
 )
 
 // OptionalResult carries the outcome of an Optional[T] lookup. Callers
@@ -46,11 +47,9 @@ type OptionalResult[T any] struct {
 	Err        error
 }
 
-// Disabled reports whether the underlying provider was not registered.
-func (r OptionalResult[T]) Disabled() bool { return r.Resolution == ResolutionDisabled }
-
-// Applied reports whether the provider resolved cleanly.
-func (r OptionalResult[T]) Applied() bool { return r.Resolution == ResolutionApplied }
+// -------------------------------------------------------------------------
+// PUBLIC API
+// -------------------------------------------------------------------------
 
 // Failed reports whether the provider was registered but failed to
 // construct (or one of its transitive dependencies failed).
@@ -91,20 +90,14 @@ func IsRegistered[T any](inj do.Injector) bool {
 	return false
 }
 
-// invokeOptional preserves the legacy "swallow error, return zero" shape
-// for call sites where the caller has already decided not to differentiate
-// Disabled from Failed. New code should prefer Optional[T] and inspect
-// Failed so a broken-but-configured feature does not look the same as a
-// feature intentionally turned off.
-func invokeOptional[T any](inj do.Injector) T {
-	return Optional[T](inj).Value
-}
+// -------------------------------------------------------------------------
+// INTERNALS
+// -------------------------------------------------------------------------
 
 // resolveOptionalCounterBackend returns the configured Redis counter
-// backend, or nil when Redis is disabled / not registered. The
-// CounterBackend field on BackendManagerConfig accepts nil to mean
-// "use the local counter backend".
-func resolveOptionalCounterBackend(i do.Injector) counter.CounterBackend {
+// backend, or nil when Redis is disabled / not registered. The runtime
+// builder treats nil as "use the local counter backend".
+func resolveOptionalCounterBackend(i do.Injector) counter.Backend {
 	rb, err := do.Invoke[*counter.RedisCounterBackend](i)
 	if err != nil {
 		return nil
@@ -113,8 +106,8 @@ func resolveOptionalCounterBackend(i do.Injector) counter.CounterBackend {
 }
 
 // resolveOptionalCache returns the object data cache, or nil when
-// caching is disabled / not registered. NewBackendManager treats nil
-// as "object data caching is off" (read path bypasses the cache layer).
+// caching is disabled / not registered. The object manager treats nil as
+// "object data caching is off" (read path bypasses the cache layer).
 func resolveOptionalCache(i do.Injector) objcache.ObjectCache {
 	c, err := do.Invoke[objcache.ObjectCache](i)
 	if err != nil {

@@ -37,6 +37,7 @@ import (
 	"github.com/afreidah/s3-orchestrator/internal/observe"
 	"github.com/afreidah/s3-orchestrator/internal/observe/logfmt"
 	"github.com/afreidah/s3-orchestrator/internal/observe/telemetry"
+	"github.com/afreidah/s3-orchestrator/internal/s3op"
 	"github.com/afreidah/s3-orchestrator/internal/store/core"
 	"github.com/afreidah/s3-orchestrator/internal/util/must"
 )
@@ -97,11 +98,10 @@ type FailoverStores interface {
 // Failover orchestrates per-key read failover across backends.
 // One instance per object.Manager; safe for concurrent reads.
 type Failover struct {
-	core        ReadRuntime
-	stores      FailoverStores
-	broadcaster *Broadcaster // degraded-mode fan-out; used only on DB outage
-	// degradedReadsEnabled false makes degraded reads fail fast instead of broadcasting.
-	degradedReadsEnabled bool
+	core                 ReadRuntime
+	stores               FailoverStores
+	broadcaster          *Broadcaster // degraded-mode fan-out; used only on DB outage
+	degradedReadsEnabled bool         // false fails a degraded read fast instead of broadcasting
 	log                  *slog.Logger
 }
 
@@ -114,10 +114,7 @@ type FailoverDeps struct {
 	ParallelBroadcast            bool
 	DegradedBroadcastParallelism int
 	DegradedReadsEnabled         bool
-	// BackendTimeout bounds the loser-drain goroutine after a winner is
-	// declared so a hung backend can't strand it. Zero falls back to a
-	// safe default.
-	BackendTimeout time.Duration
+	BackendTimeout               time.Duration // bounds the loser-drain goroutine; zero takes a safe default
 }
 
 // New constructs a Failover. When DegradedReadsEnabled is false, a DB
@@ -155,17 +152,17 @@ func New(deps *FailoverDeps) *Failover {
 // helper: the operation label, key, start time, and span. Grouping them keeps
 // the helper signatures small and the call sites readable.
 type readOp struct {
-	operation string
+	operation s3op.Operation
 	key       string
 	start     time.Time
 	span      trace.Span
 }
 
-func Read[T any](ctx context.Context, f *Failover, operation, key string, probe Probe[T]) (T, string, error) {
+func (f *Failover) Read[T any](ctx context.Context, operation s3op.Operation, key string, probe Probe[T]) (T, string, error) {
 	var zero T
 	start := time.Now()
 
-	ctx, span := telemetry.StartSpan(ctx, spanPrefix+operation,
+	ctx, span := telemetry.StartSpan(ctx, spanPrefix+operation.String(),
 		telemetry.AttrObjectKey.String(key),
 	)
 	defer span.End()
@@ -179,18 +176,18 @@ func Read[T any](ctx context.Context, f *Failover, operation, key string, probe 
 		}
 		if errors.Is(err, core.ErrDBUnavailable) {
 			span.SetAttributes(telemetry.AttrDegradedMode.Bool(true))
-			telemetry.DegradedReadsTotal.WithLabelValues(operation).Inc()
+			telemetry.DegradedReadsTotal.WithLabelValues(operation.String()).Inc()
 			if !f.degradedReadsEnabled {
 				observe.MarkSpanError(span, "degraded reads disabled by operator")
 				return zero, "", core.ErrServiceUnavailable
 			}
-			return broadcastRead(ctx, f.broadcaster, op, probe)
+			return f.broadcaster.broadcastRead(ctx, op, probe)
 		}
 		observe.RecordSpanError(span, err)
 		return zero, "", fmt.Errorf("failed to find object location: %w", err)
 	}
 
-	return tryEachLocation(ctx, f, op, locations, probe)
+	return f.tryEachLocation(ctx, op, locations, probe)
 }
 
 // tryEachLocation walks the resolved location list and runs the probe
@@ -198,7 +195,7 @@ func Read[T any](ctx context.Context, f *Failover, operation, key string, probe 
 // count of usage-limit skips so the failure-path return distinguishes
 // "all backends declined for usage limits" from "all backends genuinely
 // failed."
-func tryEachLocation[T any](ctx context.Context, f *Failover, op readOp, locations []core.ObjectLocation, probe Probe[T]) (T, string, error) {
+func (f *Failover) tryEachLocation[T any](ctx context.Context, op readOp, locations []core.ObjectLocation, probe Probe[T]) (T, string, error) {
 	var zero T
 	var lastErr error
 	var limitSkips int
@@ -219,7 +216,7 @@ func tryEachLocation[T any](ctx context.Context, f *Failover, op readOp, locatio
 				limitSkips++
 			}
 			if i < len(locations)-1 {
-				f.log.WarnContext(ctx, op.operation+": copy failed, trying next",
+				f.log.WarnContext(ctx, op.operation.String()+": copy failed, trying next",
 					"key", op.key, "failed_backend", name, "error", err)
 			}
 			continue
@@ -242,11 +239,18 @@ func tryEachLocation[T any](ctx context.Context, f *Failover, op readOp, locatio
 // failoverFailureResult finalises the span and chooses between the
 // usage-limit-exceeded sentinel and the underlying lastErr based on
 // whether every location declined for over-limit reasons.
-func failoverFailureResult(span trace.Span, operation string, locations []core.ObjectLocation, lastErr error, limitSkips int) error {
+func failoverFailureResult(span trace.Span, operation s3op.Operation, locations []core.ObjectLocation, lastErr error, limitSkips int) error {
 	if limitSkips > 0 && limitSkips == len(locations) {
-		telemetry.UsageLimitRejectionsTotal.WithLabelValues(operation, "read").Inc()
+		telemetry.UsageLimitRejectionsTotal.WithLabelValues(operation.String(), "read").Inc()
 		observe.MarkSpanError(span, "all copies over usage limit")
 		return core.ErrUsageLimitExceeded
+	}
+	// No location was even attempted, so no probe error was recorded. The
+	// store contract makes this unreachable, but a nil return here would read
+	// as a successful zero-value response.
+	if lastErr == nil {
+		observe.MarkSpanError(span, "no copies to read from")
+		return core.ErrObjectNotFound
 	}
 	observe.RecordSpanError(span, lastErr)
 	return lastErr

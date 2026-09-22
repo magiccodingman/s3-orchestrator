@@ -8,14 +8,12 @@
 // and monthly usage from the store and updates the corresponding gauges.
 // -------------------------------------------------------------------------------
 
-// Package metrics owns the Prometheus gauge/counter recording for the proxy
-// package. It exposes a Collector that the orchestrator embeds to refresh
-// gauge values from the metadata store and record per-operation metrics.
 package metrics
 
 import (
 	"context"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/afreidah/s3-orchestrator/internal/counter"
@@ -33,12 +31,28 @@ import (
 // gauges. Defined here  -  at the consumer  -  rather than in the store
 // package: adding a new metric is a Collector concern, not a store-package
 // concern.
+//go:generate mockgen -destination=mock_test.go -package=metrics github.com/afreidah/s3-orchestrator/internal/proxy/metrics Deps
+
 type Deps interface {
 	GetQuotaStats(ctx context.Context) (map[string]core.QuotaStat, error)
 	GetObjectCounts(ctx context.Context) (map[string]int64, error)
 	GetActiveMultipartCounts(ctx context.Context) (map[string]int64, error)
 	GetUsageForPeriod(ctx context.Context, period string) (map[string]core.UsageStat, error)
+	GetPoolUsageForPeriod(ctx context.Context, period string) (map[string]core.PoolUsage, error)
 	GetUnderReplicatedObjects(ctx context.Context, factor, limit int) ([]core.ObjectLocation, error)
+	CountOverReplicatedObjects(ctx context.Context, factor int) (int64, error)
+	CountUnencryptedLocations(ctx context.Context) (int64, error)
+}
+
+// ReplicationSnapshot is the last-computed replication state, retained so a
+// cheap admin endpoint can serve it without a fresh ledger scan. Ready is false
+// until the first computation has run.
+type ReplicationSnapshot struct {
+	Factor          int
+	UnderReplicated int64
+	OverReplicated  int64
+	ComputedAt      time.Time
+	Ready           bool
 }
 
 // Collector records Prometheus metrics for manager-level operations and
@@ -49,6 +63,9 @@ type Collector struct {
 	backendNames      []string
 	replicationFactor func() int // returns 0 when replication is disabled
 	log               *slog.Logger
+
+	repMu   sync.RWMutex        // guards repSnap
+	repSnap ReplicationSnapshot // last-computed replication state, served to admin
 }
 
 // CollectorDeps groups the metrics collector's constructor parameters.
@@ -105,7 +122,23 @@ func (mc *Collector) UpdateQuotaMetrics(ctx context.Context) error {
 	mc.updateMultipartCountGauges(ctx, stats)
 	mc.updateUsageGauges(ctx, stats)
 	mc.updateReplicationPending(ctx)
+	mc.updatePlaintextCopies(ctx)
 	return nil
+}
+
+// updatePlaintextCopies publishes how many copies are still unencrypted.
+//
+// Refreshed here rather than from the dashboard so the figure keeps moving on a
+// deployment that scrapes Prometheus and never opens the web UI. Encryption
+// applies to new writes only, so without this nothing reports that a fleet
+// configured for encryption is still partly plaintext.
+func (mc *Collector) updatePlaintextCopies(ctx context.Context) {
+	count, err := mc.store.CountUnencryptedLocations(ctx)
+	if err != nil {
+		mc.log.WarnContext(ctx, "failed to count unencrypted copies", "error", err)
+		return
+	}
+	telemetry.EncryptionPlaintextCopies.Set(float64(count))
 }
 
 // updateQuotaGauges sets per-backend quota bytes gauges and emits a
@@ -139,18 +172,11 @@ func (mc *Collector) maybeEmitCapacityWarning(ctx context.Context, name string, 
 		"utilization_pct", int(utilization*100),
 		"bytes_available", available,
 		"bytes_limit", stat.BytesLimit)
-	if event.Emit == nil {
-		return
-	}
-	event.Emit(event.Event{
-		Type:    event.BackendCapacityWarning,
-		Subject: name,
-		Data: map[string]any{
-			"backend":         name,
-			"utilization_pct": int(utilization * 100),
-			"bytes_available": available,
-			"bytes_limit":     stat.BytesLimit,
-		},
+	event.Publish(event.BackendCapacityWarning, name, map[string]any{
+		"backend":         name,
+		"utilization_pct": int(utilization * 100),
+		"bytes_available": available,
+		"bytes_limit":     stat.BytesLimit,
 	})
 }
 
@@ -190,9 +216,18 @@ func (mc *Collector) updateMultipartCountGauges(ctx context.Context, stats map[s
 // updateUsageGauges refreshes the monthly usage gauges and seeds the
 // usage tracker baselines used by the in-process limit checks.
 func (mc *Collector) updateUsageGauges(ctx context.Context, stats map[string]core.QuotaStat) {
-	usage, err := mc.store.GetUsageForPeriod(ctx, counter.CurrentPeriod())
+	period := counter.CurrentPeriod()
+	usage, err := mc.store.GetUsageForPeriod(ctx, period)
 	if err != nil {
 		mc.log.ErrorContext(ctx, "failed to get usage stats", "error", err)
+		return
+	}
+	// Fetched alongside the totals rather than on its own tick: the two
+	// baselines are compared against the same counters, and seeding one
+	// without the other admits work against a budget it has already spent.
+	pools, err := mc.store.GetPoolUsageForPeriod(ctx, period)
+	if err != nil {
+		mc.log.ErrorContext(ctx, "failed to get request pool usage", "error", err)
 		return
 	}
 	for name := range stats {
@@ -209,26 +244,75 @@ func (mc *Collector) updateUsageGauges(ctx context.Context, stats map[string]cor
 	// rows) zeroes out before the new period's values get cached.
 	mc.usage.ResetBaselines(mc.backendNames)
 	for name, u := range usage {
-		mc.usage.SetBaseline(name, u)
+		mc.usage.SetBaseline(name, u, pools[name])
+	}
+	mc.updatePoolGauges(pools)
+}
+
+// updatePoolGauges publishes the per-pool request counts and the ceilings they
+// are judged against, so an operator can see which budget is close to
+// refusing work rather than only that the backend stopped accepting it.
+func (mc *Collector) updatePoolGauges(pools map[string]core.PoolUsage) {
+	limits := mc.usage.GetLimits()
+	for name, lim := range limits {
+		for _, pool := range lim.Pools() {
+			telemetry.UsagePoolRequests.WithLabelValues(name, pool.Name).Set(float64(pools[name][pool.Name]))
+			telemetry.UsagePoolLimit.WithLabelValues(name, pool.Name).Set(float64(pool.Limit))
+		}
 	}
 }
 
 // updateReplicationPending updates the under-replicated-objects gauge.
 // No-op when replication is disabled (factor <= 1) or when no factor
 // source has been wired (the closure is nil in test fixtures that build
-// metrics without a BackendManager).
+// metrics without a replication worker).
 func (mc *Collector) updateReplicationPending(ctx context.Context) {
 	if mc.replicationFactor == nil {
 		return
 	}
 	factor := mc.replicationFactor()
 	if factor <= 1 {
+		// Replication disabled: record a ready, zeroed snapshot so the admin
+		// endpoint reports "not replicating" rather than "not yet computed".
+		mc.setReplicationSnapshot(ReplicationSnapshot{Factor: factor, Ready: true, ComputedAt: time.Now()})
 		return
 	}
+
 	locations, err := mc.store.GetUnderReplicatedObjects(ctx, factor, 10000)
 	if err != nil {
 		mc.log.ErrorContext(ctx, "failed to get under-replicated objects", "error", err)
 		return
 	}
-	telemetry.ReplicationPending.Set(float64(len(core.GroupByKey(locations))))
+	under := int64(len(core.GroupByKey(locations)))
+	telemetry.ReplicationPending.Set(float64(under))
+
+	over, err := mc.store.CountOverReplicatedObjects(ctx, factor)
+	if err != nil {
+		mc.log.ErrorContext(ctx, "failed to count over-replicated objects", "error", err)
+		return
+	}
+	telemetry.OverReplicationPending.Set(float64(over))
+
+	mc.setReplicationSnapshot(ReplicationSnapshot{
+		Factor:          factor,
+		UnderReplicated: under,
+		OverReplicated:  over,
+		ComputedAt:      time.Now(),
+		Ready:           true,
+	})
+}
+
+// setReplicationSnapshot stores the latest computed replication state.
+func (mc *Collector) setReplicationSnapshot(s ReplicationSnapshot) {
+	mc.repMu.Lock()
+	defer mc.repMu.Unlock()
+	mc.repSnap = s
+}
+
+// ReplicationSnapshot returns the last-computed replication state. Ready is
+// false until the first collector cycle has run.
+func (mc *Collector) ReplicationSnapshot() ReplicationSnapshot {
+	mc.repMu.RLock()
+	defer mc.repMu.RUnlock()
+	return mc.repSnap
 }

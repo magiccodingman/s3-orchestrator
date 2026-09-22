@@ -29,23 +29,23 @@ import "github.com/jackc/pgx/v5/pgtype"
 
 // ListObjectsByBackendRow
 
-func (r ListObjectsByBackendRow) GetObjectKey() string         { return r.ObjectKey }
-func (r ListObjectsByBackendRow) GetBackendName() string       { return r.BackendName }
-func (r ListObjectsByBackendRow) GetSizeBytes() int64          { return r.SizeBytes }
+func (r ListObjectsByBackendRow) GetObjectKey() string             { return r.ObjectKey }
+func (r ListObjectsByBackendRow) GetBackendName() string           { return r.BackendName }
+func (r ListObjectsByBackendRow) GetSizeBytes() int64              { return r.SizeBytes }
 func (r ListObjectsByBackendRow) GetCreatedAt() pgtype.Timestamptz { return r.CreatedAt }
 
 // ListObjectsByPrefixRow
 
-func (r ListObjectsByPrefixRow) GetObjectKey() string         { return r.ObjectKey }
-func (r ListObjectsByPrefixRow) GetBackendName() string       { return r.BackendName }
-func (r ListObjectsByPrefixRow) GetSizeBytes() int64          { return r.SizeBytes }
+func (r ListObjectsByPrefixRow) GetObjectKey() string             { return r.ObjectKey }
+func (r ListObjectsByPrefixRow) GetBackendName() string           { return r.BackendName }
+func (r ListObjectsByPrefixRow) GetSizeBytes() int64              { return r.SizeBytes }
 func (r ListObjectsByPrefixRow) GetCreatedAt() pgtype.Timestamptz { return r.CreatedAt }
 
 // ListExpiredObjectsRow
 
-func (r ListExpiredObjectsRow) GetObjectKey() string         { return r.ObjectKey }
-func (r ListExpiredObjectsRow) GetBackendName() string       { return r.BackendName }
-func (r ListExpiredObjectsRow) GetSizeBytes() int64          { return r.SizeBytes }
+func (r ListExpiredObjectsRow) GetObjectKey() string             { return r.ObjectKey }
+func (r ListExpiredObjectsRow) GetBackendName() string           { return r.BackendName }
+func (r ListExpiredObjectsRow) GetSizeBytes() int64              { return r.SizeBytes }
 func (r ListExpiredObjectsRow) GetCreatedAt() pgtype.Timestamptz { return r.CreatedAt }
 
 // ListDirectChildrenRow has no ObjectLocation projection; it groups by
@@ -74,6 +74,18 @@ func (r GetAllObjectLocationsRow) GetEncryptionKey() []byte         { return r.E
 func (r GetAllObjectLocationsRow) GetKeyID() *string                { return r.KeyID }
 func (r GetAllObjectLocationsRow) GetPlaintextSize() *int64         { return r.PlaintextSize }
 func (r GetAllObjectLocationsRow) GetContentHash() *string          { return r.ContentHash }
+func (r GetAllObjectLocationsRow) GetCompressionAlgorithm() *string { return r.CompressionAlgorithm }
+func (r GetAllObjectLocationsRow) GetCompressionLevel() *string     { return r.CompressionLevel }
+func (r GetAllObjectLocationsRow) GetLogicalSize() *int64           { return r.LogicalSize }
+func (r GetAllObjectLocationsRow) GetCompressionFormatVersion() *int16 {
+	return r.CompressionFormatVersion
+}
+func (r GetAllObjectLocationsRow) GetLastScrubbedAt() pgtype.Timestamptz {
+	return r.LastScrubbedAt
+}
+func (r GetAllObjectLocationsRow) GetEtag() *string        { return r.Etag }
+func (r GetAllObjectLocationsRow) GetContentType() *string { return r.ContentType }
+func (r GetAllObjectLocationsRow) GetUserMetadata() []byte { return r.UserMetadata }
 
 // GetUnderReplicatedObjectsRow
 
@@ -86,6 +98,14 @@ func (r GetUnderReplicatedObjectsRow) GetEncryptionKey() []byte         { return
 func (r GetUnderReplicatedObjectsRow) GetKeyID() *string                { return r.KeyID }
 func (r GetUnderReplicatedObjectsRow) GetPlaintextSize() *int64         { return r.PlaintextSize }
 func (r GetUnderReplicatedObjectsRow) GetContentHash() *string          { return r.ContentHash }
+func (r GetUnderReplicatedObjectsRow) GetCompressionLevel() *string     { return r.CompressionLevel }
+func (r GetUnderReplicatedObjectsRow) GetLogicalSize() *int64           { return r.LogicalSize }
+func (r GetUnderReplicatedObjectsRow) GetCompressionAlgorithm() *string {
+	return r.CompressionAlgorithm
+}
+func (r GetUnderReplicatedObjectsRow) GetCompressionFormatVersion() *int16 {
+	return r.CompressionFormatVersion
+}
 
 // GetUnderReplicatedObjectsExcludingRow
 
@@ -98,6 +118,16 @@ func (r GetUnderReplicatedObjectsExcludingRow) GetEncryptionKey() []byte        
 func (r GetUnderReplicatedObjectsExcludingRow) GetKeyID() *string                { return r.KeyID }
 func (r GetUnderReplicatedObjectsExcludingRow) GetPlaintextSize() *int64         { return r.PlaintextSize }
 func (r GetUnderReplicatedObjectsExcludingRow) GetContentHash() *string          { return r.ContentHash }
+func (r GetUnderReplicatedObjectsExcludingRow) GetCompressionLevel() *string {
+	return r.CompressionLevel
+}
+func (r GetUnderReplicatedObjectsExcludingRow) GetLogicalSize() *int64 { return r.LogicalSize }
+func (r GetUnderReplicatedObjectsExcludingRow) GetCompressionAlgorithm() *string {
+	return r.CompressionAlgorithm
+}
+func (r GetUnderReplicatedObjectsExcludingRow) GetCompressionFormatVersion() *int16 {
+	return r.CompressionFormatVersion
+}
 
 // GetOverReplicatedObjectsRow
 
@@ -110,18 +140,35 @@ func (r GetOverReplicatedObjectsRow) GetEncryptionKey() []byte         { return 
 func (r GetOverReplicatedObjectsRow) GetKeyID() *string                { return r.KeyID }
 func (r GetOverReplicatedObjectsRow) GetPlaintextSize() *int64         { return r.PlaintextSize }
 func (r GetOverReplicatedObjectsRow) GetContentHash() *string          { return r.ContentHash }
+func (r GetOverReplicatedObjectsRow) GetCompressionAlgorithm() *string { return r.CompressionAlgorithm }
+func (r GetOverReplicatedObjectsRow) GetCompressionLevel() *string     { return r.CompressionLevel }
+func (r GetOverReplicatedObjectsRow) GetLogicalSize() *int64           { return r.LogicalSize }
+func (r GetOverReplicatedObjectsRow) GetCompressionFormatVersion() *int16 {
+	return r.CompressionFormatVersion
+}
 
-// GetRandomHashedObjectsRow
+// GetLeastRecentlyScrubbedObjectsRow
 
-func (r GetRandomHashedObjectsRow) GetObjectKey() string             { return r.ObjectKey }
-func (r GetRandomHashedObjectsRow) GetBackendName() string           { return r.BackendName }
-func (r GetRandomHashedObjectsRow) GetSizeBytes() int64              { return r.SizeBytes }
-func (r GetRandomHashedObjectsRow) GetCreatedAt() pgtype.Timestamptz { return r.CreatedAt }
-func (r GetRandomHashedObjectsRow) GetEncrypted() bool               { return r.Encrypted }
-func (r GetRandomHashedObjectsRow) GetEncryptionKey() []byte         { return r.EncryptionKey }
-func (r GetRandomHashedObjectsRow) GetKeyID() *string                { return r.KeyID }
-func (r GetRandomHashedObjectsRow) GetPlaintextSize() *int64         { return r.PlaintextSize }
-func (r GetRandomHashedObjectsRow) GetContentHash() *string          { return r.ContentHash }
+func (r GetLeastRecentlyScrubbedObjectsRow) GetObjectKey() string             { return r.ObjectKey }
+func (r GetLeastRecentlyScrubbedObjectsRow) GetBackendName() string           { return r.BackendName }
+func (r GetLeastRecentlyScrubbedObjectsRow) GetSizeBytes() int64              { return r.SizeBytes }
+func (r GetLeastRecentlyScrubbedObjectsRow) GetCreatedAt() pgtype.Timestamptz { return r.CreatedAt }
+func (r GetLeastRecentlyScrubbedObjectsRow) GetEncrypted() bool               { return r.Encrypted }
+func (r GetLeastRecentlyScrubbedObjectsRow) GetEncryptionKey() []byte         { return r.EncryptionKey }
+func (r GetLeastRecentlyScrubbedObjectsRow) GetKeyID() *string                { return r.KeyID }
+func (r GetLeastRecentlyScrubbedObjectsRow) GetPlaintextSize() *int64         { return r.PlaintextSize }
+func (r GetLeastRecentlyScrubbedObjectsRow) GetContentHash() *string          { return r.ContentHash }
+func (r GetLeastRecentlyScrubbedObjectsRow) GetCompressionLevel() *string     { return r.CompressionLevel }
+func (r GetLeastRecentlyScrubbedObjectsRow) GetLogicalSize() *int64           { return r.LogicalSize }
+func (r GetLeastRecentlyScrubbedObjectsRow) GetCompressionAlgorithm() *string {
+	return r.CompressionAlgorithm
+}
+func (r GetLeastRecentlyScrubbedObjectsRow) GetCompressionFormatVersion() *int16 {
+	return r.CompressionFormatVersion
+}
+func (r GetLeastRecentlyScrubbedObjectsRow) GetLastScrubbedAt() pgtype.Timestamptz {
+	return r.LastScrubbedAt
+}
 
 // GetObjectsWithoutHashRow
 
@@ -134,3 +181,9 @@ func (r GetObjectsWithoutHashRow) GetEncryptionKey() []byte         { return r.E
 func (r GetObjectsWithoutHashRow) GetKeyID() *string                { return r.KeyID }
 func (r GetObjectsWithoutHashRow) GetPlaintextSize() *int64         { return r.PlaintextSize }
 func (r GetObjectsWithoutHashRow) GetContentHash() *string          { return r.ContentHash }
+func (r GetObjectsWithoutHashRow) GetCompressionAlgorithm() *string { return r.CompressionAlgorithm }
+func (r GetObjectsWithoutHashRow) GetCompressionLevel() *string     { return r.CompressionLevel }
+func (r GetObjectsWithoutHashRow) GetLogicalSize() *int64           { return r.LogicalSize }
+func (r GetObjectsWithoutHashRow) GetCompressionFormatVersion() *int16 {
+	return r.CompressionFormatVersion
+}

@@ -10,23 +10,25 @@
 // resolution and internal key prefixing.
 // -------------------------------------------------------------------------------
 
-// Package server implements the S3-compatible HTTP API, routing requests to the
-// storage backend manager with authentication, rate limiting, and tracing.
 package s3api
 
 import (
 	"context"
+	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
 	"time"
 
 	"github.com/afreidah/s3-orchestrator/internal/internalkey"
+	"github.com/afreidah/s3-orchestrator/internal/observe"
 	"github.com/afreidah/s3-orchestrator/internal/observe/audit"
 	"github.com/afreidah/s3-orchestrator/internal/observe/logfmt"
-	"github.com/afreidah/s3-orchestrator/internal/observe"
 	"github.com/afreidah/s3-orchestrator/internal/observe/telemetry"
-	"github.com/afreidah/s3-orchestrator/internal/proxy"
+	"github.com/afreidah/s3-orchestrator/internal/proxy/multipart"
+	"github.com/afreidah/s3-orchestrator/internal/proxy/object"
+	"github.com/afreidah/s3-orchestrator/internal/store/core"
 	"github.com/afreidah/s3-orchestrator/internal/transport/auth"
 	"github.com/afreidah/s3-orchestrator/internal/util/must"
 	"github.com/afreidah/s3-orchestrator/internal/util/syncutil"
@@ -48,9 +50,50 @@ var httpSpanName = map[string]string{
 	http.MethodPost:   "HTTP POST",
 }
 
-// Server handles HTTP requests and routes them to the backend manager.
+//go:generate mockgen -destination=mock_ops_test.go -package=s3api github.com/afreidah/s3-orchestrator/internal/transport/s3api ObjectOps,MultipartOps
+
+// ObjectOps is the narrow object surface the S3 transport depends on:
+// the object CRUD, listing, and capacity queries reachable from an S3
+// request. *object.Manager satisfies it.
+type ObjectOps interface {
+	PutObject(ctx context.Context, req *object.PutObjectRequest) (string, error)
+	GetObject(ctx context.Context, key, rangeHeader string) (*object.GetResult, error)
+	HeadObject(ctx context.Context, key string) (*object.HeadResult, error)
+	DeleteObject(ctx context.Context, key string) error
+	DeleteObjects(ctx context.Context, keys []string) []object.DeleteObjectResult
+	CopyObject(ctx context.Context, req *object.CopyObjectRequest) (string, error)
+	ListObjects(ctx context.Context, prefix, delimiter, startAfter string, maxKeys int) (*object.ListObjectsV2Result, error)
+	ObjectExists(ctx context.Context, key string) (bool, error)
+	CanAcceptWrite(size int64) bool
+	BackendCapacityStats(ctx context.Context) map[string]core.QuotaStat
+	GetObjectTags(ctx context.Context, key string) ([]core.Tag, error)
+	PutObjectTags(ctx context.Context, key string, tags []core.Tag) error
+	DeleteObjectTags(ctx context.Context, key string) error
+}
+
+// MultipartOps is the narrow multipart surface the S3 transport depends on.
+// *multipart.Manager satisfies it.
+type MultipartOps interface {
+	CreateMultipartUpload(ctx context.Context, req *multipart.CreateUploadRequest) (string, string, error)
+	UploadPart(ctx context.Context, bucket, key, uploadID string, partNumber int, body io.Reader, size int64) (string, error)
+	CompleteMultipartUpload(ctx context.Context, bucket, key, uploadID string, manifest []core.CompletePart) (string, error)
+	AbortMultipartUpload(ctx context.Context, bucket, key, uploadID string) error
+	ListMultipartUploads(ctx context.Context, prefix string, maxUploads int) ([]core.MultipartUpload, error)
+	GetParts(ctx context.Context, bucket, key, uploadID string) ([]core.MultipartPart, error)
+	CountActiveMultipartUploads(ctx context.Context, bucketPrefix string) (int64, error)
+}
+
+// Compile-time assertions.
+var (
+	_ ObjectOps    = (*object.Manager)(nil)
+	_ MultipartOps = (*multipart.Manager)(nil)
+)
+
+// Server handles HTTP requests and routes them to the object and multipart
+// managers.
 type Server struct {
-	Manager       *proxy.BackendManager
+	Objects       ObjectOps
+	Multipart     MultipartOps
 	bucketAuth    syncutil.AtomicConfig[auth.BucketRegistry]
 	MaxObjectSize int64        // Max upload body size in bytes
 	startedAt     time.Time    // Stable timestamp for ListBuckets CreationDate
@@ -69,10 +112,12 @@ func (s *Server) logger() *slog.Logger {
 }
 
 // NewServer creates a Server with a stable start timestamp.
-func NewServer(manager *proxy.BackendManager, maxObjectSize int64) *Server {
-	must.NotNil("manager", manager)
+func NewServer(objects ObjectOps, multipartMgr MultipartOps, maxObjectSize int64) *Server {
+	must.NotNil("objects", objects)
+	must.NotNil("multipart", multipartMgr)
 	return &Server{
-		Manager:       manager,
+		Objects:       objects,
+		Multipart:     multipartMgr,
 		MaxObjectSize: maxObjectSize,
 		startedAt:     time.Now(),
 		log:           slog.Default().With(logfmt.Component("s3_server")),
@@ -105,17 +150,21 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	telemetry.InflightRequests.WithLabelValues(method).Inc()
 	defer telemetry.InflightRequests.WithLabelValues(method).Dec()
 
-	authorizedBucket, streamMat, err := s.GetBucketAuth().AuthenticateAndResolveBucket(r)
+	user, streamMat, err := s.GetBucketAuth().Authenticate(r)
 	if err != nil {
 		s.rejectAuth(ctx, w, r, method, start, err)
 		return
 	}
+	// Set before any work happens, so every audit entry this request produces
+	// names the identity behind it - including the storage-layer one written
+	// several packages deeper, which is handed a context and nothing else.
+	ctx = audit.WithUser(ctx, user.ID)
 	if streamMat != nil {
 		applyStreamingBody(r, streamMat)
 	}
 
 	if r.URL.Path == "/" && method == http.MethodGet {
-		s.serveListBuckets(ctx, w, r, method, requestID, start, authorizedBucket)
+		s.serveListBuckets(ctx, w, r, method, requestID, start, user)
 		return
 	}
 
@@ -124,8 +173,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.rejectInvalidPath(ctx, w, r, method, start)
 		return
 	}
-	if bucket != authorizedBucket {
-		s.rejectBucketMismatch(ctx, w, r, method, start, authorizedBucket, bucket)
+	// Named before dispatch rather than reported after it. An authorization
+	// check has nowhere to sit if the operation is only known once the handler
+	// has already written the response.
+	act := Classify(r, key)
+	if !s.authorize(ctx, w, r, &authRequest{
+		method: method, start: start, user: user, bucket: bucket, act: act,
+	}) {
 		return
 	}
 
@@ -155,17 +209,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		observe.MarkSpanError(span, msg)
 	}
 
-	var status int
-	var requestSize, responseSize int64
-	var operation string
-	var supported bool
-
+	var res routed
 	if key == "" {
-		operation, status, err, supported = s.routeBucketRequest(ctx, w, r, method, bucket)
+		res, err = s.routeBucketRequest(ctx, w, r, act, bucket)
 	} else {
-		operation, status, requestSize, responseSize, err, supported = s.routeObjectRequest(ctx, w, r, method, bucket, key, internalKey)
+		res, err = s.routeObjectRequest(ctx, w, r, act, bucket, key, internalKey)
 	}
-	if !supported {
+	if !res.supported {
 		if key == "" {
 			rejectMethod("Method not supported for bucket")
 		} else {
@@ -174,27 +224,27 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.recordRequest(method, status, start, requestSize, responseSize)
+	s.recordRequest(method, res.status, start, res.requestSize, res.responseSize)
 
 	if err != nil {
 		observe.RecordSpanError(span, err)
 		slog.LogAttrs(ctx, slog.LevelWarn, "S3 request failed",
-			slog.String("operation", operation),
+			slog.String("operation", res.operation),
 			slog.String("key", key),
-			slog.Int("status", status),
+			slog.Int("status", res.status),
 			slog.String("client_addr", r.RemoteAddr),
 			logfmt.Err(err))
 	}
-	span.SetAttributes(attribute.Int("http.status_code", status))
+	span.SetAttributes(attribute.Int("http.status_code", res.status))
 
 	s.auditRequest(ctx, r, &auditEntry{
 		method:       method,
 		bucket:       bucket,
 		key:          key,
-		operation:    operation,
-		status:       status,
-		requestSize:  requestSize,
-		responseSize: responseSize,
+		operation:    res.operation,
+		status:       res.status,
+		requestSize:  res.requestSize,
+		responseSize: res.responseSize,
 		elapsed:      time.Since(start),
 		err:          err,
 	})
@@ -217,19 +267,19 @@ func (s *Server) rejectAuth(ctx context.Context, w http.ResponseWriter, r *http.
 		slog.Int("status", http.StatusForbidden),
 		slog.Duration("duration", time.Since(start)),
 	)
-	writeS3Error(w, http.StatusForbidden, "AccessDenied", "Access denied")
+	writeAccessDenied(w)
 }
 
-// serveListBuckets handles the special-case GET / route that serves the
-// authorized bucket as a single-entry ListBuckets response.
-func (s *Server) serveListBuckets(ctx context.Context, w http.ResponseWriter, r *http.Request, method, requestID string, start time.Time, authorizedBucket string) {
+// serveListBuckets handles the special-case GET / route, which enumerates every
+// bucket the caller's identity reaches.
+func (s *Server) serveListBuckets(ctx context.Context, w http.ResponseWriter, r *http.Request, method, requestID string, start time.Time, user *auth.User) {
 	ctx, span := telemetry.StartServerSpan(ctx, "HTTP GET",
 		append(telemetry.RequestAttributes(method, "/", "", "", r.RemoteAddr),
 			telemetry.AttrRequestID.String(requestID))...,
 	)
 	defer span.End()
 
-	status, err := s.handleListBuckets(w, authorizedBucket)
+	status, err := s.handleListBuckets(w, user.Buckets())
 	s.recordRequest(method, status, start, 0, 0)
 	if err != nil {
 		observe.RecordSpanError(span, err)
@@ -259,63 +309,155 @@ func (s *Server) rejectInvalidPath(ctx context.Context, w http.ResponseWriter, r
 	writeS3Error(w, http.StatusBadRequest, "InvalidRequest", "Invalid path format")
 }
 
-// rejectBucketMismatch writes a 403 AccessDenied when the path bucket
-// does not match the bucket the credentials authorize.
-func (s *Server) rejectBucketMismatch(ctx context.Context, w http.ResponseWriter, r *http.Request, method string, start time.Time, authorizedBucket, bucket string) {
+// rejectBucketDenied writes a 403 AccessDenied when the authenticated user holds
+// no grant on the bucket the path names.
+func (s *Server) rejectBucketDenied(ctx context.Context, w http.ResponseWriter, r *http.Request, method string, start time.Time, user *auth.User, bucket string) {
 	s.recordRequest(method, http.StatusForbidden, start, 0, 0)
-	s.logger().WarnContext(ctx, "bucket mismatch",
+	s.logger().WarnContext(ctx, "bucket not granted",
 		"method", method,
 		"path", r.URL.Path,
 		"client_addr", r.RemoteAddr,
-		"authorized", authorizedBucket,
+		"user", user.ID,
 		"requested", bucket,
 	)
-	audit.Log(ctx, "s3.BucketMismatch",
+	audit.Log(ctx, "s3.BucketDenied",
 		slog.String("method", method),
 		slog.String("path", r.URL.Path),
 		slog.String("client_addr", r.RemoteAddr),
-		slog.String("authorized_bucket", authorizedBucket),
 		slog.String("requested_bucket", bucket),
 		slog.Int("status", http.StatusForbidden),
 		slog.Duration("duration", time.Since(start)),
 	)
-	writeS3Error(w, http.StatusForbidden, "AccessDenied", "Access denied")
+	writeAccessDenied(w)
+}
+
+// authRequest carries what an authorization decision reads about a request.
+// Bundled because the two refusals below need the same set and passing them
+// positionally at three call sites is where they get transposed.
+type authRequest struct {
+	method string
+	start  time.Time
+	user   *auth.User
+	bucket string
+	act    Action
+}
+
+// authorize refuses a caller that does not reach the bucket, and one whose
+// grant does not carry what the operation needs. Reports whether the request
+// may proceed; the refusal is already written when it may not.
+//
+// Both checks live here so the request path has one authorization step rather
+// than two spread either side of the span. They stay separate refusals: a
+// bucket the caller was never granted and an operation its grant does not allow
+// are different states an operator fixes differently.
+func (s *Server) authorize(ctx context.Context, w http.ResponseWriter, r *http.Request, a *authRequest) bool {
+	if !a.user.CanReach(a.bucket) {
+		s.rejectBucketDenied(ctx, w, r, a.method, a.start, a.user, a.bucket)
+		return false
+	}
+	if want := RequiredPermissions(a.act); !a.user.Can(a.bucket, want) {
+		s.rejectActionDenied(ctx, w, r, a, want)
+		return false
+	}
+	return true
+}
+
+// rejectActionDenied writes a 403 for a caller that reaches the bucket but
+// whose grant does not carry what the operation needs.
+//
+// Recorded as its own audit event rather than folded into the bucket refusal,
+// because the two describe different states an operator acts on differently:
+// one is a client pointed at a bucket it was never granted, the other a client
+// granted the bucket and asking for more than its grant allows. The entry names
+// what was needed and what was held so the fix is readable without a second
+// lookup.
+func (s *Server) rejectActionDenied(ctx context.Context, w http.ResponseWriter, r *http.Request, a *authRequest, want core.PermissionSet) {
+	held, _ := a.user.Permissions(a.bucket)
+	s.recordRequest(a.method, http.StatusForbidden, a.start, 0, 0)
+	s.logger().WarnContext(ctx, "operation not permitted by grant",
+		"method", a.method,
+		"path", r.URL.Path,
+		"client_addr", r.RemoteAddr,
+		"user", a.user.ID,
+		"bucket", a.bucket,
+		"operation", string(a.act),
+	)
+	audit.Log(ctx, "s3.ActionDenied",
+		slog.String("method", a.method),
+		slog.String("path", r.URL.Path),
+		slog.String("client_addr", r.RemoteAddr),
+		slog.String("bucket", a.bucket),
+		slog.String("operation", string(a.act)),
+		slog.String("required", want.String()),
+		slog.String("held", held.String()),
+		slog.Int("status", http.StatusForbidden),
+		slog.Duration("duration", time.Since(a.start)),
+	)
+	writeAccessDenied(w)
+}
+
+// routed is what a dispatcher reports about the request it handled: the
+// operation name metrics and the audit log are keyed on, the status written,
+// the bytes in and out, and whether the method and query combination is one
+// this server implements.
+//
+// A struct rather than six positional results. The dispatchers return the same
+// shape at twenty-odd sites, and half of those results are zero at any given
+// one; naming them is what makes a return statement readable without counting
+// commas back to the signature.
+type routed struct {
+	operation    string
+	status       int
+	requestSize  int64
+	responseSize int64
+	supported    bool
 }
 
 // routeBucketRequest dispatches bucket-level operations (no object key)
 // to their handlers. supported=false means none of the supported method/
 // query combinations matched; the caller emits a 405.
-func (s *Server) routeBucketRequest(ctx context.Context, w http.ResponseWriter, r *http.Request, method, bucket string) (string, int, error, bool) {
-	query := r.URL.Query()
-	_, hasDelete := query["delete"]
-	_, hasLocation := query["location"]
-	_, hasUploads := query["uploads"]
-	_, hasVersioning := query["versioning"]
-
-	switch {
-	case method == http.MethodHead:
-		s, e := s.handleHeadBucket(w)
-		return "HeadBucket", s, e, true
-	case method == http.MethodGet && hasVersioning:
+func (s *Server) routeBucketRequest(ctx context.Context, w http.ResponseWriter, r *http.Request, act Action, bucket string) (routed, error) {
+	switch act {
+	// Refused before dispatch, for the reason the object path does: S3 selects
+	// the operation from the query string, so an unrecognised key names a
+	// bucket subresource this server does not implement. Falling through
+	// answers a ListBucketResult, which a client that asked for versions, a
+	// policy or a lifecycle configuration parses as "there are none".
+	case ActionUnsupportedSubresource:
+		sub, _ := unsupportedQuery(r.URL.Query(), supportedBucketQueryKeys, supportedBucketQueryPrefixes)
+		msg := fmt.Sprintf("bucket subresource %q is not supported", sub)
+		writeS3Error(w, http.StatusNotImplemented, "NotImplemented", msg)
+		return done(act, http.StatusNotImplemented), nil
+	case ActionHeadBucket:
+		st, e := s.handleHeadBucket(w)
+		return done(act, st), e
+	case ActionGetBucketVersioning:
 		st, e := s.handleGetBucketVersioning(w)
-		return "GetBucketVersioning", st, e, true
-	case method == http.MethodGet && hasUploads:
+		return done(act, st), e
+	case ActionListMultipartUpload:
 		st, e := s.handleListMultipartUploads(ctx, w, r, bucket)
-		return "ListMultipartUploads", st, e, true
-	case method == http.MethodGet && hasLocation:
+		return done(act, st), e
+	case ActionGetBucketLocation:
 		st, e := s.handleGetBucketLocation(w)
-		return "GetBucketLocation", st, e, true
-	case method == http.MethodGet && query.Get("list-type") == "2":
+		return done(act, st), e
+	case ActionListObjectsV2:
 		st, e := s.handleListObjectsV2(ctx, w, r, bucket)
-		return "ListObjectsV2", st, e, true
-	case method == http.MethodGet:
+		return done(act, st), e
+	case ActionListObjectsV1:
 		st, e := s.handleListObjectsV1(ctx, w, r, bucket)
-		return "ListObjectsV1", st, e, true
-	case method == http.MethodPost && hasDelete:
+		return done(act, st), e
+	case ActionDeleteObjects:
 		st, e := s.handleDeleteObjects(ctx, w, r, bucket)
-		return "DeleteObjects", st, e, true
+		return done(act, st), e
 	}
-	return "", 0, nil, false
+	return routed{}, nil
+}
+
+// done builds the result for a dispatched action. The operation name is the
+// action itself rather than a literal repeated at every return, so the two
+// cannot drift.
+func done(act Action, status int) routed {
+	return routed{operation: string(act), status: status, supported: true}
 }
 
 // objectRouteKey carries the path-derived identifiers a per-object
@@ -331,65 +473,117 @@ type objectRouteKey struct {
 // routeObjectRequest dispatches object-level operations to their
 // handlers, splitting on multipart-upload state. supported=false means
 // the method/query combination is not supported and the caller emits 405.
-func (s *Server) routeObjectRequest(ctx context.Context, w http.ResponseWriter, r *http.Request, method, bucket, key, internalKey string) (string, int, int64, int64, error, bool) {
-	query := r.URL.Query()
-	_, hasUploads := query["uploads"]
-	uploadID := query.Get("uploadId")
-	rk := &objectRouteKey{method: method, bucket: bucket, key: key, internalKey: internalKey, uploadID: uploadID}
-
-	switch {
-	case hasUploads && method == http.MethodPost:
-		st, e := s.handleCreateMultipartUpload(ctx, w, r, bucket, key, internalKey)
-		return "CreateMultipartUpload", st, 0, 0, e, true
-	case uploadID != "":
-		return s.routeMultipartRequest(ctx, w, r, rk)
-	default:
-		return s.routePlainObjectRequest(ctx, w, r, method, bucket, internalKey)
+func (s *Server) routeObjectRequest(ctx context.Context, w http.ResponseWriter, r *http.Request, act Action, bucket, key, internalKey string) (routed, error) {
+	// Refused before dispatch. S3 selects the operation from the query string,
+	// so an unrecognised key names an operation this server does not
+	// implement; falling through would run PutObject or DeleteObject against
+	// the key instead, overwriting or removing the object the caller was
+	// asking about.
+	if act == ActionUnsupportedSubresource {
+		sub, _ := unsupportedQuery(r.URL.Query(), supportedObjectQueryKeys, supportedObjectQueryPrefixes)
+		msg := fmt.Sprintf("object subresource %q is not supported", sub)
+		writeS3Error(w, http.StatusNotImplemented, "NotImplemented", msg)
+		return done(act, http.StatusNotImplemented), nil
 	}
+
+	if act == ActionCreateMultipartUpload {
+		st, e := s.handleCreateMultipartUpload(ctx, w, r, bucket, key, internalKey)
+		return done(act, st), e
+	}
+
+	rk := &objectRouteKey{
+		method:      r.Method,
+		bucket:      bucket,
+		key:         key,
+		internalKey: internalKey,
+		uploadID:    r.URL.Query().Get("uploadId"),
+	}
+	if res, ok, err := s.routeTaggingRequest(ctx, w, r, act, internalKey); ok {
+		return res, err
+	}
+	if res, ok, err := s.routeMultipartRequest(ctx, w, r, act, rk); ok {
+		return res, err
+	}
+	return s.routePlainObjectRequest(ctx, w, r, act, bucket, internalKey)
 }
 
-// routeMultipartRequest dispatches per-uploadID multipart operations.
-func (s *Server) routeMultipartRequest(ctx context.Context, w http.ResponseWriter, r *http.Request, rk *objectRouteKey) (string, int, int64, int64, error, bool) {
-	switch rk.method {
-	case http.MethodPut:
+// routeMultipartRequest dispatches per-uploadID multipart operations. PUT
+// splits between UploadPart and UploadPartCopy on the X-Amz-Copy-Source
+// header, the same split routePlainObjectRequest makes: an UploadPartCopy
+// carries no body, so handing it to UploadPart stores an empty part.
+// ok reports false when the action belongs to another dispatcher, so the
+// caller tries the next one.
+func (s *Server) routeMultipartRequest(ctx context.Context, w http.ResponseWriter, r *http.Request, act Action, rk *objectRouteKey) (res routed, ok bool, err error) {
+	switch act {
+	case ActionUploadPartCopy:
+		st, e := s.handleUploadPartCopy(ctx, w, r, rk, r.Header.Get(headerCopySource))
+		return done(act, st), true, e
+	case ActionUploadPart:
 		st, e := s.handleUploadPart(ctx, w, r, rk.bucket, rk.key)
-		return "UploadPart", st, r.ContentLength, 0, e, true
-	case http.MethodPost:
+		out := done(act, st)
+		out.requestSize = r.ContentLength
+		return out, true, e
+	case ActionCompleteMultipartUpload:
 		st, e := s.handleCompleteMultipartUpload(ctx, w, r, rk.bucket, rk.key)
-		return "CompleteMultipartUpload", st, 0, 0, e, true
-	case http.MethodDelete:
+		return done(act, st), true, e
+	case ActionAbortMultipartUpload:
 		st, e := s.handleAbortMultipartUpload(ctx, w, rk.bucket, rk.key, rk.uploadID)
-		return "AbortMultipartUpload", st, 0, 0, e, true
-	case http.MethodGet:
+		return done(act, st), true, e
+	case ActionListParts:
 		st, e := s.handleListParts(ctx, w, r, rk.bucket, rk.key, rk.internalKey)
-		return "ListParts", st, 0, 0, e, true
+		return done(act, st), true, e
 	}
-	return "", 0, 0, 0, nil, false
+	return routed{}, false, nil
+}
+
+// routeTaggingRequest dispatches the three ?tagging subresource operations.
+// supported=false for any other method, which the caller renders as 405 rather
+// than letting it reach the object itself.
+// ok reports false when the action is not a tagging one, so the caller tries
+// the next dispatcher.
+func (s *Server) routeTaggingRequest(ctx context.Context, w http.ResponseWriter, r *http.Request, act Action, internalKey string) (res routed, ok bool, err error) {
+	switch act {
+	case ActionGetObjectTagging:
+		st, e := s.handleGetObjectTagging(ctx, w, internalKey)
+		return done(act, st), true, e
+	case ActionPutObjectTagging:
+		st, e := s.handlePutObjectTagging(ctx, w, r, internalKey)
+		out := done(act, st)
+		out.requestSize = r.ContentLength
+		return out, true, e
+	case ActionDeleteObjectTagging:
+		st, e := s.handleDeleteObjectTagging(ctx, w, internalKey)
+		return done(act, st), true, e
+	}
+	return routed{}, false, nil
 }
 
 // routePlainObjectRequest dispatches non-multipart object operations.
 // PUT splits between PutObject and CopyObject based on the
 // X-Amz-Copy-Source header.
-func (s *Server) routePlainObjectRequest(ctx context.Context, w http.ResponseWriter, r *http.Request, method, bucket, internalKey string) (string, int, int64, int64, error, bool) {
-	switch method {
-	case http.MethodPut:
-		if copySource := r.Header.Get("X-Amz-Copy-Source"); copySource != "" {
-			st, e := s.handleCopyObject(ctx, w, bucket, internalKey, copySource)
-			return "CopyObject", st, 0, 0, e, true
-		}
+func (s *Server) routePlainObjectRequest(ctx context.Context, w http.ResponseWriter, r *http.Request, act Action, bucket, internalKey string) (routed, error) {
+	switch act {
+	case ActionCopyObject:
+		st, e := s.handleCopyObject(ctx, w, r, bucket, internalKey, r.Header.Get(headerCopySource))
+		return done(act, st), e
+	case ActionPutObject:
 		st, e := s.handlePut(ctx, w, r, internalKey)
-		return "PutObject", st, r.ContentLength, 0, e, true
-	case http.MethodGet:
+		out := done(act, st)
+		out.requestSize = r.ContentLength
+		return out, e
+	case ActionGetObject:
 		st, sz, e := s.handleGet(ctx, w, r, internalKey)
-		return "GetObject", st, 0, sz, e, true
-	case http.MethodHead:
+		out := done(act, st)
+		out.responseSize = sz
+		return out, e
+	case ActionHeadObject:
 		st, e := s.handleHead(ctx, w, r, internalKey)
-		return "HeadObject", st, 0, 0, e, true
-	case http.MethodDelete:
+		return done(act, st), e
+	case ActionDeleteObject:
 		st, e := s.handleDelete(ctx, w, r, internalKey)
-		return "DeleteObject", st, 0, 0, e, true
+		return done(act, st), e
 	}
-	return "", 0, 0, 0, nil, false
+	return routed{}, nil
 }
 
 // auditEntry carries the data emitted to the audit log for a completed

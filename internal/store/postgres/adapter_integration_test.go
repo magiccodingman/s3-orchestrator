@@ -14,6 +14,7 @@
 package postgres
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -34,7 +35,7 @@ import (
 // SHARED CONTAINER FIXTURE
 // -------------------------------------------------------------------------
 
-// pgFixtureOnce and related package-level variables used by this package.
+// The lazily started Postgres testcontainer shared by the whole suite.
 var (
 	pgFixtureOnce sync.Once
 	pgFixture     *Store
@@ -46,14 +47,23 @@ var (
 // test backends, and returns a *Store whose pool every test can issue
 // transactions against. Container lifecycle relies on Ryuk for
 // teardown.
-func adapterPgStore(t *testing.T) *Store {
-	t.Helper()
+//
+// Takes testing.TB so the benchmarks share the container with the tests. The
+// pool is sized for the parallel ones: a benchmark with more goroutines than
+// connections measures the queue in front of the pool rather than the
+// contention it is trying to observe.
+func adapterPgStore(tb testing.TB) *Store {
+	tb.Helper()
 	pgFixtureOnce.Do(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
 
+		// Debian rather than alpine: musl has no locale data, so every
+		// collation degrades to byte order and a query that forgot its
+		// COLLATE "C" would pass every ordering assertion here. glibc
+		// orders text the way a real deployment does.
 		ctr, err := tcpostgres.Run(ctx,
-			"postgres:16-alpine",
+			"postgres:16",
 			tcpostgres.WithDatabase("adapter_test"),
 			tcpostgres.WithUsername("s3proxy"),
 			tcpostgres.WithPassword("s3proxy"),
@@ -83,7 +93,7 @@ func adapterPgStore(t *testing.T) *Store {
 			User:     "s3proxy",
 			Password: "s3proxy",
 			SSLMode:  "disable",
-			MaxConns: 4,
+			MaxConns: 16,
 			MinConns: 1,
 		}, nil)
 		if err != nil {
@@ -104,10 +114,10 @@ func adapterPgStore(t *testing.T) *Store {
 		pgFixture = s
 	})
 	if pgFixtureErr != nil {
-		t.Fatalf("postgres fixture: %v", pgFixtureErr)
+		tb.Fatalf("postgres fixture: %v", pgFixtureErr)
 	}
 	if pgFixture == nil {
-		t.Fatal("postgres fixture nil")
+		tb.Fatal("postgres fixture nil")
 	}
 	return pgFixture
 }
@@ -160,7 +170,7 @@ func TestPgAdapter_ClaimPending_TrueWhenInserted(t *testing.T) {
 	s := adapterPgStore(t)
 	ctx := context.Background()
 	intentID := uniqueKey(t, "intent")
-	if err := s.InsertPending(ctx, &core.PendingObject{
+	if _, err := s.InsertPendingIfFits(ctx, &core.PendingObject{
 		IntentID: intentID, ObjectKey: uniqueKey(t, "k"), BackendName: "backend-a", SizeBytes: 1,
 	}); err != nil {
 		t.Fatalf("InsertPending: %v", err)
@@ -212,17 +222,8 @@ func TestPgAdapter_InsertPending_PreservesAllFields(t *testing.T) {
 		PlaintextSize: 180,
 		ContentHash:   "abc123",
 	}
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		t.Fatalf("Begin: %v", err)
-	}
-	a := &pgTxAdapter{q: s.queries.WithTx(tx)}
-	if err := a.InsertPending(ctx, &want); err != nil {
-		_ = tx.Rollback(ctx)
+	if _, err := s.InsertPendingIfFits(ctx, &want); err != nil {
 		t.Fatalf("InsertPending: %v", err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		t.Fatalf("Commit: %v", err)
 	}
 	defer func() { _ = s.DeletePending(ctx, intentID) }()
 
@@ -251,26 +252,18 @@ func TestPgAdapter_InsertPending_PreservesAllFields(t *testing.T) {
 	}
 }
 
-// TestPgAdapter_InsertPending_NullableFieldsOmitted verifies that
-// empty optional fields land as SQL NULL when round-tripped via the
-// adapter and read back through GetStalePending.
-func TestPgAdapter_InsertPending_NullableFieldsOmitted(t *testing.T) {
+// TestPgInsertPending_NullableFieldsOmitted verifies that empty optional
+// fields land as SQL NULL and read back through GetStalePending as zero
+// values, rather than as a stored zero an encrypted-object check would
+// mistake for real metadata.
+func TestPgInsertPending_NullableFieldsOmitted(t *testing.T) {
 	s := adapterPgStore(t)
 	ctx := context.Background()
 	intentID := uniqueKey(t, "intent")
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		t.Fatalf("Begin: %v", err)
-	}
-	a := &pgTxAdapter{q: s.queries.WithTx(tx)}
-	if err := a.InsertPending(ctx, &core.PendingObject{
+	if _, err := s.InsertPendingIfFits(ctx, &core.PendingObject{
 		IntentID: intentID, ObjectKey: uniqueKey(t, "k"), BackendName: "backend-a", SizeBytes: 5,
 	}); err != nil {
-		_ = tx.Rollback(ctx)
 		t.Fatalf("InsertPending: %v", err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		t.Fatalf("Commit: %v", err)
 	}
 	defer func() { _ = s.DeletePending(ctx, intentID) }()
 
@@ -297,7 +290,7 @@ func TestPgAdapter_DeletePending_RemovesRow(t *testing.T) {
 	s := adapterPgStore(t)
 	ctx := context.Background()
 	intentID := uniqueKey(t, "intent")
-	if err := s.InsertPending(ctx, &core.PendingObject{
+	if _, err := s.InsertPendingIfFits(ctx, &core.PendingObject{
 		IntentID: intentID, ObjectKey: uniqueKey(t, "k"), BackendName: "backend-a", SizeBytes: 1,
 	}); err != nil {
 		t.Fatalf("InsertPending: %v", err)
@@ -316,45 +309,6 @@ func TestPgAdapter_DeletePending_RemovesRow(t *testing.T) {
 	})
 }
 
-// TestPgAdapter_DeletePendingByBackend_RemovesAllForBackend verifies
-// the scoped delete clears every intent for the named backend without
-// touching other backends' intents.
-func TestPgAdapter_DeletePendingByBackend_RemovesAllForBackend(t *testing.T) {
-	s := adapterPgStore(t)
-	ctx := context.Background()
-	prefix := t.Name() + "/i-"
-	for i, backend := range []string{"backend-a", "backend-a", "backend-b"} {
-		if err := s.InsertPending(ctx, &core.PendingObject{
-			IntentID:    fmt.Sprintf("%s%d", prefix, i),
-			ObjectKey:   uniqueKey(t, fmt.Sprintf("k-%d", i)),
-			BackendName: backend,
-			SizeBytes:   1,
-		}); err != nil {
-			t.Fatalf("InsertPending(%d): %v", i, err)
-		}
-	}
-	defer func() {
-		_ = s.DeletePending(ctx, prefix+"0")
-		_ = s.DeletePending(ctx, prefix+"1")
-		_ = s.DeletePending(ctx, prefix+"2")
-	}()
-
-	withPgAdapter(t, s, func(a *pgTxAdapter) {
-		if err := a.DeletePendingByBackend(ctx, "backend-a"); err != nil {
-			t.Fatalf("DeletePendingByBackend: %v", err)
-		}
-		if got, err := a.ClaimPending(ctx, prefix+"0"); err != nil || got {
-			t.Errorf("backend-a intent 0 still present: got=%v err=%v", got, err)
-		}
-		if got, err := a.ClaimPending(ctx, prefix+"1"); err != nil || got {
-			t.Errorf("backend-a intent 1 still present: got=%v err=%v", got, err)
-		}
-		if got, err := a.ClaimPending(ctx, prefix+"2"); err != nil || !got {
-			t.Errorf("backend-b intent 2 missing: got=%v err=%v", got, err)
-		}
-	})
-}
-
 // -------------------------------------------------------------------------
 // OBJECTS TX
 // -------------------------------------------------------------------------
@@ -366,10 +320,10 @@ func TestPgAdapter_GetExistingCopiesForUpdate_ReturnsAllCopies(t *testing.T) {
 	s := adapterPgStore(t)
 	ctx := context.Background()
 	key := uniqueKey(t, "k")
-	if _, err := s.RecordObject(ctx, key, "backend-a", 100, nil); err != nil {
+	if _, _, err := s.RecordObject(ctx, &core.RecordObjectRequest{Key: key, Copies: []core.ObjectCopy{{Backend: "backend-a"}}, Size: 100}); err != nil {
 		t.Fatalf("RecordObject: %v", err)
 	}
-	defer func() { _, _ = s.DeleteObject(ctx, key) }()
+	defer func() { _, _, _ = s.DeleteObject(ctx, key) }()
 	if _, _, err := s.RecordReplica(ctx, key, "backend-b", "backend-a"); err != nil {
 		t.Fatalf("RecordReplica: %v", err)
 	}
@@ -418,17 +372,17 @@ func TestPgAdapter_InsertObjectLocation_PreservesEncryptionFields(t *testing.T) 
 	s := adapterPgStore(t)
 	ctx := context.Background()
 	key := uniqueKey(t, "k")
-	enc := &core.EncryptionMeta{
+	form := &core.StoredForm{
 		Encrypted:     true,
 		EncryptionKey: []byte("packed"),
 		KeyID:         "kid-1",
 		PlaintextSize: 50,
 		ContentHash:   "abc123",
 	}
-	if _, err := s.RecordObject(ctx, key, "backend-a", 75, enc); err != nil {
+	if _, _, err := s.RecordObject(ctx, &core.RecordObjectRequest{Key: key, Copies: []core.ObjectCopy{{Backend: "backend-a"}}, Size: 75, Form: form}); err != nil {
 		t.Fatalf("RecordObject: %v", err)
 	}
-	defer func() { _, _ = s.DeleteObject(ctx, key) }()
+	defer func() { _, _, _ = s.DeleteObject(ctx, key) }()
 
 	locs, err := s.GetAllObjectLocations(ctx, key)
 	if err != nil {
@@ -453,15 +407,15 @@ func TestPgAdapter_DeleteObjectCopies_RemovesAllRows(t *testing.T) {
 	ctx := context.Background()
 	key := uniqueKey(t, "k")
 	other := uniqueKey(t, "other")
-	if _, err := s.RecordObject(ctx, key, "backend-a", 100, nil); err != nil {
+	if _, _, err := s.RecordObject(ctx, &core.RecordObjectRequest{Key: key, Copies: []core.ObjectCopy{{Backend: "backend-a"}}, Size: 100}); err != nil {
 		t.Fatalf("RecordObject(target): %v", err)
 	}
-	if _, err := s.RecordObject(ctx, other, "backend-a", 100, nil); err != nil {
+	if _, _, err := s.RecordObject(ctx, &core.RecordObjectRequest{Key: other, Copies: []core.ObjectCopy{{Backend: "backend-a"}}, Size: 100}); err != nil {
 		t.Fatalf("RecordObject(other): %v", err)
 	}
 	defer func() {
-		_, _ = s.DeleteObject(ctx, key)
-		_, _ = s.DeleteObject(ctx, other)
+		_, _, _ = s.DeleteObject(ctx, key)
+		_, _, _ = s.DeleteObject(ctx, other)
 	}()
 
 	withPgAdapter(t, s, func(a *pgTxAdapter) {
@@ -491,10 +445,10 @@ func TestPgAdapter_CheckObjectExistsOnBackend(t *testing.T) {
 	s := adapterPgStore(t)
 	ctx := context.Background()
 	key := uniqueKey(t, "k")
-	if _, err := s.RecordObject(ctx, key, "backend-a", 100, nil); err != nil {
+	if _, _, err := s.RecordObject(ctx, &core.RecordObjectRequest{Key: key, Copies: []core.ObjectCopy{{Backend: "backend-a"}}, Size: 100}); err != nil {
 		t.Fatalf("RecordObject: %v", err)
 	}
-	defer func() { _, _ = s.DeleteObject(ctx, key) }()
+	defer func() { _, _, _ = s.DeleteObject(ctx, key) }()
 
 	withPgAdapter(t, s, func(a *pgTxAdapter) {
 		got, err := a.CheckObjectExistsOnBackend(ctx, key, "backend-a")
@@ -521,17 +475,17 @@ func TestPgAdapter_LockObjectOnBackend_ReturnsRow(t *testing.T) {
 	s := adapterPgStore(t)
 	ctx := context.Background()
 	key := uniqueKey(t, "k")
-	enc := &core.EncryptionMeta{
+	form := &core.StoredForm{
 		Encrypted:     true,
 		EncryptionKey: []byte("packed"),
 		KeyID:         "kid-1",
 		PlaintextSize: 50,
 		ContentHash:   "hash",
 	}
-	if _, err := s.RecordObject(ctx, key, "backend-a", 75, enc); err != nil {
+	if _, _, err := s.RecordObject(ctx, &core.RecordObjectRequest{Key: key, Copies: []core.ObjectCopy{{Backend: "backend-a"}}, Size: 75, Form: form}); err != nil {
 		t.Fatalf("RecordObject: %v", err)
 	}
-	defer func() { _, _ = s.DeleteObject(ctx, key) }()
+	defer func() { _, _, _ = s.DeleteObject(ctx, key) }()
 
 	withPgAdapter(t, s, func(a *pgTxAdapter) {
 		loc, ok, err := a.LockObjectOnBackend(ctx, key, "backend-a")
@@ -574,13 +528,13 @@ func TestPgAdapter_DeleteObjectFromBackend_RemovesOneRow(t *testing.T) {
 	s := adapterPgStore(t)
 	ctx := context.Background()
 	key := uniqueKey(t, "k")
-	if _, err := s.RecordObject(ctx, key, "backend-a", 100, nil); err != nil {
+	if _, _, err := s.RecordObject(ctx, &core.RecordObjectRequest{Key: key, Copies: []core.ObjectCopy{{Backend: "backend-a"}}, Size: 100}); err != nil {
 		t.Fatalf("RecordObject: %v", err)
 	}
 	if _, _, err := s.RecordReplica(ctx, key, "backend-b", "backend-a"); err != nil {
 		t.Fatalf("RecordReplica: %v", err)
 	}
-	defer func() { _, _ = s.DeleteObject(ctx, key) }()
+	defer func() { _, _, _ = s.DeleteObject(ctx, key) }()
 
 	withPgAdapter(t, s, func(a *pgTxAdapter) {
 		if err := a.DeleteObjectFromBackend(ctx, key, "backend-a"); err != nil {
@@ -603,13 +557,13 @@ func TestPgAdapter_InsertObjectLocationIfNotExists_BothBranches(t *testing.T) {
 	s := adapterPgStore(t)
 	ctx := context.Background()
 	key := uniqueKey(t, "k")
-	defer func() { _, _ = s.DeleteObject(ctx, key) }()
+	defer func() { _, _, _ = s.DeleteObject(ctx, key) }()
 
-	if got, err := s.ImportObject(ctx, key, "backend-a", 50); err != nil || !got {
-		t.Fatalf("ImportObject(insert): got=%v err=%v, want (true, nil)", got, err)
+	if got, err := s.ImportObject(ctx, &core.ImportObjectRequest{Key: key, Backend: "backend-a", Size: 50}); err != nil || got != core.ImportInserted {
+		t.Fatalf("ImportObject(insert): got=%s err=%v, want inserted", got, err)
 	}
-	if got, err := s.ImportObject(ctx, key, "backend-a", 50); err != nil || got {
-		t.Errorf("ImportObject(idempotent): got=%v err=%v, want (false, nil)", got, err)
+	if got, err := s.ImportObject(ctx, &core.ImportObjectRequest{Key: key, Backend: "backend-a", Size: 50}); err != nil || got != core.ImportSkippedExisting {
+		t.Errorf("ImportObject(idempotent): got=%s err=%v, want skipped_existing", got, err)
 	}
 }
 
@@ -620,10 +574,10 @@ func TestPgAdapter_InsertReplicaConditional_InsertsWhenSourceExists(t *testing.T
 	s := adapterPgStore(t)
 	ctx := context.Background()
 	key := uniqueKey(t, "k")
-	if _, err := s.RecordObject(ctx, key, "backend-a", 100, nil); err != nil {
+	if _, _, err := s.RecordObject(ctx, &core.RecordObjectRequest{Key: key, Copies: []core.ObjectCopy{{Backend: "backend-a"}}, Size: 100}); err != nil {
 		t.Fatalf("RecordObject: %v", err)
 	}
-	defer func() { _, _ = s.DeleteObject(ctx, key) }()
+	defer func() { _, _, _ = s.DeleteObject(ctx, key) }()
 
 	if _, ok, err := s.RecordReplica(ctx, key, "backend-b", "backend-a"); err != nil || !ok {
 		t.Fatalf("RecordReplica(insert): got ok=%v err=%v, want (true, nil)", ok, err)
@@ -704,50 +658,55 @@ func TestPgAdapter_SumAndDeleteCleanupQueueRows_NoRowsReturnsZero(t *testing.T) 
 // QUOTA TX
 // -------------------------------------------------------------------------
 
-// TestPgAdapter_IncrementBackendQuota_AddsBytesUsed verifies the
-// increment updates bytes_used and returns nil error inside a tx.
-func TestPgAdapter_IncrementBackendQuota_AddsBytesUsed(t *testing.T) {
+// TestPgAdapter_AdjustQuotaStripe_MaterializesAndAccumulates asserts the first
+// adjustment creates the stripe row and later ones add to it, so nothing has to
+// seed a backend's stripes before it can be charged.
+func TestPgAdapter_AdjustQuotaStripe_MaterializesAndAccumulates(t *testing.T) {
 	s := adapterPgStore(t)
 	ctx := context.Background()
 	withPgAdapter(t, s, func(a *pgTxAdapter) {
-		if err := a.IncrementBackendQuota(ctx, "backend-a", 500); err != nil {
-			t.Fatalf("IncrementBackendQuota: %v", err)
+		before := pgBytesUsed(t, ctx, a, "backend-a")
+		if err := a.AdjustQuotaStripe(ctx, "backend-a", 4, 500); err != nil {
+			t.Fatalf("AdjustQuotaStripe: %v", err)
+		}
+		if err := a.AdjustQuotaStripe(ctx, "backend-a", 4, 250); err != nil {
+			t.Fatalf("AdjustQuotaStripe: %v", err)
+		}
+		if got := pgBytesUsed(t, ctx, a, "backend-a") - before; got != 750 {
+			t.Errorf("total moved by %d, want 750 across two charges on one stripe", got)
 		}
 	})
 }
 
-// TestPgAdapter_IncrementBackendQuota_ReturnsErrNoSpaceWhenExceeded
-// verifies the guarded UPDATE returns ErrNoSpaceAvailable when the
-// quota ceiling would be exceeded.
-func TestPgAdapter_IncrementBackendQuota_ReturnsErrNoSpaceWhenExceeded(t *testing.T) {
-	s := adapterPgStore(t)
-	ctx := context.Background()
-	if _, err := s.pool.Exec(ctx,
-		`UPDATE backend_quotas SET bytes_limit = 100 WHERE backend_name = $1`, "backend-a",
-	); err != nil {
-		t.Fatalf("setup: %v", err)
+// pgBytesUsed reads a backend's striped byte total through the adapter.
+func pgBytesUsed(t *testing.T, ctx context.Context, a *pgTxAdapter, backend string) int64 {
+	t.Helper()
+	totals, err := a.AllBackendBytesUsed(ctx)
+	if err != nil {
+		t.Fatalf("AllBackendBytesUsed: %v", err)
 	}
-	defer func() {
-		_, _ = s.pool.Exec(ctx,
-			`UPDATE backend_quotas SET bytes_limit = $1 WHERE backend_name = $2`, int64(1<<30), "backend-a",
-		)
-	}()
-
-	withPgAdapter(t, s, func(a *pgTxAdapter) {
-		err := a.IncrementBackendQuota(ctx, "backend-a", 200)
-		if !errors.Is(err, core.ErrNoSpaceAvailable) {
-			t.Errorf("got %v, want ErrNoSpaceAvailable", err)
-		}
-	})
+	return totals[backend]
 }
 
-// TestPgAdapter_DecrementBackendQuota_NoErrorOnZero verifies the
-// decrement returns nil when there's no row drift.
-func TestPgAdapter_DecrementBackendQuota_NoErrorOnZero(t *testing.T) {
+// TestPgAdapter_AdjustQuotaStripe_NegativeStripeIsHeldUnclamped asserts a
+// stripe may sit negative. A credit for an object recorded before the stripes
+// existed lands on whichever stripe its key hashes to rather than the one
+// holding the backfilled bytes, so clamping per stripe would discard the debit
+// and leave the total permanently high.
+func TestPgAdapter_AdjustQuotaStripe_NegativeStripeIsHeldUnclamped(t *testing.T) {
 	s := adapterPgStore(t)
+	ctx := context.Background()
 	withPgAdapter(t, s, func(a *pgTxAdapter) {
-		if err := a.DecrementBackendQuota(context.Background(), "backend-b", 100); err != nil {
-			t.Errorf("DecrementBackendQuota: %v", err)
+		if err := a.AdjustQuotaStripe(ctx, "backend-a", 8, 1000); err != nil {
+			t.Fatalf("seed stripe 8: %v", err)
+		}
+		before := pgBytesUsed(t, ctx, a, "backend-a")
+		if err := a.AdjustQuotaStripe(ctx, "backend-a", 9, -400); err != nil {
+			t.Fatalf("credit stripe 9: %v", err)
+		}
+		// A stripe clamped at zero would leave the total unchanged.
+		if got := pgBytesUsed(t, ctx, a, "backend-a") - before; got != -400 {
+			t.Errorf("total moved by %d, want -400 from a stripe allowed to go negative", got)
 		}
 	})
 }
@@ -762,4 +721,186 @@ func TestPgAdapter_DecrementOrphanBytes_NoErrorOnZero(t *testing.T) {
 			t.Errorf("DecrementOrphanBytes: %v", err)
 		}
 	})
+}
+
+// TestPgAdapter_GetExistingCopiesForUpdate_CarriesEncryptionState verifies the
+// Postgres locked re-read reports the same encryption state the SQLite adapter
+// does. RemoveExcessCopy's guard reads these two fields, so the engines must
+// agree or the guard protects objects on one backend and not the other.
+func TestPgAdapter_GetExistingCopiesForUpdate_CarriesEncryptionState(t *testing.T) {
+	s := adapterPgStore(t)
+	ctx := context.Background()
+	key := uniqueKey(t, "enc")
+
+	form := &core.StoredForm{
+		Encrypted:     true,
+		EncryptionKey: []byte("wrapped-dek"),
+		KeyID:         "key-1",
+		PlaintextSize: 1024,
+	}
+	if _, _, err := s.RecordObject(ctx, &core.RecordObjectRequest{Key: key, Copies: []core.ObjectCopy{{Backend: "backend-a"}}, Size: 1100, Form: form}); err != nil {
+		t.Fatalf("RecordObject encrypted: %v", err)
+	}
+	defer func() { _, _, _ = s.DeleteObject(ctx, key) }()
+	if _, _, err := s.RecordReplica(ctx, key, "backend-b", "backend-a"); err != nil {
+		t.Fatalf("RecordReplica: %v", err)
+	}
+
+	withPgAdapter(t, s, func(a *pgTxAdapter) {
+		copies, err := a.GetExistingCopiesForUpdate(ctx, key)
+		if err != nil {
+			t.Fatalf("GetExistingCopiesForUpdate: %v", err)
+		}
+		if len(copies) != 2 {
+			t.Fatalf("expected 2 copies, got %d", len(copies))
+		}
+		for _, ec := range copies {
+			if !ec.Encrypted {
+				t.Errorf("%s: Encrypted = false, want true", ec.BackendName)
+			}
+			if !ec.HasDEK {
+				t.Errorf("%s: HasDEK = false, want true (replication copies the key)", ec.BackendName)
+			}
+		}
+	})
+}
+
+// TestPgAdapter_GetExistingCopiesForUpdate_ReportsUnencryptedCopy verifies a
+// plain object reports neither flag, so the guard stays inert for copy sets
+// that were never encrypted.
+func TestPgAdapter_GetExistingCopiesForUpdate_ReportsUnencryptedCopy(t *testing.T) {
+	s := adapterPgStore(t)
+	ctx := context.Background()
+	key := uniqueKey(t, "plain")
+
+	if _, _, err := s.RecordObject(ctx, &core.RecordObjectRequest{Key: key, Copies: []core.ObjectCopy{{Backend: "backend-a"}}, Size: 100}); err != nil {
+		t.Fatalf("RecordObject: %v", err)
+	}
+	defer func() { _, _, _ = s.DeleteObject(ctx, key) }()
+
+	withPgAdapter(t, s, func(a *pgTxAdapter) {
+		copies, err := a.GetExistingCopiesForUpdate(ctx, key)
+		if err != nil {
+			t.Fatalf("GetExistingCopiesForUpdate: %v", err)
+		}
+		if len(copies) != 1 {
+			t.Fatalf("expected 1 copy, got %d", len(copies))
+		}
+		if copies[0].Encrypted || copies[0].HasDEK {
+			t.Errorf("plain copy reported Encrypted=%v HasDEK=%v, want both false",
+				copies[0].Encrypted, copies[0].HasDEK)
+		}
+	})
+}
+
+// TestPgAdapter_ImportObject_PreservesEncryptionMetadata verifies an import
+// carrying encryption metadata writes every column, not just the four the
+// adapter used to populate.
+//
+// This is the shape reconcile produces when it rediscovers an encrypted object
+// on a backend: dropping the flag records ciphertext as plaintext, and
+// replication then inherits that from the source row and spreads it.
+func TestPgAdapter_ImportObject_PreservesEncryptionMetadata(t *testing.T) {
+	s := adapterPgStore(t)
+	ctx := context.Background()
+	key := uniqueKey(t, "enc-import")
+
+	form := &core.StoredForm{
+		Encrypted:     true,
+		EncryptionKey: []byte("packed-nonce-and-wrapped-dek"),
+		KeyID:         "key-1",
+		PlaintextSize: 1024,
+		ContentHash:   "abc123",
+	}
+	inserted, err := s.ImportObject(ctx, &core.ImportObjectRequest{Key: key, Backend: "backend-a", Size: 1100, Form: form})
+	if err != nil {
+		t.Fatalf("ImportObject: %v", err)
+	}
+	defer func() { _, _, _ = s.DeleteObject(ctx, key) }()
+	if inserted != core.ImportInserted {
+		t.Fatalf("ImportObject outcome = %s, want inserted", inserted)
+	}
+
+	locs, err := s.GetAllObjectLocations(ctx, key)
+	if err != nil {
+		t.Fatalf("GetAllObjectLocations: %v", err)
+	}
+	if len(locs) != 1 {
+		t.Fatalf("expected 1 copy, got %d", len(locs))
+	}
+	got := locs[0]
+
+	if !got.Encrypted {
+		t.Error("Encrypted = false, want true")
+	}
+	if !bytes.Equal(got.EncryptionKey, form.EncryptionKey) {
+		t.Errorf("EncryptionKey = %q, want %q", got.EncryptionKey, form.EncryptionKey)
+	}
+	if got.KeyID != form.KeyID {
+		t.Errorf("KeyID = %q, want %q", got.KeyID, form.KeyID)
+	}
+	if got.PlaintextSize != form.PlaintextSize {
+		t.Errorf("PlaintextSize = %d, want %d", got.PlaintextSize, form.PlaintextSize)
+	}
+	if got.ContentHash != form.ContentHash {
+		t.Errorf("ContentHash = %q, want %q", got.ContentHash, form.ContentHash)
+	}
+}
+
+// TestPgAdapter_ImportObject_KeylessEncryptedRow verifies the exact row
+// reconcile writes for an envelope whose key is gone: encrypted, but with no
+// key to read it. Recording that as plaintext is what publishes ciphertext to
+// clients as though it were the object.
+func TestPgAdapter_ImportObject_KeylessEncryptedRow(t *testing.T) {
+	s := adapterPgStore(t)
+	ctx := context.Background()
+	key := uniqueKey(t, "unreadable")
+
+	inserted, err := s.ImportObject(ctx, &core.ImportObjectRequest{
+		Key: key, Backend: "backend-a", Size: 508, Form: &core.StoredForm{Encrypted: true},
+	})
+	if err != nil {
+		t.Fatalf("ImportObject: %v", err)
+	}
+	defer func() { _, _, _ = s.DeleteObject(ctx, key) }()
+	if inserted != core.ImportInserted {
+		t.Fatalf("ImportObject outcome = %s, want inserted", inserted)
+	}
+
+	locs, err := s.GetAllObjectLocations(ctx, key)
+	if err != nil {
+		t.Fatalf("GetAllObjectLocations: %v", err)
+	}
+	if len(locs) != 1 {
+		t.Fatalf("expected 1 copy, got %d", len(locs))
+	}
+	if !locs[0].Encrypted {
+		t.Error("Encrypted = false, want true - an envelope must never be recorded as plaintext")
+	}
+	if len(locs[0].EncryptionKey) != 0 {
+		t.Errorf("EncryptionKey = %q, want empty", locs[0].EncryptionKey)
+	}
+}
+
+// TestPgAdapter_ImportObject_PlaintextStaysPlaintext verifies an import with no
+// encryption metadata is unaffected, so the fix does not start flagging
+// ordinary objects.
+func TestPgAdapter_ImportObject_PlaintextStaysPlaintext(t *testing.T) {
+	s := adapterPgStore(t)
+	ctx := context.Background()
+	key := uniqueKey(t, "plain")
+
+	if _, err := s.ImportObject(ctx, &core.ImportObjectRequest{Key: key, Backend: "backend-a", Size: 100}); err != nil {
+		t.Fatalf("ImportObject: %v", err)
+	}
+	defer func() { _, _, _ = s.DeleteObject(ctx, key) }()
+
+	locs, err := s.GetAllObjectLocations(ctx, key)
+	if err != nil {
+		t.Fatalf("GetAllObjectLocations: %v", err)
+	}
+	if locs[0].Encrypted || len(locs[0].EncryptionKey) != 0 {
+		t.Errorf("plain import recorded Encrypted=%v key=%q, want false/empty",
+			locs[0].Encrypted, locs[0].EncryptionKey)
+	}
 }

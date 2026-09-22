@@ -29,6 +29,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	smithymiddleware "github.com/aws/smithy-go/middleware"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
+
 	"github.com/afreidah/s3-orchestrator/internal/config"
 	"github.com/afreidah/s3-orchestrator/internal/observe"
 	"github.com/afreidah/s3-orchestrator/internal/observe/telemetry"
@@ -90,20 +91,26 @@ type S3Backend struct {
 // Each backend gets its own transport so connection pools are isolated and
 // sized for the proxy's concurrent workload (rebalancer, replicator, parallel
 // PUTs/GETs). IdleConnTimeout bounds DNS staleness: idle connections are
-// recycled within 90 s, forcing a fresh DNS resolution on the next dial.
-func newBackendTransport() *http.Transport {
+// recycled within 60 s, forcing a fresh DNS resolution on the next dial.
+//
+// The pool sizes, the response-header timeout and whether HTTP/2 is attempted
+// come from the backend's own config, defaulted by the config layer, so one
+// backend can be tuned or dropped to HTTP/1.1 without touching the others. The
+// dial and TLS-handshake timeouts stay fixed: they bound how long a broken
+// endpoint can hold a request, which is not a per-deployment judgement.
+func newBackendTransport(httpCfg config.BackendHTTPConfig) *http.Transport {
 	return &http.Transport{
 		DialContext: (&net.Dialer{
 			Timeout:   10 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
-		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   100,
-		MaxConnsPerHost:       200,
+		MaxIdleConns:          httpCfg.MaxIdleConns,
+		MaxIdleConnsPerHost:   httpCfg.MaxIdleConnsPerHost,
+		MaxConnsPerHost:       httpCfg.MaxConnsPerHost,
 		IdleConnTimeout:       60 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: 30 * time.Second,
-		ForceAttemptHTTP2:      true,
+		ResponseHeaderTimeout: httpCfg.ResponseHeaderTimeout,
+		ForceAttemptHTTP2:     httpCfg.HTTP2Enabled(),
 	}
 }
 
@@ -117,13 +124,12 @@ func NewS3Backend(ctx context.Context, cfg *config.BackendConfig) (*S3Backend, e
 	if err != nil {
 		return nil, fmt.Errorf("resolve credentials for backend %q: %w", cfg.Name, err)
 	}
-	// --- Create S3 client with custom endpoint and transport ---
 	opts := s3.Options{
 		Region:       cfg.Region,
 		Credentials:  creds,
 		BaseEndpoint: aws.String(cfg.Endpoint),
 		UsePathStyle: cfg.ForcePathStyle,
-		HTTPClient:   &http.Client{Transport: newBackendTransport()},
+		HTTPClient:   &http.Client{Transport: newBackendTransport(cfg.HTTP)},
 	}
 	if cfg.DisableChecksum {
 		opts.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
@@ -160,6 +166,37 @@ func NewS3Backend(ctx context.Context, cfg *config.BackendConfig) (*S3Backend, e
 // CRUD OPERATIONS
 // -------------------------------------------------------------------------
 
+// measuredStream hides a stream's concrete type from the AWS SDK so the
+// Content-Length this package supplies survives request building.
+//
+// smithy-go's Request.Build type-switches on *io.PipeReader and overwrites
+// ContentLength with -1 for it (transport/http/request.go). The upload then
+// goes out chunked with no Content-Length header, while SigV4 has already
+// signed content-length into SignedHeaders, so the request cannot validate:
+// backends answer 411 if they require the header and 403 SignatureDoesNotMatch
+// if they merely check the signature. Every PutObject call site here knows the
+// exact size and passes it, so that conservatism is wrong for this code.
+type measuredStream struct{ r io.Reader }
+
+// Read proxies to the wrapped stream. Deliberately the only method: gaining an
+// io.Seeker or io.Closer here would change how the SDK treats the body.
+func (s measuredStream) Read(p []byte) (int, error) { return s.r.Read(p) }
+
+// withKnownLength wraps a stream whose length the caller knows but the SDK
+// would otherwise discard.
+//
+// Seekable bodies pass through untouched. Hiding an io.Seeker would cost the
+// SDK its ability to rewind and retry, which the single-object write path
+// relies on for failover. Everything else is wrapped rather than only
+// *io.PipeReader, so the behaviour does not depend on which concrete types the
+// SDK happens to special-case in a given release.
+func withKnownLength(body io.Reader) io.Reader {
+	if _, ok := body.(io.ReadSeeker); ok {
+		return body
+	}
+	return measuredStream{r: body}
+}
+
 // preparePutBody resolves the body and request options for a single PutObject
 // call, plus a cleanup the caller must defer (always safe to call). In
 // unsigned-payload mode (default) it tags the request so the SDK skips the
@@ -176,7 +213,7 @@ func (b *S3Backend) preparePutBody(body io.Reader, size int64) (io.Reader, []fun
 		// Nothing to release on the non-materialized paths.
 	}
 	if b.unsignedPayload {
-		return body, []func(*s3.Options){withUnsignedPayload}, noop, nil
+		return withKnownLength(body), []func(*s3.Options){withUnsignedPayload}, noop, nil
 	}
 	if _, ok := body.(io.ReadSeeker); ok {
 		return body, nil, noop, nil
@@ -401,9 +438,14 @@ func (b *S3Backend) CopyObject(ctx context.Context, srcKey, dstKey, contentType 
 // -------------------------------------------------------------------------
 
 // ListedObject holds metadata for a single object returned by S3 ListObjects.
+// LastModified is what the backend reports for the object, and is zero when
+// it reports nothing. Reconcile records it as the write time of a discovered
+// object, which is the only place that time can come from; a zero value means
+// the import has to stamp its own.
 type ListedObject struct {
-	Key       string
-	SizeBytes int64
+	Key          string
+	SizeBytes    int64
+	LastModified time.Time
 }
 
 // ListObjects iterates all objects in the backend bucket with the given
@@ -470,7 +512,11 @@ func convertListPage(page *s3.ListObjectsV2Output) []ListedObject {
 		if obj.Size != nil {
 			size = *obj.Size
 		}
-		objects[i] = ListedObject{Key: key, SizeBytes: size}
+		var lastModified time.Time
+		if obj.LastModified != nil {
+			lastModified = *obj.LastModified
+		}
+		objects[i] = ListedObject{Key: key, SizeBytes: size, LastModified: lastModified}
 	}
 	return objects
 }

@@ -22,6 +22,10 @@ import (
 	"github.com/afreidah/s3-orchestrator/internal/store/core"
 )
 
+// -------------------------------------------------------------------------
+// TYPES
+// -------------------------------------------------------------------------
+
 // dlqErrStore is a core.CleanupStore whose DLQ methods return seeded errors so
 // the handler's 500 branches can be exercised without a database. Only the
 // methods the DLQ handlers call are overridden; the embedded nil satisfies the
@@ -30,6 +34,10 @@ type dlqErrStore struct {
 	core.CleanupStore
 	depthErr, listErr, requeueErr error
 }
+
+// -------------------------------------------------------------------------
+// PUBLIC API
+// -------------------------------------------------------------------------
 
 func (s dlqErrStore) CleanupDLQDepth(context.Context) (int64, error) { return 0, s.depthErr }
 func (s dlqErrStore) ListCleanupDLQ(context.Context, string, int) ([]core.CleanupDLQItem, error) {
@@ -53,7 +61,7 @@ func TestHandleCleanupDLQ_ListReturnsTypedShape(t *testing.T) {
 	h.Register(mux)
 
 	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, doAuth(http.MethodGet, "/admin/api/cleanup-dlq?backend=b2&limit=25", ""))
+	mux.ServeHTTP(w, doAuth(t, http.MethodGet, "/admin/api/cleanup-dlq?backend=b2&limit=25", ""))
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
 	}
@@ -77,7 +85,7 @@ func TestHandleCleanupDLQRequeue_ReturnsCount(t *testing.T) {
 	h.Register(mux)
 
 	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, doAuth(http.MethodPost, "/admin/api/cleanup-dlq/requeue?backend=b2", ""))
+	mux.ServeHTTP(w, doAuth(t, http.MethodPost, "/admin/api/cleanup-dlq/requeue?backend=b2", ""))
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
 	}

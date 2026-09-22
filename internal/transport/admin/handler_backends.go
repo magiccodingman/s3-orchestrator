@@ -28,11 +28,19 @@ import (
 	"github.com/afreidah/s3-orchestrator/internal/transport/httputil"
 )
 
+// -------------------------------------------------------------------------
+// CONSTANTS
+// -------------------------------------------------------------------------
+
 // removeConfirmTTL is how long a purge confirmation token is valid.
 const (
 	removeConfirmTTL        = 60 * time.Second
 	errDrainOperationFailed = "drain operation failed"
 )
+
+// -------------------------------------------------------------------------
+// INTERNALS
+// -------------------------------------------------------------------------
 
 // handleStartDrain begins draining a backend.
 func (h *Handler) handleStartDrain(w http.ResponseWriter, r *http.Request) {
@@ -42,7 +50,10 @@ func (h *Handler) handleStartDrain(w http.ResponseWriter, r *http.Request) {
 		httputil.WriteJSONError(w, http.StatusBadRequest, errDrainOperationFailed)
 		return
 	}
-	httputil.WriteJSON(w, http.StatusAccepted, map[string]string{"status": "drain started", "backend": name})
+	httputil.WriteJSON(w, http.StatusAccepted, adminapi.BackendOperationResponse{
+		Status:  "drain started",
+		Backend: name,
+	})
 }
 
 // handleDrainProgress returns the current state of a drain operation.
@@ -54,7 +65,13 @@ func (h *Handler) handleDrainProgress(w http.ResponseWriter, r *http.Request) {
 		httputil.WriteJSONError(w, http.StatusInternalServerError, errDrainOperationFailed)
 		return
 	}
-	httputil.WriteJSON(w, http.StatusOK, progress)
+	httputil.WriteJSON(w, http.StatusOK, adminapi.DrainProgressResponse{
+		Active:           progress.Active,
+		ObjectsRemaining: progress.ObjectsRemaining,
+		BytesRemaining:   progress.BytesRemaining,
+		ObjectsMoved:     progress.ObjectsMoved,
+		Error:            progress.Error,
+	})
 }
 
 // handleCancelDrain cancels an active drain operation.
@@ -65,7 +82,10 @@ func (h *Handler) handleCancelDrain(w http.ResponseWriter, r *http.Request) {
 		httputil.WriteJSONError(w, http.StatusBadRequest, errDrainOperationFailed)
 		return
 	}
-	httputil.WriteJSON(w, http.StatusOK, map[string]string{"status": "drain cancelled", "backend": name})
+	httputil.WriteJSON(w, http.StatusOK, adminapi.BackendOperationResponse{
+		Status:  "drain cancelled",
+		Backend: name,
+	})
 }
 
 // handleRemoveBackend deletes all DB records for a backend. When purge=true,
@@ -84,7 +104,10 @@ func (h *Handler) handleRemoveBackend(w http.ResponseWriter, r *http.Request) {
 			httputil.WriteJSONError(w, http.StatusBadRequest, "remove failed")
 			return
 		}
-		httputil.WriteJSON(w, http.StatusOK, map[string]string{"status": "backend removed", "backend": name})
+		httputil.WriteJSON(w, http.StatusOK, adminapi.BackendOperationResponse{
+			Status:  "backend removed",
+			Backend: name,
+		})
 		return
 	}
 
@@ -103,7 +126,10 @@ func (h *Handler) handleRemoveBackend(w http.ResponseWriter, r *http.Request) {
 			httputil.WriteJSONError(w, http.StatusBadRequest, "purge failed")
 			return
 		}
-		httputil.WriteJSON(w, http.StatusOK, map[string]string{"status": "backend purged", "backend": name})
+		httputil.WriteJSON(w, http.StatusOK, adminapi.BackendOperationResponse{
+			Status:  "backend purged",
+			Backend: name,
+		})
 		return
 	}
 
@@ -155,7 +181,7 @@ func (h *Handler) streamRemovePurge(w http.ResponseWriter, r *http.Request, name
 func (h *Handler) generateRemoveToken(name string) string {
 	expiry := time.Now().Add(removeConfirmTTL).Unix()
 	payload := fmt.Sprintf("purge|%s|%d", name, expiry)
-	mac := hmac.New(sha256.New, []byte(h.token))
+	mac := hmac.New(sha256.New, h.confirmKey)
 	mac.Write([]byte(payload))
 	sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 	return base64.RawURLEncoding.EncodeToString([]byte(payload)) + "." + sig
@@ -176,7 +202,7 @@ func (h *Handler) validRemoveToken(token, expectedName string) bool {
 		return false
 	}
 
-	mac := hmac.New(sha256.New, []byte(h.token))
+	mac := hmac.New(sha256.New, h.confirmKey)
 	mac.Write(payloadBytes)
 	if !hmac.Equal(mac.Sum(nil), sig) {
 		return false

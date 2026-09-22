@@ -5,12 +5,26 @@ deploy/nomad/local/config.yaml
 cover.out
 coverage.out
 integration-coverage.out
+int-results
+integration-results
 dist/
 *.deb
 packaging/changelog.gz
 loadtest/s3-loadtest
 loadtest/loadtest
 perf-results/
+
+# What Terraform leaves next to any configuration it is pointed at, and the
+# coverage profile the provider's own test job writes. The provider directory
+# carries its own copy of the first part, because it is published on its own.
+provider-coverage.out
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+
+# Keypair the local demo mints for the perf suite. Minted per run, never shared.
+deploy/nomad/local/.perf-credentials.env
 *.db
 *.db-shm
 *.db-wal
@@ -18,3 +32,8 @@ web/public/
 web/content/godoc/
 !web/content/godoc/_index.md
 tags
+
+# Editor swap and backup files
+*.swp
+*.swo
+*~

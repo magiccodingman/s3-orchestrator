@@ -13,8 +13,11 @@ package tui
 import (
 	"context"
 	"errors"
+	"io"
 	"strings"
 	"testing"
+
+	"github.com/afreidah/s3-orchestrator/internal/cli/adminclient"
 
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/table"
@@ -23,14 +26,30 @@ import (
 	"github.com/afreidah/s3-orchestrator/internal/transport/admin/adminapi"
 )
 
+// -------------------------------------------------------------------------
+// TYPES
+// -------------------------------------------------------------------------
+
 // errLister always fails, for the load error paths.
 type errLister struct{}
+
+// -------------------------------------------------------------------------
+// PUBLIC API
+// -------------------------------------------------------------------------
 
 func (errLister) ListObjects(_ context.Context, _, _ string) (*adminapi.ObjectListResponse, error) {
 	return nil, errors.New("nope")
 }
 
 func (errLister) GetObjectLocations(_ context.Context, _ string) (*adminapi.ObjectLocationsResponse, error) {
+	return nil, errors.New("nope")
+}
+
+func (errLister) GetObjectTags(_ context.Context, _ string) (*adminapi.ObjectTagsResponse, error) {
+	return nil, errors.New("nope")
+}
+
+func (errLister) ScrubKey(_ context.Context, _ string) (*adminapi.ScrubKeyResponse, error) {
 	return nil, errors.New("nope")
 }
 
@@ -42,8 +61,73 @@ func (errLister) GetLogs(_ context.Context, _ string) (*adminapi.LogsResponse, e
 	return nil, errors.New("nope")
 }
 
-func (errLister) ReconcileUsage(_ context.Context) error { return errors.New("nope") }
-func (errLister) FlushCache(_ context.Context) error      { return errors.New("nope") }
+func (errLister) GetReplicationStatus(_ context.Context) (*adminapi.ReplicationStatusResponse, error) {
+	return nil, errors.New("nope")
+}
+
+func (errLister) GetWorkers(_ context.Context) (*adminapi.WorkersResponse, error) {
+	return nil, errors.New("nope")
+}
+
+func (errLister) GetCleanupQueue(_ context.Context) (*adminapi.CleanupQueueResponse, error) {
+	return nil, errors.New("nope")
+}
+
+func (errLister) GetCleanupDLQ(_ context.Context) (*adminapi.CleanupDLQResponse, error) {
+	return nil, errors.New("nope")
+}
+
+func (errLister) GetCacheStats(_ context.Context) (*adminapi.CacheStatsResponse, error) {
+	return nil, errors.New("nope")
+}
+
+func (errLister) GetProvisioning(_ context.Context) (*adminapi.ProvisioningResponse, error) {
+	return nil, errors.New("nope")
+}
+
+func (errLister) RequeueCleanupDLQ(_ context.Context, _ string) (*adminapi.CleanupDLQRequeueResponse, error) {
+	return nil, errors.New("nope")
+}
+
+func (errLister) RunOp(_ context.Context, _ *opsAction, _ opsRequest) (adminclient.EventStream, error) {
+	return nil, errors.New("nope")
+}
+
+func (errLister) ListObjectsFlat(_ context.Context, _, _ string) (*adminapi.ObjectListResponse, error) {
+	return nil, errors.New("nope")
+}
+
+func (errLister) DownloadObject(_ context.Context, _ string) (io.ReadCloser, int64, error) {
+	return nil, 0, errors.New("nope")
+}
+
+func (errLister) UploadObject(_ context.Context, _ string, _ io.Reader, _ int64) error {
+	return errors.New("nope")
+}
+
+func (errLister) DeleteObject(_ context.Context, _ string) (*adminapi.ObjectDeleteResponse, error) {
+	return nil, errors.New("nope")
+}
+
+func (errLister) DeletePrefix(_ context.Context, _ string) (*adminapi.ObjectDeleteResponse, error) {
+	return nil, errors.New("nope")
+}
+
+func (errLister) StartDrain(_ context.Context, _ string) (*adminapi.BackendOperationResponse, error) {
+	return nil, errors.New("nope")
+}
+
+func (errLister) DrainProgress(_ context.Context, _ string) (*adminapi.DrainProgressResponse, error) {
+	return nil, errors.New("nope")
+}
+
+func (errLister) CancelDrain(_ context.Context, _ string) (*adminapi.BackendOperationResponse, error) {
+	return nil, errors.New("nope")
+}
+
+func (errLister) ReconcileBackend(_ context.Context, _ string) (*adminapi.ReconcileResponse, error) {
+	return nil, errors.New("nope")
+}
 
 // modelWith builds a model seeded with entries and a table synced to them.
 func modelWith(entries []entry, prefix string, client adminClient) *model {
@@ -211,26 +295,60 @@ func TestHandleKey_TableDelegationAndUnknownMsg(t *testing.T) {
 }
 
 func TestResolveTarget(t *testing.T) {
+	// The resolver falls back to these, so a shell holding a real keypair
+	// would satisfy the half-keypair case below and hide the check.
+	t.Setenv("S3O_ACCESS_KEY_ID", "")
+	t.Setenv("S3O_SECRET_ACCESS_KEY", "")
+
 	// flags win and the address gets an http prefix
-	addr, tok, err := resolveTarget([]string{"-addr", "host:9000", "-token", "tok"})
-	if err != nil || addr != "http://host:9000" || tok != "tok" {
-		t.Fatalf("flags: addr=%q tok=%q err=%v", addr, tok, err)
+	got, err := resolveTarget([]string{"-addr", "host:9000", "-access-key", "AK", "-secret-key", "SK"})
+	if err != nil || got.baseAddr != "http://host:9000" {
+		t.Fatalf("flags: addr=%q err=%v", got.baseAddr, err)
+	}
+	if !got.signs() || got.accessKeyID != "AK" || got.secretKey != "SK" {
+		t.Fatalf("keypair: %+v", got)
 	}
 
 	// an explicit scheme is left untouched
-	if addr, _, _ := resolveTarget([]string{"-addr", "https://x", "-token", "t"}); addr != "https://x" {
-		t.Errorf("scheme passthrough: addr=%q", addr)
+	if got, _ := resolveTarget([]string{
+		"-addr", "https://x", "-access-key", "AK", "-secret-key", "SK",
+	}); got.baseAddr != "https://x" {
+		t.Errorf("scheme passthrough: addr=%q", got.baseAddr)
+	}
+
+	// half a keypair proves nothing and cannot sign
+	if got, _ := resolveTarget([]string{"-addr", "host:9000", "-access-key", "AK"}); got.signs() {
+		t.Error("a target holding only an access key reported that it signs")
 	}
 
 	// an unknown flag surfaces the parse error
-	if _, _, err := resolveTarget([]string{"-nope"}); err == nil {
+	if _, err := resolveTarget([]string{"-nope"}); err == nil {
 		t.Error("bad flag: expected error")
 	}
 
 	// with no flags/env and an unreadable config, resolution fails
 	t.Setenv("S3O_ADMIN_ADDR", "")
-	t.Setenv("S3O_ADMIN_TOKEN", "")
-	if _, _, err := resolveTarget([]string{"-config", "/no/such/file.yaml"}); err == nil {
+	if _, err := resolveTarget([]string{"-config", "/no/such/file.yaml"}); err == nil {
 		t.Error("missing target: expected error")
+	}
+}
+
+// TestResolveTarget_KeypairNeedsNoConfig pins that a keypair and an address
+// given outright resolve without a config file, which is the documented setup
+// for a binary targeting a remote instance from a machine holding no server
+// config.
+func TestResolveTarget_KeypairNeedsNoConfig(t *testing.T) {
+	t.Setenv("S3O_ADMIN_ADDR", "")
+
+	got, err := resolveTarget([]string{
+		"-config", "/no/such/file.yaml",
+		"-addr", "host:9000",
+		"-access-key", "AK", "-secret-key", "SK",
+	})
+	if err != nil {
+		t.Fatalf("a keypair still required the config file: %v", err)
+	}
+	if !got.signs() || got.baseAddr != "http://host:9000" {
+		t.Errorf("target = %+v", got)
 	}
 }

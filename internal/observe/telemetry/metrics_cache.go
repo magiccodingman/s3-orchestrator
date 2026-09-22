@@ -14,10 +14,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
-// CacheHitsTotal and related package-level variables used by this package.
+// Object data cache hit and miss metrics.
 var (
-	// --- Cache metrics ---
-
 	// CacheHitsTotal counts object data cache hits.
 	CacheHitsTotal = promauto.NewCounter(
 		prometheus.CounterOpts{
@@ -80,7 +78,16 @@ var (
 		},
 	)
 
-	// --- Redis metrics ---
+	// HeadServedFromMetadataTotal counts HEAD responses answered from the
+	// object ledger, each one a backend round trip and a metered API call
+	// that did not happen. Rises as pre-identity objects are read once and
+	// learn their identity.
+	HeadServedFromMetadataTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "s3o_head_served_from_metadata_total",
+			Help: "HEAD responses answered from stored metadata without a backend request",
+		},
+	)
 
 	// RedisOperationsTotal counts Redis counter backend operations.
 	RedisOperationsTotal = promauto.NewCounterVec(
@@ -99,5 +106,4 @@ var (
 			Help: "Whether Redis counter backend is in local fallback mode",
 		},
 	)
-
 )

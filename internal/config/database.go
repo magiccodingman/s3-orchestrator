@@ -14,6 +14,7 @@
 package config
 
 import (
+	"cmp"
 	"fmt"
 	"net"
 	"net/url"
@@ -21,12 +22,16 @@ import (
 	"time"
 )
 
+// -------------------------------------------------------------------------
+// TYPES
+// -------------------------------------------------------------------------
+
 // DatabaseConfig holds metadata store connection settings. The Driver field
 // selects between "sqlite" (embedded, zero-dependency default) and "postgres"
 // (required for multi-instance deployments).
 type DatabaseConfig struct {
-	Driver          string        `yaml:"driver"`            // "sqlite" or "postgres" (default: inferred from config)
-	Path            string        `yaml:"path"`              // SQLite file path (default: "s3-orchestrator.db")
+	Driver          string        `yaml:"driver"` // "sqlite" or "postgres" (default: inferred from config)
+	Path            string        `yaml:"path"`   // SQLite file path (default: "s3-orchestrator.db")
 	Host            string        `yaml:"host"`
 	Port            int           `yaml:"port"`
 	Database        string        `yaml:"database"`
@@ -34,7 +39,7 @@ type DatabaseConfig struct {
 	Password        string        `yaml:"password"` //nolint:gosec // G117: config struct field, not a hardcoded credential
 	SSLMode         string        `yaml:"ssl_mode"`
 	MaxConns        int32         `yaml:"max_conns"`         // Max pool connections (default: 50; size to 2-3x max concurrent requests)
-	MinConns        int32         `yaml:"min_conns"`         // Min idle connections (default: 5)
+	MinConns        int32         `yaml:"min_conns"`         // Min idle connections (default: 10)
 	MaxConnLifetime time.Duration `yaml:"max_conn_lifetime"` // Max connection age (default: 5m)
 }
 
@@ -50,6 +55,10 @@ func (c *DatabaseConfig) ConnectionString() string {
 	}
 	return u.String()
 }
+
+// -------------------------------------------------------------------------
+// INTERNALS
+// -------------------------------------------------------------------------
 
 // setDefaultsAndValidate sets defaults and validate.
 func (d *DatabaseConfig) setDefaultsAndValidate() []error {
@@ -77,9 +86,7 @@ func (d *DatabaseConfig) setDefaultsAndValidate() []error {
 // deployments only need a writable path; everything else has sane
 // defaults.
 func (d *DatabaseConfig) validateSQLite() []error {
-	if d.Path == "" {
-		d.Path = "s3-orchestrator.db"
-	}
+	d.Path = cmp.Or(d.Path, "s3-orchestrator.db")
 	return nil
 }
 
@@ -99,21 +106,11 @@ func (d *DatabaseConfig) validatePostgres() []error {
 	if d.User == "" {
 		errs = append(errs, fmt.Errorf("database.user is required"))
 	}
-	if d.Port == 0 {
-		d.Port = 5432
-	}
-	if d.SSLMode == "" {
-		d.SSLMode = "require"
-	}
-	if d.MaxConns == 0 {
-		d.MaxConns = 50
-	}
-	if d.MinConns == 0 {
-		d.MinConns = 10
-	}
-	if d.MaxConnLifetime == 0 {
-		d.MaxConnLifetime = 5 * time.Minute
-	}
+	d.Port = cmp.Or(d.Port, 5432)
+	d.SSLMode = cmp.Or(d.SSLMode, "require")
+	d.MaxConns = cmp.Or(d.MaxConns, 50)
+	d.MinConns = cmp.Or(d.MinConns, 10)
+	d.MaxConnLifetime = cmp.Or(d.MaxConnLifetime, 5*time.Minute)
 
 	if d.MinConns > d.MaxConns {
 		errs = append(errs, fmt.Errorf("database.min_conns (%d) cannot exceed max_conns (%d)", d.MinConns, d.MaxConns))

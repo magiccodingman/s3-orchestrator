@@ -6,7 +6,8 @@
 // Defines ServerConfig - the HTTP listener block - plus the TLS, admin
 // API, request-id, admission control, and timeout sub-blocks. Carries
 // the listen address, optional Unix socket, hard admission cap, load-
-// shedding threshold, and read/write/header timeouts. Validators enforce
+// shedding threshold, request-header limits, and read/write/header
+// timeouts. Validators enforce
 // that admission limits are non-zero when configured and that the TLS
 // cert and key are both present (or both absent) so partial TLS
 // configuration cannot start.
@@ -15,7 +16,10 @@
 package config
 
 import (
+	"cmp"
 	"fmt"
+	"net/http"
+	"os"
 	"time"
 )
 
@@ -25,21 +29,24 @@ import (
 
 // ServerConfig holds HTTP server settings.
 type ServerConfig struct {
-	ListenAddr           string        `yaml:"listen_addr"`
-	LogLevel             string        `yaml:"log_level"`                // Log level: debug, info, warn, error (default: info)
-	MaxObjectSize        int64         `yaml:"max_object_size"`          // Max upload size in bytes (default: 5GB)
-	MaxConcurrentRequests int          `yaml:"max_concurrent_requests"`  // Max concurrent S3 requests (default: 1000)
-	MaxConcurrentReads    int          `yaml:"max_concurrent_reads"`     // Max concurrent read requests (0 = use global limit)
-	MaxConcurrentWrites   int          `yaml:"max_concurrent_writes"`    // Max concurrent write requests (0 = use global limit)
-	LoadShedThreshold     float64      `yaml:"load_shed_threshold"`      // Active shedding threshold (0.0-1.0, 0 = disabled)
-	AdmissionWait         time.Duration `yaml:"admission_wait"`           // Brief wait before rejection (0 = instant reject)
-	BackendTimeout       time.Duration `yaml:"backend_timeout"`          // Per-operation timeout for backend S3 calls (default: 30s)
-	ReadHeaderTimeout    time.Duration `yaml:"read_header_timeout"`      // Max time to read request headers (default: 10s)
-	ReadTimeout          time.Duration `yaml:"read_timeout"`             // Max time to read entire request including body (default: 5m)
-	WriteTimeout         time.Duration `yaml:"write_timeout"`            // Max time to write response (default: 5m)
-	IdleTimeout          time.Duration `yaml:"idle_timeout"`             // Max time to wait for next request on keep-alive (default: 120s)
-	ShutdownDelay        time.Duration `yaml:"shutdown_delay"`           // Delay before HTTP drain on SIGTERM for LB deregistration (default: 0)
-	TLS                  TLSConfig     `yaml:"tls"`
+	ListenAddr            string        `yaml:"listen_addr"`
+	LogLevel              string        `yaml:"log_level"`               // Log level: debug, info, warn, error (default: info)
+	MaxObjectSize         int64         `yaml:"max_object_size"`         // Max upload size in bytes (default: 5GB)
+	SpillDir              string        `yaml:"spill_dir"`               // Directory for large-payload spill files (default: OS temp dir)
+	MaxConcurrentRequests int           `yaml:"max_concurrent_requests"` // Max concurrent S3 requests (default: 1000)
+	MaxConcurrentReads    int           `yaml:"max_concurrent_reads"`    // Max concurrent read requests (0 = use global limit)
+	MaxConcurrentWrites   int           `yaml:"max_concurrent_writes"`   // Max concurrent write requests (0 = use global limit)
+	MaxHeaderBytes        int           `yaml:"max_header_bytes"`        // Max total request header size in bytes (default: 1MB)
+	MaxHeaderValueCount   int           `yaml:"max_header_value_count"`  // Max number of header values per request (default: 500)
+	LoadShedThreshold     float64       `yaml:"load_shed_threshold"`     // Active shedding threshold (0.0-1.0, 0 = disabled)
+	AdmissionWait         time.Duration `yaml:"admission_wait"`          // Brief wait before rejection (0 = instant reject)
+	BackendTimeout        time.Duration `yaml:"backend_timeout"`         // Per-operation timeout for backend S3 calls (default: 30s)
+	ReadHeaderTimeout     time.Duration `yaml:"read_header_timeout"`     // Max time to read request headers (default: 10s)
+	ReadTimeout           time.Duration `yaml:"read_timeout"`            // Max time to read entire request including body (default: 5m)
+	WriteTimeout          time.Duration `yaml:"write_timeout"`           // Max time to write response (default: 5m)
+	IdleTimeout           time.Duration `yaml:"idle_timeout"`            // Max time to wait for next request on keep-alive (default: 120s)
+	ShutdownDelay         time.Duration `yaml:"shutdown_delay"`          // Delay before HTTP drain on SIGTERM for LB deregistration (default: 0)
+	TLS                   TLSConfig     `yaml:"tls"`
 }
 
 // TLSConfig holds optional TLS settings for the HTTP server. When CertFile
@@ -61,6 +68,7 @@ func (s *ServerConfig) setDefaultsAndValidate() []error {
 	var errs []error
 	errs = append(errs, s.validateBasics()...)
 	errs = append(errs, s.validateConcurrency()...)
+	errs = append(errs, s.validateHeaderLimits()...)
 	s.applyTimeoutDefaults()
 	errs = append(errs, s.validateTimeouts()...)
 	errs = append(errs, s.validateTLS()...)
@@ -74,18 +82,33 @@ func (s *ServerConfig) validateBasics() []error {
 	if s.ListenAddr == "" {
 		errs = append(errs, fmt.Errorf("server.listen_addr is required"))
 	}
-	if s.LogLevel == "" {
-		s.LogLevel = "info"
-	}
+	s.LogLevel = cmp.Or(s.LogLevel, "info")
 	switch s.LogLevel {
 	case "debug", "info", "warn", "error":
 	default:
 		errs = append(errs, fmt.Errorf("%w: %q (want one of debug, info, warn, error)", ErrInvalidLogLevel, s.LogLevel))
 	}
-	if s.MaxObjectSize == 0 {
-		s.MaxObjectSize = 5 * 1024 * 1024 * 1024 // 5 GB
-	}
+	s.MaxObjectSize = cmp.Or(s.MaxObjectSize, 5*1024*1024*1024) // 5 GB
+	errs = append(errs, s.validateSpillDir()...)
 	return errs
+}
+
+// validateSpillDir checks that a configured spill directory exists and is one.
+// Checked at startup because the alternative is discovering the typo on the
+// first object too large to hold in memory, which is the worst moment for a
+// write to start failing.
+func (s *ServerConfig) validateSpillDir() []error {
+	if s.SpillDir == "" {
+		return nil
+	}
+	info, err := os.Stat(s.SpillDir)
+	if err != nil {
+		return []error{fmt.Errorf("%w: %s: %w", ErrSpillDirUnusable, s.SpillDir, err)}
+	}
+	if !info.IsDir() {
+		return []error{fmt.Errorf("%w: %s is not a directory", ErrSpillDirUnusable, s.SpillDir)}
+	}
+	return nil
 }
 
 // validateConcurrency checks concurrency-limit fields and applies the
@@ -113,24 +136,31 @@ func (s *ServerConfig) validateConcurrency() []error {
 	return errs
 }
 
+// validateHeaderLimits applies the net/http defaults to the request-header
+// limits and rejects negative values. The defaults are pinned to the stdlib
+// constants rather than literals so a future Go release that retunes them
+// carries through instead of silently diverging from unconfigured servers.
+func (s *ServerConfig) validateHeaderLimits() []error {
+	var errs []error
+	if s.MaxHeaderBytes < 0 {
+		errs = append(errs, fmt.Errorf("server.max_header_bytes must not be negative"))
+	}
+	if s.MaxHeaderValueCount < 0 {
+		errs = append(errs, fmt.Errorf("server.max_header_value_count must not be negative"))
+	}
+	s.MaxHeaderBytes = cmp.Or(s.MaxHeaderBytes, http.DefaultMaxHeaderBytes)
+	s.MaxHeaderValueCount = cmp.Or(s.MaxHeaderValueCount, http.DefaultMaxHeaderValueCount)
+	return errs
+}
+
 // applyTimeoutDefaults fills zero-valued timeout fields with production
 // defaults.
 func (s *ServerConfig) applyTimeoutDefaults() {
-	if s.BackendTimeout == 0 {
-		s.BackendTimeout = 30 * time.Second
-	}
-	if s.ReadHeaderTimeout == 0 {
-		s.ReadHeaderTimeout = 10 * time.Second
-	}
-	if s.ReadTimeout == 0 {
-		s.ReadTimeout = 5 * time.Minute
-	}
-	if s.WriteTimeout == 0 {
-		s.WriteTimeout = 5 * time.Minute
-	}
-	if s.IdleTimeout == 0 {
-		s.IdleTimeout = 120 * time.Second
-	}
+	s.BackendTimeout = cmp.Or(s.BackendTimeout, 30*time.Second)
+	s.ReadHeaderTimeout = cmp.Or(s.ReadHeaderTimeout, 10*time.Second)
+	s.ReadTimeout = cmp.Or(s.ReadTimeout, 5*time.Minute)
+	s.WriteTimeout = cmp.Or(s.WriteTimeout, 5*time.Minute)
+	s.IdleTimeout = cmp.Or(s.IdleTimeout, 120*time.Second)
 }
 
 // validateTimeouts enforces the ordering invariants between the various
@@ -156,9 +186,7 @@ func (s *ServerConfig) validateTLS() []error {
 		errs = append(errs, ErrInvalidTLSConfig)
 	}
 	if hasCert && hasKey {
-		if s.TLS.MinVersion == "" {
-			s.TLS.MinVersion = "1.2"
-		}
+		s.TLS.MinVersion = cmp.Or(s.TLS.MinVersion, "1.2")
 		if s.TLS.MinVersion != "1.2" && s.TLS.MinVersion != "1.3" {
 			errs = append(errs, fmt.Errorf("%w: got %q (want %q or %q)", ErrInvalidTLSVersion, s.TLS.MinVersion, "1.2", "1.3"))
 		}

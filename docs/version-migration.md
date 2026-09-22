@@ -1,3 +1,7 @@
+---
+description: "Upgrading between versions: how database migrations run, which configuration changes are required, and where breaking changes land."
+---
+
 This document covers upgrading between versions of the S3 Orchestrator, including database migrations, configuration changes, and breaking changes.
 
 ## How Upgrades Work
@@ -37,7 +41,7 @@ s3-orchestrator version
 |-----------|----------------|------------|-------|
 | PostgreSQL | 16, 18 | 10+ (pgx driver) | Required. Connection pooling via pgxpool. |
 | Redis | 7, 8 | 6+ (go-redis driver) | Optional. Shared usage counters for multi-instance deployments. |
-| Go | 1.26 | 1.26+ | For building from source. Version set in `go.mod`. |
+| Go | 1.27 | 1.27+ | For building from source. Version set in `go.mod`. |
 | S3 backends | MinIO, OCI, R2 | Any S3-compatible API | GCS requires `disable_checksum`, `unsigned_payload`, `strip_sdk_headers`. |
 | Container runtime | Docker | Docker, containerd, Podman | Multi-arch images (amd64, arm64) published to ghcr.io. |
 | Orchestrators | Nomad, Kubernetes | Nomad, Kubernetes, systemd | Deploy manifests and demo scripts provided. |
@@ -54,11 +58,144 @@ Before upgrading to a new version:
 - [ ] Test a PUT + GET round-trip in staging
 - [ ] Deploy to production with rolling update (readiness probe gates traffic)
 
-To roll back: restore the database backup and deploy the previous binary version. Schema migrations are forward-only — downgrade requires a database restore.
+To roll back: restore the database backup and deploy the previous binary version. Schema migrations are forward-only - downgrade requires a database restore.
 
 ## Version History
 
-### v0.64.x (current)
+### v0.131.x (current)
+
+**A write can place its own copies ([#1406](https://github.com/afreidah/s3-orchestrator/issues/1406), v0.130.0)**
+
+A copy after the first has always been the replicator's: it reads the object back off a backend that holds it and writes it elsewhere, which costs a full GET plus that backend's egress for every copy it makes. The bytes are in hand at PUT time, so a write can place the copy itself for one more upload and no read at all.
+
+Off unless asked for, under `write_path.parallel_copies`. Turned on, a write claims the top N eligible backends with an intent each, uploads to all of them at once from one materialized payload, and answers the client as soon as the first copy commits. The rest finish behind the response and commit themselves. `count` defaults to `replication.factor` and may not exceed it; a factor of 1 leaves the setting inert.
+
+The trade is shape rather than total. Total work drops, but the further copies' bytes are sent at write time instead of spread across replicator cycles, so a deployment whose uplink is the bottleneck can see PUT throughput fall even as its backend bill does. Measure before leaving it on.
+
+**Operator action items after upgrade:**
+
+- **Nothing changes unless you opt in.** A config that does not set `write_path.parallel_copies.enabled: true` writes exactly as before.
+- **Turning it on changes what your backends see.** Concurrent PUT traffic at write time rises by roughly the copy count; replicator reads and their egress fall by about as much. Watch `s3o_replication_copies_created_total` drop and per-backend PUT concurrency rise.
+- **`max_in_flight` bounds the copies still uploading after their response**, defaulting to `server.max_concurrent_writes`. A write that finds it full places one copy and leaves the rest to the replicator, so a non-zero `s3o_replication_write_fanout_skipped_total` means either the ceiling is low for your write rate or a backend is falling behind - `s3o_detached_uploads_depth` says which.
+- **Graceful shutdown may take up to 30 seconds longer**, waiting for copies still uploading after their response. Anything unfinished at that point is left to the pending reaper, exactly as a kill would leave it.
+- **Multipart uploads are unaffected** and stay on write-one-then-replicate.
+- **One migration applies automatically** (Postgres `00026`, SQLite `0014`), adding `pending_objects.role`. Existing intents read as `primary`, which is what every intent written before this meant.
+
+### v0.129.x
+
+**Quota admission moved into the database ([#1388](https://github.com/afreidah/s3-orchestrator/issues/1388), v0.129.0)**
+
+Whether a write fits is decided by the statement that claims the space. A PUT's pending intent is inserted only if the target backend's live rows still have headroom, and a replica row likewise. A backend that declines is skipped and the next candidate tried; a write no candidate accepts fails with 507. Because the test reads rows rather than a per-process figure, every instance in a fleet is judged against the same totals, and the intents of writes in progress occupy their backend for all of them.
+
+The byte total lives in `backend_quota_stripes`, 16 rows per backend rather than one, so concurrent writes charging a backend take different row locks. It is charged inside the transaction that writes the `object_locations` rows it summarizes, so it cannot drift from them.
+
+Routing keeps a periodically reloaded snapshot and decides only the order candidates are tried. A stale ranking costs an uneven spread that the next reload corrects.
+
+**Operator action items after upgrade:**
+
+- **Two migrations apply automatically** (Postgres `00025`, SQLite `0013`). They create the stripe table, carry each backend's existing total onto stripe zero, and drop `backend_quotas.bytes_used`. Anything reading that column directly - a dashboard query, an operational script - must move to `SUM(bytes_used)` over `backend_quota_stripes`, or to `GET /admin/api/status`, which is unchanged.
+- **`write_path.pending_pattern.enabled` has been removed, and a config still setting it is ignored rather than rejected** - the loader does not reject unknown keys. Delete the line so the file does not imply a control that no longer exists. If you had set it to `false`, note that intents and the reaper are now always on: every write claims its bytes with an intent, so a deployment without the pattern would have nothing to judge writes against, and one without the reaper would strand rows holding a backend's headroom against writes that are never coming. The remaining `reaper_tick`, `min_age` and `batch_size` keys are unchanged.
+- **`s3o_quota_reconcile_corrections_total` becomes an alert rather than a statistic.** It is expected to stay at zero; any increase means a mutation path is storing bytes without charging them.
+- **New metric `s3o_quota_claims_declined_total{backend}`** counts writes a backend refused for want of room. Sustained non-zero on one backend means it needs capacity or a drain.
+- **Watch `s3o_pending_intents_depth` after upgrade.** An intent holds its bytes against its backend's headroom for as long as it lives, so a stuck one is space no write can use. Steady state is zero.
+
+### v0.121.x
+
+**Integrity coverage counted copies the scrubber could not reach ([#1367](https://github.com/afreidah/s3-orchestrator/issues/1367), v0.121.0)**
+
+The scrub queue draws only from backends within their usage budget, so a copy on a backend over its limit is never selected and never stamped. The coverage query had no such filter, so it counted those copies anyway. They pinned the minimum the age is measured from, and `s3o_integrity_oldest_unverified_seconds` then climbed by a day every day regardless of how much the sweep verified - on one fleet, 3,542 verifications in 24 hours moved it by nothing at all.
+
+Coverage is now scoped to the same backends the queue draws from, and the copies it excludes are published separately as `s3o_integrity_deferred_copies` rather than dropped. Dropping them would have been the opposite failure: a fleet holding most of its copies on an over-limit backend would have read as fully verified.
+
+The backfill pass was a second source of the same confusion. It reads an object end to end to compute its hash, then wrote only `content_hash` - leaving `last_scrubbed_at` NULL, so a copy it had just verified counted as never verified and sorted to the head of the queue on its original `created_at`. The next sweep re-downloaded and re-hashed the same bytes. Backfill now stamps the copy in the same statement.
+
+**Operator action items after upgrade:**
+
+- **No config change required, and no migration.** The fix is in the query, not the schema.
+- **Both coverage figures will drop on the first sweep after upgrade**, by however many copies sit on over-limit backends. That is the correction, not a regression: watch `s3o_integrity_deferred_copies` for where they went. A sustained non-zero value there means coverage describes only part of the fleet, and the scrubber will not close the gap on its own - raise the backend's limit or wait for the usage period to roll over.
+- **`s3o_integrity_oldest_unverified_seconds` becomes alertable.** It could not fall before, so any threshold on it fired permanently once crossed. It now falls when the sweep verifies the copy at the head of the queue.
+- The admin status endpoint gains `integrity.deferred_copies`, and the dashboard an "Unreachable" row alongside the two existing ones.
+
+### v0.120.x
+
+**Per-operation request budgets ([#235](https://github.com/afreidah/s3-orchestrator/issues/235), v0.120.0)**
+
+`api_request_limit` charged every backend call against one allowance. Providers do not bill that way: GCS meters uploads and listings from a small Class A allowance, reads from a much larger Class B one, and does not bill deletes at all. Collapsing those into one number means either wasting the loose classes or exhausting the strict one and taking the whole backend out of service - reads included, since the read path checks the same counter.
+
+Backends can now declare `request_limits`, a list of named pools each covering a set of operations, plus `unmetered` for the operations the provider gives away. Pools are additive: an operation charges every pool containing it and is admitted only when all of them have headroom. Migration `00024` adds `backend_request_usage(backend_name, period, pool, requests)`; byte counters stay in `backend_usage`.
+
+**Operator action items after upgrade:**
+
+- **No config change required.** `api_request_limit` remains valid and desugars to a single pool named `all` covering every operation, which is exactly what it meant before. Setting both it and `request_limits` on one backend is rejected at startup.
+- **Pool counts start at zero for the month in progress.** The existing `api_requests` total cannot be split by pool retroactively - nothing recorded which calls were uploads and which were reads - so seeding a pool from it would charge reads and free deletes against a write budget. A backend that is currently over its limit will accept work again until the new counts accumulate, once, for the remainder of the current period.
+- **`s3o_usage_api_requests` still counts every call**, including operations no budget charges. Watch `s3o_usage_pool_requests{backend,pool}` against `s3o_usage_pool_limit{backend,pool}` to see which budget is close to refusing work; the bundled Grafana dashboard adds a "Request Pool Usage" panel for this.
+- Operators on GCS, B2 or IBM COS should re-check the provider's current pricing page and split their allowances accordingly. The free-tier guide has a worked GCS example.
+
+### v0.118.x
+
+**Prefix listings are served index-only ([#1341](https://github.com/afreidah/s3-orchestrator/issues/1341), v0.118.0)**
+
+`ListObjectsByPrefix` dedups replicas with `DISTINCT ON`, so it walks every copy row per key and emits one. The index backing it held only the key, which cost a heap fetch per row walked plus a sort per key group to pick the winner. Migration `00023` replaces it with `idx_object_locations_key_collate_c_covering` on `(object_key COLLATE "C", created_at)` including `backend_name`, `size_bytes` and `etag`, which removes both. On 360 K rows a 1000-key page reads 51 buffers instead of 3017.
+
+`created_at` is a key column rather than `INCLUDE` payload deliberately: `INCLUDE` columns are unordered and satisfy the projection but not the `ORDER BY`, so keeping it there would have left the per-group sort in place.
+
+**Operator action items after upgrade:**
+
+- No config change required. The index is built with `CREATE INDEX CONCURRENTLY` and the old one dropped concurrently, so the migration does not lock the table for writes.
+- **The new index is wider** - roughly 45 MB against 10 MB at 360 K rows - and every write to `object_locations` pays that. It replaces the previous index rather than joining it, so the number of indexes on the table is unchanged.
+- Index-only scans depend on the visibility map, and `object_locations` is a write-heavy table. If listings are slower than expected, check `pg_stat_user_tables.n_dead_tup` and consider a more aggressive `autovacuum_vacuum_scale_factor` for the table before assuming the index is not being used.
+
+### v0.117.x
+
+**`Last-Modified` is now the object's write time, not the serving copy's ([#1356](https://github.com/afreidah/s3-orchestrator/issues/1356), v0.117.0)**
+
+An object's `Last-Modified` used to depend on which copy answered the request. A GET reported the serving backend's own modification time, so failing over to a replica changed it; a listing reported `MIN(created_at)` across copies, which was a third value again. Nothing about the object had changed in either case. Conditional requests are built on this header, so `If-Modified-Since` and `If-Range` were comparing against a value that moved on its own.
+
+Three things changed. Replication now carries the source row's `created_at` to the new copy instead of stamping the moment the copy was made. Reconcile and `sync` record the modification time the backend reported for a discovered object, falling back to the moment of discovery when the backend reports none. Reads now prefer the stored timestamp over the backend's, which is the same precedence [#1340](https://github.com/afreidah/s3-orchestrator/issues/1340) established for ETag.
+
+This also removes the failure mode that the fallback was originally added for ([#1182](https://github.com/afreidah/s3-orchestrator/issues/1182)): a backend that omits a modification time on GET can no longer produce an empty `Last-Modified`, because the stored value is always present and is now consulted first.
+
+Fixing the write paths alone would not have repaired anything already stored, because a read answers from whichever copy served it: an object replicated under an older version would keep reporting a different time per copy, just sourced from the ledger instead of the backend. Migration `00022` therefore aligns existing rows, setting every copy of a key to `MIN(created_at)` across its copies. That is the correct target rather than an arbitrary pick - the copy the client's own write created is the one stamped at the write, and every later value belongs to a replica.
+
+**Operator action items after upgrade:**
+
+- No config change required. The backfill runs automatically as part of the usual startup migration and needs no operator step.
+- **The backfill only moves timestamps backwards.** Lifecycle expiry reads the same column, so an object whose replicas were carrying a later stamp now ages from its real write time. That is the intended behaviour, but it can put an object closer to expiry than its pre-migration value suggested. If you run lifecycle rules with short windows, review `expiration_days` against the objects in your fleet before upgrading.
+- The migration is not reversible. The per-copy stamps it replaces are not recoverable, and its `Down` is a no-op.
+- Objects discovered by reconcile before this version were stamped at discovery time rather than their backend modification time. The backfill aligns their copies with each other but cannot recover the original write time; re-running reconcile will not correct them either, since the rows already exist and import leaves existing rows alone.
+- `created_at` is now the object's write time on every copy, so it is no longer a per-copy age. The scrub queue was already using `last_scrubbed_at` for that and is unaffected.
+
+### v0.101.x
+
+**`integrity.verify_on_replicate` now does something ([#1292](https://github.com/afreidah/s3-orchestrator/issues/1292), v0.101.0)**
+
+The field has been parsed and documented since v0.41.x, but no code read it, so replicas were never hash-checked whatever it was set to. It is now wired into the replicator: when enabled, each new copy is read back from its target, decoded to plaintext, and compared against the source's `content_hash` before the ledger row that makes it count toward the replication factor is written. A copy whose hash disagrees is deleted and another target is tried.
+
+**Default changed from `true` to `false`.** The documented default was never in force, so no deployment's behaviour changes on upgrade. It is off because it is the one integrity check that is not close to free: reading each new copy back means a replica costs its size in egress twice. Every other check in this section is opt-in for the same reason, and hashing on write stays on because it rides a buffering pass the write path already performs.
+
+**Operator action items after upgrade:**
+
+- No config change required. A config that already sets `verify_on_replicate: true` starts verifying replicas on upgrade - expect replication egress on the receiving backends to roughly double. Remove the field or set it to `false` to keep the previous behaviour.
+- If you enable it, run `admin backfill-checksums` first. A source with no `content_hash` has nothing to compare against, and its replicas are recorded unverified.
+- `s3o_integrity_checks_total{operation="replicate"}` and `s3o_integrity_errors_total{operation="replicate"}` report the new check. A non-zero error rate does not say which end is damaged: the copy is byte-identical to its source, so a source that has already rotted makes every target disagree. Both backend names are logged; `admin scrub -key <key>` settles it.
+
+### v0.76.x
+
+**Reconcile imports objects at their literal key ([#1161](https://github.com/afreidah/s3-orchestrator/pull/1161), v0.76.0)**
+
+Reconcile previously rewrote every backend key that matched no configured virtual bucket prefix, prepending the pass's bucket prefix before comparing it against the ledger. Backends list in byte order, so rewriting only some keys made the stream non-monotonic and broke the sorted-merge: on each pass the merge deleted a block of `object_locations` rows and then re-imported them, reporting a large import and removal count every 24 hours against a backend that had not changed. Because `ImportObject` writes no `content_hash`, the integrity backfill also never stayed done.
+
+Objects are now imported at their literal backend key. Keys outside every configured virtual bucket prefix are still imported - they are real bytes against the backend's quota, and omitting them makes space accounting wrong - but their `object_locations` row is marked unmanaged via the new `managed` column (migration `00014_object_managed_flag`, default true). Quota sums every row; replication, rebalance, integrity and drain consider only managed ones.
+
+The reconcile stream now also rejects a non-ascending backend listing or ledger cursor outright rather than silently mis-merging.
+
+**Operator action items after upgrade:**
+
+- Expect one larger-than-usual reconcile pass on backends that hold objects outside the configured virtual bucket prefixes: those objects are imported once, and `backend_quotas.bytes_used` rises to include them. That new total is the correct one - the earlier figure undercounted real consumption.
+- Repeating import/remove counts on an otherwise idle backend should stop. A backend still reporting them after this upgrade is a genuine drift signal.
+- No config change.
+
+### v0.64.x
 
 **Terminal object browser (`tui`) + object-locations response reshape ([#1085](https://github.com/afreidah/s3-orchestrator/pull/1085), v0.64.0)**
 
@@ -78,14 +215,14 @@ As part of the same change, the `GET /admin/api/object-locations` response was r
 
 **Cleanup DELETE 404 treated as idempotent success ([#877](https://github.com/afreidah/s3-orchestrator/pull/877), v0.57.1)**
 
-A backend cleanup `DeleteObject` that returns HTTP 404 / `NoSuchKey` is now treated as idempotent success: the `cleanup_queue` row drops immediately instead of retrying nine more times and graduating to `cleanup_dlq`. The motivating incident: 63 phantom rows accumulated in `cleanup_dlq` against one MinIO backend over two days — all `StatusCode: 404`, none of them real un-cleanable orphans (the upstream PUTs had silently failed during a network outage, so the cleanup correctly identified objects to remove and got confused when the backend already agreed they didn't exist). The DLQ noise masked real un-cleanable orphans.
+A backend cleanup `DeleteObject` that returns HTTP 404 / `NoSuchKey` is now treated as idempotent success: the `cleanup_queue` row drops immediately instead of retrying nine more times and graduating to `cleanup_dlq`. The motivating incident: 63 phantom rows accumulated in `cleanup_dlq` against one MinIO backend over two days - all `StatusCode: 404`, none of them real un-cleanable orphans (the upstream PUTs had silently failed during a network outage, so the cleanup correctly identified objects to remove and got confused when the backend already agreed they didn't exist). The DLQ noise masked real un-cleanable orphans.
 
-The same 404 → drop logic was also added to `DeleteOrEnqueue` in the write coordinator, so a 404 never seeds the cleanup queue in the first place.
+The same 404 -> drop logic was also added to `DeleteOrEnqueue` in the write coordinator, so a 404 never seeds the cleanup queue in the first place.
 
 New surfaces:
 
-- `s3o_cleanup_queue_processed_total{status="success_absent"}` — counter label for idempotent drops. Add this to dashboards alongside `success` / `retry` / `exhausted`.
-- `cleanup_queue.already_absent` audit event — emitted when the 404 path fires.
+- `s3o_cleanup_queue_processed_total{status="success_absent"}` - counter label for idempotent drops. Add this to dashboards alongside `success` / `retry` / `exhausted`.
+- `cleanup_queue.already_absent` audit event - emitted when the 404 path fires.
 
 `backend.IsNotFound` was promoted from a private worker helper to an exported function in `internal/backend/`. Existing call sites in `worker/replicator.go`, `worker/pending.go`, and `backend/circuitbreaker.go` were consolidated onto it.
 
@@ -99,29 +236,29 @@ New surfaces:
 Three related fixes around backend drain:
 
 1. **Drain race closed.** A drain that began while a backend `PutObject` was in flight could land bytes on the now-draining backend. The write path now re-checks `IsDraining(backend)` after the backend PUT succeeds, before the metadata commit. On a positive re-check the bytes are cleaned up via `RecoverFromRecordFailure` and the attempt fails over to the next eligible backend.
-2. **`s3o_drain_active` is now Inc/Dec instead of Set(1)/Set(0).** Concurrent drains across multiple backends now compose correctly — the gauge reports the count of in-flight drains, not just "is any drain running?".
+2. **`s3o_drain_active` is now Inc/Dec instead of Set(1)/Set(0).** Concurrent drains across multiple backends now compose correctly - the gauge reports the count of in-flight drains, not just "is any drain running?".
 3. **`PurgeBackendObjects` bails on zero DB progress.** A pathological list-and-fail loop (e.g., the page-list works but every per-row `DeleteObjectLocation` fails) could spin indefinitely. The worker now exits the page when it finishes a list with zero rows actually deleted, preventing the infinite-list-and-fail spin.
 
 New surfaces:
 
-- `s3o_drain_race_aborted_total` (counter) — increments each time the post-PUT re-check fires.
+- `s3o_drain_race_aborted_total` (counter) - increments each time the post-PUT re-check fires.
 
 **Operator action items after upgrade:**
 
 - Dashboards / alerts that read `s3o_drain_active == 1` should switch to `s3o_drain_active > 0` to keep working when multiple drains overlap.
 - Add an alert on any non-zero rate of `s3o_drain_race_aborted_total`. A persistent rate suggests a longer-than-expected gap between `EligibleForWrite` and the backend PUT (e.g., very large objects against a fast-draining backend).
 
-### v0.55.x – v0.56.x
+### v0.55.x - v0.56.x
 
 **UsageTracker swapped to atomic.Pointer snapshots ([#874](https://github.com/afreidah/s3-orchestrator/pull/874), v0.56.0)**
 
 The internal `UsageTracker` (the per-backend rolling-window counter feeding `BackendsWithinLimits` and the eligibility filter) replaced its `sync.RWMutex` pair with `atomic.Pointer[T]` snapshots and copy-on-write writes. The hot read path no longer touches a mutex.
 
-No behavior change. Measured improvement on parallel `WithinLimits` benchmarks: 65.93 ns/op → 29.80 ns/op (~2.2× under contention). The change only matters at high request rates where `BackendsWithinLimits` is dispatched per request; below ~500 RPS it is in the noise.
+No behavior change. Measured improvement on parallel `WithinLimits` benchmarks: 65.93 ns/op -> 29.80 ns/op (~2.2x under contention). The change only matters at high request rates where `BackendsWithinLimits` is dispatched per request; below ~500 RPS it is in the noise.
 
 **Operator action items:** none.
 
-### v0.53.x – v0.54.x
+### v0.53.x - v0.54.x
 
 **Optimize PutObject buffering + integrity pipeline ([#869](https://github.com/afreidah/s3-orchestrator/pull/869), v0.54.0)**
 
@@ -130,7 +267,7 @@ The `PutObject` body materialization layer (the buffer that lets the write path 
 **Operator action items after upgrade:**
 
 - Container memory limits sized off pre-v0.54 baselines can be tightened; equivalently, the previous limits absorb more concurrent in-flight PUTs.
-- Tempfiles are written under the orchestrator's `TMPDIR` (defaults to `/tmp`). Operators running with a tmpfs `/tmp` should size it to accommodate `max_concurrent_writes × p99_object_size`, or set `TMPDIR` to a disk-backed location.
+- Tempfiles are written under the orchestrator's `TMPDIR` (defaults to `/tmp`). Operators running with a tmpfs `/tmp` should size it to accommodate `max_concurrent_writes x p99_object_size`, or set `TMPDIR` to a disk-backed location.
 
 **Same-backend server-side copy fast path ([#868](https://github.com/afreidah/s3-orchestrator/pull/868), v0.53.0)**
 
@@ -143,9 +280,9 @@ New surfaces:
 
 **Operator action items after upgrade:**
 
-- If you compute "data transferred" from `s3o_usage_egress_bytes` + `s3o_usage_ingress_bytes`, native-copy traffic is now invisible to that metric (which is correct — no bytes left the backend). Add a panel querying for spans with `s3o.native_copy=true` if you need a copy-volume signal.
+- If you compute "data transferred" from `s3o_usage_egress_bytes` + `s3o_usage_ingress_bytes`, native-copy traffic is now invisible to that metric (which is correct - no bytes left the backend). Add a panel querying for spans with `s3o.native_copy=true` if you need a copy-volume signal.
 
-### v0.51.x – v0.52.x
+### v0.51.x - v0.52.x
 
 **Per-operation completion observability centralized ([#866](https://github.com/afreidah/s3-orchestrator/pull/866), v0.52.0)**
 
@@ -157,11 +294,11 @@ The audit / metric / span completion logic for `PutObject`, `GetObject`, `Delete
 
 **Cancel losing degraded-read probes ([#867](https://github.com/afreidah/s3-orchestrator/pull/867), v0.52.1)**
 
-When the read path is in degraded mode (one source unhealthy) it fires probe reads against multiple backends and serves the first one back. The losing probes were previously left to run to completion, wasting backend API calls and egress against quotas. They are now cancelled the moment a winner is declared. The visible effect is a drop in `s3o_usage_api_calls{backend=...}` during degraded operation, with no change to correctness or latency.
+When the read path is in degraded mode (one source unhealthy) it fires probe reads against multiple backends and serves the first one back. The losing probes were previously left to run to completion, wasting backend API calls and egress against quotas. They are now cancelled the moment a winner is declared. The visible effect is a drop in `s3o_usage_api_requests{backend=...}` during degraded operation, with no change to correctness or latency.
 
 **Operator action items:** none.
 
-### v0.49.x – v0.50.x
+### v0.49.x - v0.50.x
 
 **Consumer-declared interfaces for proxy subpackages ([#847](https://github.com/afreidah/s3-orchestrator/pull/847), v0.49.0)**
 
@@ -182,11 +319,11 @@ Internal refactor only (proxy package decomposed into focused subpackages, [#845
 
 **Surface orphan-enqueue failures during DB outages ([#824](https://github.com/afreidah/s3-orchestrator/pull/824), v0.47.5)**
 
-When the write path enqueues a cleanup row after a partial write failure and the enqueue itself fails (e.g., the DB is unreachable), the orphan bytes were previously silent — the backend held data the orchestrator could not see. The failure path now emits a metric and an audit event so operators can pivot to the exact backend / key / size and reconcile manually once DB connectivity returns.
+When the write path enqueues a cleanup row after a partial write failure and the enqueue itself fails (e.g., the DB is unreachable), the orphan bytes were previously silent - the backend held data the orchestrator could not see. The failure path now emits a metric and an audit event so operators can pivot to the exact backend / key / size and reconcile manually once DB connectivity returns.
 
 New surfaces:
 
-- `s3o_cleanup_enqueue_failures_total{backend, reason, stage}` counter. `stage="enqueue"` means the cleanup_queue row itself did not persist (worst case — the cleanup worker will never see this orphan). `stage="orphan_bytes"` means the row persisted but the `orphan_bytes` counter did not increment (quota accounting drifts but cleanup still runs).
+- `s3o_cleanup_enqueue_failures_total{backend, reason, stage}` counter. `stage="enqueue"` means the cleanup_queue row itself did not persist (worst case - the cleanup worker will never see this orphan). `stage="orphan_bytes"` means the row persisted but the `orphan_bytes` counter did not increment (quota accounting drifts but cleanup still runs).
 - `storage.OrphanEnqueueFailed` audit event carrying backend, key, size, stage, error.
 
 **Operator action items after upgrade:**
@@ -327,7 +464,7 @@ already encode.
 without checking that the upload belonged to the bucket on the request
 URL. An authenticated caller for any bucket could manipulate in-flight
 multipart uploads owned by another bucket: write parts into them, abort
-them, or complete them under their own bucket's URL — silent cross-tenant
+them, or complete them under their own bucket's URL - silent cross-tenant
 data corruption with no detection signal.
 
 The fix adds bucket and key parameters to the manager-layer methods that
@@ -370,7 +507,7 @@ died mid-process does not leave the row stuck.
 **Database migration:** `00011_cleanup_queue_claim` runs automatically on
 startup. The migration uses `+goose NO TRANSACTION` plus
 `CREATE INDEX CONCURRENTLY` so applying it against a populated table does
-not require a write outage. `ExpectedSchemaVersion` is bumped 10 → 11.
+not require a write outage. `ExpectedSchemaVersion` is bumped 10 -> 11.
 
 **New configuration field:**
 
@@ -483,21 +620,21 @@ Cleanup queue rows that exhausted their retry budget previously stayed pinned in
 
 **Database migration:**
 
-- `00009_cleanup_dlq.sql` — adds the `cleanup_dlq` table (auto-applied on startup). The columns mirror `cleanup_queue` plus `original_id`, `first_enqueued_at`, and `moved_at` so each DLQ row carries enough context to investigate the orphan.
+- `00009_cleanup_dlq.sql` - adds the `cleanup_dlq` table (auto-applied on startup). The columns mirror `cleanup_queue` plus `original_id`, `first_enqueued_at`, and `moved_at` so each DLQ row carries enough context to investigate the orphan.
 
 **Behavioral changes:**
 
-- **Exhaustion path** — the cleanup worker now calls `MoveCleanupToDLQ(id, last_error)` instead of `RetryCleanupItem(id, 0, ...)` when `attempts` reaches 10. The move is a single transaction (read queue row → insert DLQ row → delete queue row) so the row is never duplicated or lost.
-- **Quota accounting unchanged** — `orphan_bytes` is intentionally NOT decremented when a row is moved to the DLQ. The backend object is still on disk; the bytes really are still occupying the backend's quota. Reclaim happens only when an operator confirms the object is gone (e.g. via the reconciler) and writes off the row deliberately.
+- **Exhaustion path** - the cleanup worker now calls `MoveCleanupToDLQ(id, last_error)` instead of `RetryCleanupItem(id, 0, ...)` when `attempts` reaches 10. The move is a single transaction (read queue row -> insert DLQ row -> delete queue row) so the row is never duplicated or lost.
+- **Quota accounting unchanged** - `orphan_bytes` is intentionally NOT decremented when a row is moved to the DLQ. The backend object is still on disk; the bytes really are still occupying the backend's quota. Reclaim happens only when an operator confirms the object is gone (e.g. via the reconciler) and writes off the row deliberately.
 
 **New metrics:**
 
-- `s3o_cleanup_dlq_depth` (gauge) — current count of unrecoverable orphans waiting in the DLQ.
-- `s3o_cleanup_dlq_enqueued_total{backend}` (counter) — rate of graduations per backend; one backend dominating means that backend's delete path is broken.
+- `s3o_cleanup_dlq_depth` (gauge) - current count of unrecoverable orphans waiting in the DLQ.
+- `s3o_cleanup_dlq_enqueued_total{backend}` (counter) - rate of graduations per backend; one backend dominating means that backend's delete path is broken.
 
 **New audit event:**
 
-- `cleanup_queue.exhausted_to_dlq` — emitted with the row's key, backend, attempts, size_bytes, and final last_error each time a queue row is graduated.
+- `cleanup_queue.exhausted_to_dlq` - emitted with the row's key, backend, attempts, size_bytes, and final last_error each time a queue row is graduated.
 
 **Operator action items after upgrade:**
 
@@ -520,28 +657,29 @@ SHA-256 content hashing for object integrity verification. When enabled, objects
 integrity:
   enabled: false                     # Enable integrity verification
   verify_on_read: false              # Hash-check GET responses as they stream
-  verify_on_replicate: true          # Verify hash when creating replicas (default when enabled)
   scrubber_interval: "6h"            # Background verification interval (0 = disabled)
   scrubber_batch_size: 100           # Objects per scrub cycle
 ```
 
-All fields are optional and default to disabled. This is a non-breaking change — existing configs work without modification.
+A `verify_on_replicate` field was also parsed from this section, but nothing read it and replicas were never hash-checked. It became a real setting in v0.101.x.
+
+All fields are optional and default to disabled. This is a non-breaking change - existing configs work without modification.
 
 **New admin commands:**
 
-- `admin scrub [-batch-size N]` — trigger an on-demand integrity scrub cycle.
-- `admin backfill-checksums [-batch-size N]` — compute and store hashes for objects written before integrity was enabled.
+- `admin scrub [-batch-size N]` - trigger an on-demand integrity scrub cycle.
+- `admin backfill-checksums [-batch-size N]` - compute and store hashes for objects written before integrity was enabled.
 
 **New metrics:**
 
-- `s3o_integrity_checks_total{operation}` — hash verifications performed (read, scrub).
-- `s3o_integrity_errors_total{operation}` — hash mismatches detected (read, scrub).
+- `s3o_integrity_checks_total{operation}` - hash verifications performed (read, scrub).
+- `s3o_integrity_errors_total{operation}` - hash mismatches detected (read, scrub).
 
 **Behavioral notes:**
 
 - Integrity config is hot-reloadable via SIGHUP.
 - The scrubber reads objects from backends, which counts against usage quota (API calls + egress).
-- Encrypted objects are decrypted before hashing — the hash is always computed on plaintext.
+- Encrypted objects are decrypted before hashing - the hash is always computed on plaintext.
 
 ### v0.19.x
 
@@ -553,12 +691,12 @@ All fields are optional and default to disabled. This is a non-breaking change �
 **Config validation:**
 
 - `encryption.master_key_file` must exist and be exactly 32 bytes at startup. Previously validated only at first use.
-- Invalid worker pool concurrency (≤ 0) logs a warning when clamped to 1.
+- Invalid worker pool concurrency (<= 0) logs a warning when clamped to 1.
 
 **Metrics:**
 
-- `s3o_rebalance_pending` (gauge) — objects planned for rebalance in the current cycle.
-- `s3o_encryption_unknown_key_id_total` (counter) — decryption attempts with an unrecognized keyID.
+- `s3o_rebalance_pending` (gauge) - objects planned for rebalance in the current cycle.
+- `s3o_encryption_unknown_key_id_total` (counter) - decryption attempts with an unrecognized keyID.
 
 **Behavioral changes:**
 
@@ -575,8 +713,8 @@ All fields are optional and default to disabled. This is a non-breaking change �
 
 **New config fields:**
 
-- `buckets[].max_multipart_uploads` — optional limit on active multipart uploads per bucket (default: 0, unlimited). Returns `503 SlowDown` when exceeded.
-- `telemetry.metrics.listen` — optional separate address for the metrics endpoint (e.g., `127.0.0.1:9091`).
+- `buckets[].max_multipart_uploads` - optional limit on active multipart uploads per bucket (default: 0, unlimited). Returns `503 SlowDown` when exceeded.
+- `telemetry.metrics.listen` - optional separate address for the metrics endpoint (e.g., `127.0.0.1:9091`).
 
 ### v0.14.x
 
@@ -621,14 +759,14 @@ All fields are optional and default to disabled. This is a non-breaking change �
 
 **Behavioral changes:**
 
-- **Worker pool parallelism** — the cleanup worker, replicator, single-key DeleteObject, batch DeleteObjects, and rebalancer now use a shared bounded-concurrency worker pool. The cleanup worker and replicator concurrency are configurable; the rebalancer retains its existing `rebalance.concurrency` field.
-- **Orphan bytes tracking** — the cleanup queue now tracks the size of each enqueued item. On enqueue, the backend's `orphan_bytes` counter is incremented; on successful cleanup, it is decremented. All capacity checks (write routing, replication target selection, spread utilization ratio) subtract `orphan_bytes` from available space to prevent quota overcommitment during backend outages.
-- **Exhausted cleanup items preserved** — items that exceed 10 retry attempts remain in the queue with `orphan_bytes` still reserved, rather than being removed. This prevents the write path from overcommitting storage. Operators must manually resolve these items.
-- **Overwrite displaced copies** — when a PutObject overwrites an existing key, stale copies on other backends are now enqueued for cleanup with their size tracked, rather than being silently abandoned if the immediate delete fails.
+- **Worker pool parallelism** - the cleanup worker, replicator, single-key DeleteObject, batch DeleteObjects, and rebalancer now use a shared bounded-concurrency worker pool. The cleanup worker and replicator concurrency are configurable; the rebalancer retains its existing `rebalance.concurrency` field.
+- **Orphan bytes tracking** - the cleanup queue now tracks the size of each enqueued item. On enqueue, the backend's `orphan_bytes` counter is incremented; on successful cleanup, it is decremented. All capacity checks (write routing, replication target selection, spread utilization ratio) subtract `orphan_bytes` from available space to prevent quota overcommitment during backend outages.
+- **Exhausted cleanup items preserved** - items that exceed 10 retry attempts remain in the queue with `orphan_bytes` still reserved, rather than being removed. This prevents the write path from overcommitting storage. Operators must manually resolve these items.
+- **Overwrite displaced copies** - when a PutObject overwrites an existing key, stale copies on other backends are now enqueued for cleanup with their size tracked, rather than being silently abandoned if the immediate delete fails.
 
 **New metrics:**
 
-- `s3o_quota_orphan_bytes` (gauge, `backend` label) — bytes reserved by pending cleanup items per backend
+- `s3o_quota_orphan_bytes` (gauge, `backend` label) - bytes reserved by pending cleanup items per backend
 
 ### v0.11.x
 
@@ -656,7 +794,7 @@ All fields are optional and default to disabled. This is a non-breaking change �
 - `x-amz-meta-*` user metadata passthrough on PutObject, GetObject, HeadObject, CopyObject, and multipart uploads
 - `govulncheck` CI job for Go dependency vulnerability scanning
 - Optional Redis shared counters for multi-instance usage tracking with circuit breaker fallback to local counters
-- Dashboard file download — download individual objects directly from the file tree in the admin UI
+- Dashboard file download - download individual objects directly from the file tree in the admin UI
 
 **New dependencies:**
 

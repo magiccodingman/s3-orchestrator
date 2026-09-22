@@ -19,8 +19,14 @@ import (
 	"testing"
 
 	"github.com/afreidah/s3-orchestrator/internal/backend"
+	"github.com/afreidah/s3-orchestrator/internal/backend/backendtest"
 	"github.com/afreidah/s3-orchestrator/internal/config"
+	"github.com/afreidah/s3-orchestrator/internal/store/core"
 )
+
+// -------------------------------------------------------------------------
+// INTERNALS
+// -------------------------------------------------------------------------
 
 // freshStore opens a fresh in-memory sqlite store for each test so
 // importPage can exercise the real importer surface end-to-end.
@@ -46,11 +52,21 @@ type errorObjectStore struct {
 	err error
 }
 
+// -------------------------------------------------------------------------
+// PUBLIC API
+// -------------------------------------------------------------------------
+
 // ImportObject records the import call so the test can assert it
 // happened. The first return value mirrors the real store's
 // inserted=true semantics for a fresh row.
-func (e errorObjectStore) ImportObject(context.Context, string, string, int64) (bool, error) {
-	return false, e.err
+func (e errorObjectStore) ImportObject(context.Context, *core.ImportObjectRequest) (core.ImportOutcome, error) {
+	return core.ImportSkippedExisting, e.err
+}
+
+// GetAllObjectLocations reports no existing copies, so a discovered object is
+// classified purely on its own bytes.
+func (e errorObjectStore) GetAllObjectLocations(context.Context, string) ([]core.ObjectLocation, error) {
+	return nil, core.ErrObjectNotFound
 }
 
 // writeYAML drops the given config content into a temp file and returns the
@@ -88,6 +104,20 @@ backends:
     secret_access_key: sk
 `
 
+// TestParseFlags_BucketOptional pins that --bucket is no longer required.
+// Keys are imported exactly as the backend holds them, so there is nothing for
+// a virtual bucket name to contribute to the import.
+func TestParseFlags_BucketOptional(t *testing.T) {
+	var stderr bytes.Buffer
+	opts, ok := parseFlags([]string{"--backend", "b1"}, &stderr)
+	if !ok {
+		t.Fatalf("expected --bucket to be optional, stderr=%q", stderr.String())
+	}
+	if opts.BackendName != "b1" {
+		t.Errorf("backend = %q, want b1", opts.BackendName)
+	}
+}
+
 // TestParseFlags_RequiredMissing covers both required-flag branches in
 // parseFlags. The flag set is constructed with ContinueOnError-equivalent
 // behaviour by exiting before fs.Usage prints to a real terminal.
@@ -98,7 +128,6 @@ func TestParseFlags_RequiredMissing(t *testing.T) {
 		want string
 	}{
 		{"no-backend", []string{"--bucket", "vb"}, "--backend is required"},
-		{"no-bucket", []string{"--backend", "b1"}, "--bucket is required"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -198,8 +227,8 @@ func TestImportPage_DryRun(t *testing.T) {
 		{Key: "b.txt", SizeBytes: 20},
 	}
 	imp, skip, bytesIn, err := importPage(
-		context.Background(), objects, page, "b1",
-		&Options{BucketName: "vb", DryRun: true},
+		context.Background(), syncTestBackend(page),
+		testImportRun(objects, &Options{BucketName: "vb", DryRun: true}), page,
 	)
 	if err != nil {
 		t.Fatalf("importPage: %v", err)
@@ -220,8 +249,8 @@ func TestImportPage_RealImportSkipsExisting(t *testing.T) {
 
 	// First pass: both rows are created.
 	imp, skip, bytesIn, err := importPage(
-		context.Background(), objects, page, "b1",
-		&Options{BucketName: "vb"},
+		context.Background(), syncTestBackend(page),
+		testImportRun(objects, &Options{BucketName: "vb"}), page,
 	)
 	if err != nil {
 		t.Fatalf("importPage first pass: %v", err)
@@ -232,8 +261,8 @@ func TestImportPage_RealImportSkipsExisting(t *testing.T) {
 
 	// Second pass: both already exist, so ImportObject returns (false, nil).
 	imp, skip, bytesIn, err = importPage(
-		context.Background(), objects, page, "b1",
-		&Options{BucketName: "vb"},
+		context.Background(), syncTestBackend(page),
+		testImportRun(objects, &Options{BucketName: "vb"}), page,
 	)
 	if err != nil {
 		t.Fatalf("importPage second pass: %v", err)
@@ -248,13 +277,40 @@ func TestImportPage_RealImportSkipsExisting(t *testing.T) {
 func TestImportPage_PropagatesError(t *testing.T) {
 	_, _ = freshStore(t)
 	wrapped := errorObjectStore{err: os.ErrPermission}
+	page := []backend.ListedObject{{Key: "x", SizeBytes: 1}}
 	_, _, _, err := importPage(
-		context.Background(), wrapped,
-		[]backend.ListedObject{{Key: "x", SizeBytes: 1}},
-		"b1", &Options{BucketName: "vb"},
+		context.Background(), syncTestBackend(page),
+		testImportRun(wrapped, &Options{BucketName: "vb"}), page,
 	)
 	if err == nil {
 		t.Fatal("expected error to propagate")
+	}
+}
+
+// suppressedObjectStore refuses every import the way the store does for a key
+// whose delete is still outstanding.
+type suppressedObjectStore struct{ errorObjectStore }
+
+// ImportObject reports the key as suppressed rather than imported.
+func (suppressedObjectStore) ImportObject(context.Context, *core.ImportObjectRequest) (core.ImportOutcome, error) {
+	return core.ImportSkippedPendingCleanup, nil
+}
+
+// TestImportPage_SkipsKeyWithPendingDelete asserts a key refused because its
+// delete is still outstanding counts as skipped and contributes no bytes.
+// Counting it as imported would report a resurrection as a successful sync.
+func TestImportPage_SkipsKeyWithPendingDelete(t *testing.T) {
+	_, _ = freshStore(t)
+	page := []backend.ListedObject{{Key: "x", SizeBytes: 7}}
+	imp, skip, bytesIn, err := importPage(
+		context.Background(), syncTestBackend(page),
+		testImportRun(suppressedObjectStore{}, &Options{BucketName: "vb"}), page,
+	)
+	if err != nil {
+		t.Fatalf("importPage: %v", err)
+	}
+	if imp != 0 || skip != 1 || bytesIn != 0 {
+		t.Errorf("imported=%d skipped=%d bytes=%d, want 0/1/0", imp, skip, bytesIn)
 	}
 }
 
@@ -278,4 +334,30 @@ func TestRun_FailsWithoutLiveBackend(t *testing.T) {
 	if code != 1 {
 		t.Errorf("exit code = %d, want 1 (no live S3 backend at fixture URL)", code)
 	}
+}
+
+// -------------------------------------------------------------------------
+// INTERNALS
+// -------------------------------------------------------------------------
+
+// syncTestBackend returns an in-memory backend holding plaintext bytes for
+// every key in a listing page, so the import path's envelope inspection has
+// something real to read.
+// testImportRun builds the per-run state importPage reads, with no codec: these
+// cases seed plaintext bodies, which nothing tries to recognise.
+func testImportRun(store importer, opts *Options) *importRun {
+	return &importRun{
+		Store:      store,
+		BackendCfg: &config.BackendConfig{Name: "b1"},
+		Buckets:    []string{"vb"},
+		Opts:       opts,
+	}
+}
+
+func syncTestBackend(page []backend.ListedObject) *backendtest.InMemory {
+	be := backendtest.NewInMemory()
+	for _, o := range page {
+		be.Objects[o.Key] = backendtest.Object{Data: []byte("plaintext body")}
+	}
+	return be
 }

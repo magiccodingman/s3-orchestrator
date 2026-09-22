@@ -21,9 +21,11 @@ import (
 	"time"
 
 	"github.com/afreidah/s3-orchestrator/internal/config"
+	"github.com/afreidah/s3-orchestrator/internal/counter"
 	"github.com/afreidah/s3-orchestrator/internal/observe/audit"
 	"github.com/afreidah/s3-orchestrator/internal/observe/logfmt"
 	"github.com/afreidah/s3-orchestrator/internal/observe/telemetry"
+	"github.com/afreidah/s3-orchestrator/internal/progress"
 	"github.com/afreidah/s3-orchestrator/internal/proxy/writepath"
 	"github.com/afreidah/s3-orchestrator/internal/store/core"
 	"github.com/afreidah/s3-orchestrator/internal/util/must"
@@ -78,14 +80,35 @@ type RebalanceMove struct {
 	SizeBytes   int64
 }
 
+// progressLabel names the move for a streaming caller: the object and the
+// backends it travels between, which is the whole of what a rebalance does.
+func (m RebalanceMove) progressLabel() string {
+	return fmt.Sprintf("%s  %s -> %s", m.ObjectKey, m.FromBackend, m.ToBackend)
+}
+
+// Why a cycle declined to move anything. Reported instead of a zero move count,
+// which a caller cannot tell apart from a cycle that ran and found nothing.
+const (
+	SkipReasonWithinThreshold = "backend utilization is already within the rebalance threshold"
+	SkipReasonEmptyPlan       = "the rebalance strategy planned no moves"
+)
+
+// RebalanceSummary is one cycle's outcome. SkipReason is set when the cycle
+// never planned any moves; the embedded WorkSummary is zero in that case.
+type RebalanceSummary struct {
+	WorkSummary
+	SkipReason string
+}
+
 // -------------------------------------------------------------------------
 // PUBLIC API
 // -------------------------------------------------------------------------
 
 // Rebalance moves objects between backends to optimize space distribution.
-// Returns the number of objects successfully moved.
-func (r *Rebalancer) Rebalance(ctx context.Context, cfg config.RebalanceConfig) (WorkSummary, error) {
-	return runOpsCycle(ctx, "Rebalance", "rebalance", func(ctx context.Context) (WorkSummary, error) {
+// observer, when non-nil, receives a step per planned move so a streaming
+// caller can report progress as the cycle runs.
+func (r *Rebalancer) Rebalance(ctx context.Context, cfg config.RebalanceConfig, observer progress.Observer) (RebalanceSummary, error) {
+	return runOpsCycle(ctx, "Rebalance", "rebalance", func(ctx context.Context) (RebalanceSummary, error) {
 		start := time.Now()
 		audit.Log(ctx, "rebalance.start",
 			slog.String("strategy", cfg.Strategy),
@@ -95,15 +118,15 @@ func (r *Rebalancer) Rebalance(ctx context.Context, cfg config.RebalanceConfig) 
 
 		stats, err := r.store.GetQuotaStats(ctx)
 		if err != nil {
-			telemetry.RebalanceRunsTotal.WithLabelValues(cfg.Strategy, "error").Inc()
-			return WorkSummary{}, fmt.Errorf("failed to get quota stats: %w", err)
+			telemetry.RebalanceRunsTotal.WithLabelValues(cfg.Strategy, OutcomeError).Inc()
+			return RebalanceSummary{}, fmt.Errorf("failed to get quota stats: %w", err)
 		}
 
 		if !ExceedsThreshold(stats, r.ops.BackendOrder(), cfg.Threshold) {
 			r.log.InfoContext(ctx, "rebalance skipping, within threshold",
 				"threshold", cfg.Threshold, "strategy", cfg.Strategy)
 			telemetry.RebalanceSkipped.WithLabelValues("threshold").Inc()
-			return WorkSummary{}, nil
+			return RebalanceSummary{SkipReason: SkipReasonWithinThreshold}, nil
 		}
 
 		var plan []RebalanceMove
@@ -113,11 +136,11 @@ func (r *Rebalancer) Rebalance(ctx context.Context, cfg config.RebalanceConfig) 
 		case "spread":
 			plan, err = r.PlanSpreadEven(ctx, stats, cfg.BatchSize)
 		default:
-			return WorkSummary{}, fmt.Errorf("unknown rebalance strategy: %s", cfg.Strategy)
+			return RebalanceSummary{}, fmt.Errorf("unknown rebalance strategy: %s", cfg.Strategy)
 		}
 		if err != nil {
-			telemetry.RebalanceRunsTotal.WithLabelValues(cfg.Strategy, "error").Inc()
-			return WorkSummary{}, fmt.Errorf("failed to plan rebalance: %w", err)
+			telemetry.RebalanceRunsTotal.WithLabelValues(cfg.Strategy, OutcomeError).Inc()
+			return RebalanceSummary{}, fmt.Errorf("failed to plan rebalance: %w", err)
 		}
 
 		telemetry.RebalancePending.Set(float64(len(plan)))
@@ -125,12 +148,12 @@ func (r *Rebalancer) Rebalance(ctx context.Context, cfg config.RebalanceConfig) 
 		if len(plan) == 0 {
 			r.log.InfoContext(ctx, "rebalance skipping, empty plan", "strategy", cfg.Strategy)
 			telemetry.RebalanceSkipped.WithLabelValues("empty_plan").Inc()
-			return WorkSummary{}, nil
+			return RebalanceSummary{SkipReason: SkipReasonEmptyPlan}, nil
 		}
 
-		sum := r.ExecuteMoves(ctx, plan, cfg.Strategy, cfg.Concurrency)
+		sum := r.ExecuteMoves(ctx, plan, cfg.Strategy, cfg.Concurrency, observer)
 
-		telemetry.RebalanceRunsTotal.WithLabelValues(cfg.Strategy, "success").Inc()
+		telemetry.RebalanceRunsTotal.WithLabelValues(cfg.Strategy, sum.Outcome()).Inc()
 		telemetry.RebalanceDuration.WithLabelValues(cfg.Strategy).Observe(time.Since(start).Seconds())
 
 		audit.Log(ctx, "rebalance.complete",
@@ -139,7 +162,7 @@ func (r *Rebalancer) Rebalance(ctx context.Context, cfg config.RebalanceConfig) 
 			slog.Int("planned", len(plan)),
 			slog.Duration("duration", time.Since(start)),
 		)
-		return sum, nil
+		return RebalanceSummary{WorkSummary: sum}, nil
 	})
 }
 
@@ -198,16 +221,16 @@ type backendUtil struct {
 func (r *Rebalancer) PlanPackTight(ctx context.Context, stats map[string]core.QuotaStat, batchSize int) ([]RebalanceMove, error) {
 	simUsed := make(map[string]int64)
 	backends := sortedBackendsByUtilDesc(r.ops.BackendOrder(), stats, simUsed)
+	state := newPlanState(r.ops.Usage(), simUsed, batchSize)
 
 	var plan []RebalanceMove
-	remaining := batchSize
 	candidates := r.newCandidateCache(batchSize)
 
-	for di := 0; di < len(backends) && remaining > 0; di++ {
+	for di := 0; di < len(backends) && state.remaining > 0; di++ {
 		if ctx.Err() != nil {
 			return plan, ctx.Err()
 		}
-		moves, err := r.packMovesIntoDestination(ctx, di, backends, simUsed, candidates, &remaining)
+		moves, err := r.packMovesIntoDestination(ctx, di, backends, state, candidates)
 		if err != nil {
 			return nil, err
 		}
@@ -246,20 +269,19 @@ func (r *Rebalancer) packMovesIntoDestination(
 	ctx context.Context,
 	di int,
 	backends []backendUtil,
-	simUsed map[string]int64,
+	state *planState,
 	candidates *candidateCache,
-	remaining *int,
 ) ([]RebalanceMove, error) {
 	dest := backends[di]
-	destFree := dest.Limit - simUsed[dest.Name]
+	destFree := dest.Limit - state.simUsed[dest.Name]
 	if destFree <= 0 {
 		return nil, nil
 	}
 
 	var plan []RebalanceMove
-	for si := len(backends) - 1; si > di && *remaining > 0 && destFree > 0; si-- {
+	for si := len(backends) - 1; si > di && state.remaining > 0 && destFree > 0; si-- {
 		src := backends[si]
-		if !srcLessUtilized(src, dest, simUsed) {
+		if !srcLessUtilized(src, dest, state.simUsed) {
 			continue
 		}
 
@@ -268,7 +290,7 @@ func (r *Rebalancer) packMovesIntoDestination(
 			return nil, err
 		}
 
-		moves := r.packMovesFromSource(src, dest, sc.Objects, sc.Placement, simUsed, &destFree, remaining)
+		moves := r.packMovesFromSource(src, dest, sc.Objects, sc.Placement, state, &destFree)
 		plan = append(plan, moves...)
 	}
 	return plan, nil
@@ -281,22 +303,25 @@ func (r *Rebalancer) packMovesFromSource(
 	src, dest backendUtil,
 	objects []core.ObjectLocation,
 	placement PlacementSet,
-	simUsed map[string]int64,
+	state *planState,
 	destFree *int64,
-	remaining *int,
 ) []RebalanceMove {
 	var moves []RebalanceMove
 	for oi := range objects {
-		if *remaining <= 0 || *destFree <= 0 {
+		if state.remaining <= 0 || *destFree <= 0 {
 			break
 		}
 		if objects[oi].SizeBytes > *destFree {
 			continue
 		}
-		if !srcLessUtilized(src, dest, simUsed) {
+		if !srcLessUtilized(src, dest, state.simUsed) {
 			break
 		}
 		if placement.Has(objects[oi].ObjectKey, dest.Name) {
+			continue
+		}
+		if !state.allows(src.Name, dest.Name, objects[oi].SizeBytes) {
+			telemetry.UsageLimitRejectionsTotal.WithLabelValues("rebalance", "transfer").Inc()
 			continue
 		}
 
@@ -306,10 +331,8 @@ func (r *Rebalancer) packMovesFromSource(
 			ToBackend:   dest.Name,
 			SizeBytes:   objects[oi].SizeBytes,
 		})
+		state.accept(src.Name, dest.Name, objects[oi].SizeBytes)
 		*destFree -= objects[oi].SizeBytes
-		simUsed[dest.Name] += objects[oi].SizeBytes
-		simUsed[src.Name] -= objects[oi].SizeBytes
-		*remaining--
 	}
 	return moves
 }
@@ -322,12 +345,10 @@ func srcLessUtilized(src, dest backendUtil, simUsed map[string]int64) bool {
 	return srcRatio < destRatio
 }
 
-// fetchCopyMap batches GetObjectBackendsForKeys for every candidate
-// key. Replaces a per-object GetAllObjectLocations call that the inner
-// loop would otherwise issue. Returns the lookup error so callers fail
-// planning rather than silently continue with empty placement data,
-// which previously caused unnecessary transfers when destinations
-// already held a copy.
+// fetchCopyMap batches GetObjectBackendsForKeys for every candidate key, so the
+// inner loop does not issue a per-object lookup. Returns the lookup error so
+// callers fail planning rather than continue with empty placement data, which
+// plans transfers to destinations that already hold a copy.
 func (r *Rebalancer) fetchCopyMap(ctx context.Context, objects []core.ObjectLocation) (map[string][]string, error) {
 	keys := make([]string, len(objects))
 	for i := range objects {
@@ -358,15 +379,15 @@ func (r *Rebalancer) PlanSpreadEven(ctx context.Context, stats map[string]core.Q
 	if !ok {
 		return nil, nil
 	}
+	state := newPlanState(r.ops.Usage(), simUsed, batchSize)
 
 	var plan []RebalanceMove
-	remaining := batchSize
 
 	for si := range sources {
-		if remaining <= 0 || ctx.Err() != nil {
+		if state.remaining <= 0 || ctx.Err() != nil {
 			break
 		}
-		moves, err := r.spreadMovesFromSource(ctx, &sources[si], destinations, stats, simUsed, &remaining)
+		moves, err := r.spreadMovesFromSource(ctx, &sources[si], destinations, stats, state)
 		if err != nil {
 			return nil, err
 		}
@@ -432,10 +453,9 @@ func (r *Rebalancer) spreadMovesFromSource(
 	src *backendBalance,
 	destinations []backendBalance,
 	stats map[string]core.QuotaStat,
-	simUsed map[string]int64,
-	remaining *int,
+	state *planState,
 ) ([]RebalanceMove, error) {
-	objects, err := r.store.ListObjectsByBackend(ctx, src.Name, *remaining)
+	objects, err := r.store.ListObjectsByBackend(ctx, src.Name, state.remaining)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list objects on %s: %w", src.Name, err)
 	}
@@ -447,18 +467,23 @@ func (r *Rebalancer) spreadMovesFromSource(
 
 	var moves []RebalanceMove
 	for oi := range objects {
-		if *remaining <= 0 || src.Balance <= 0 {
+		if state.remaining <= 0 || src.Balance <= 0 {
 			break
 		}
 		if objects[oi].SizeBytes > src.Balance {
 			continue
 		}
-		bestDest := findSpreadDestination(&objects[oi], destinations, placement, stats, simUsed)
+		bestDest := findSpreadDestination(&objects[oi], destinations, placement, stats, state.simUsed)
 		if bestDest < 0 {
 			continue
 		}
 
 		dest := &destinations[bestDest]
+		if !state.allows(src.Name, dest.Name, objects[oi].SizeBytes) {
+			telemetry.UsageLimitRejectionsTotal.WithLabelValues("rebalance", "transfer").Inc()
+			continue
+		}
+
 		moves = append(moves, RebalanceMove{
 			ObjectKey:   objects[oi].ObjectKey,
 			FromBackend: src.Name,
@@ -467,9 +492,7 @@ func (r *Rebalancer) spreadMovesFromSource(
 		})
 		src.Balance -= objects[oi].SizeBytes
 		dest.Balance += objects[oi].SizeBytes
-		simUsed[src.Name] -= objects[oi].SizeBytes
-		simUsed[dest.Name] += objects[oi].SizeBytes
-		*remaining--
+		state.accept(src.Name, dest.Name, objects[oi].SizeBytes)
 	}
 	return moves, nil
 }
@@ -505,9 +528,16 @@ func findSpreadDestination(
 
 // ExecuteMoves runs the planned object moves with bounded concurrency.
 // Skips individual moves that fail and continues with the rest, returning
-// the count of successful moves.
-func (r *Rebalancer) ExecuteMoves(ctx context.Context, plan []RebalanceMove, strategy string, concurrency int) WorkSummary {
-	runner := BatchRunner[RebalanceMove]{Name: "rebalance", Log: r.log, Concurrency: concurrency}
+// the count of successful moves. observer, when non-nil, receives a step per
+// move labelled with the object and the backends it travels between.
+func (r *Rebalancer) ExecuteMoves(ctx context.Context, plan []RebalanceMove, strategy string, concurrency int, observer progress.Observer) WorkSummary {
+	runner := BatchRunner[RebalanceMove]{
+		Name:        "rebalance",
+		Log:         r.log,
+		Concurrency: concurrency,
+		Observer:    observer,
+		Key:         RebalanceMove.progressLabel,
+	}
 	return runner.Run(ctx, plan, func(ctx context.Context, mv RebalanceMove) ItemResult {
 		defer telemetry.RebalancePending.Dec()
 		var res ItemResult // zero value (ItemSkipped) when admission blocks the move
@@ -569,4 +599,88 @@ func (r *Rebalancer) ExecuteOneMove(ctx context.Context, move RebalanceMove, str
 	telemetry.RebalanceObjectsMoved.WithLabelValues(strategy, "success").Inc()
 	telemetry.RebalanceBytesMoved.WithLabelValues(strategy).Add(float64(movedSize))
 	return true
+}
+
+// -------------------------------------------------------------------------
+// USAGE BUDGET
+// -------------------------------------------------------------------------
+
+// planState is the running state of one rebalance cycle: the simulated stored
+// bytes, the committed transfer, and how many moves the batch has left.
+//
+// Grouped because every accepted move mutates all three together. Threading
+// them individually put the pack helpers past the parameter count a reader can
+// hold, and left the mutations inline at each call site where dropping one -
+// the source side of simUsed, say - would quietly skew every later decision in
+// the same plan.
+type planState struct {
+	simUsed   map[string]int64
+	budget    *usageBudget
+	remaining int
+}
+
+func newPlanState(usage *counter.UsageTracker, simUsed map[string]int64, batchSize int) *planState {
+	return &planState{simUsed: simUsed, budget: newUsageBudget(usage), remaining: batchSize}
+}
+
+// allows reports whether the plan may still move size bytes from src to dest.
+func (p *planState) allows(src, dest string, size int64) bool {
+	return p.remaining > 0 && p.budget.allows(src, dest, size)
+}
+
+// accept records one planned move against every counter it affects.
+func (p *planState) accept(src, dest string, size int64) {
+	p.budget.commit(src, dest, size)
+	p.simUsed[dest] += size
+	p.simUsed[src] -= size
+	p.remaining--
+}
+
+// usageBudget tracks the transfer a plan has already committed so a batch of
+// moves cannot collectively breach a limit that each move individually fits
+// inside. It is the usage-side counterpart to simUsed, which does the same job
+// for stored bytes.
+//
+// A move spends two different allowances on two different backends: reading the
+// object is egress on the source, writing it is ingress on the destination. The
+// two are checked separately because a backend can have headroom in one and
+// none in the other.
+type usageBudget struct {
+	usage   *counter.UsageTracker
+	egress  map[string]int64
+	ingress map[string]int64
+}
+
+func newUsageBudget(usage *counter.UsageTracker) *usageBudget {
+	return &usageBudget{
+		usage:   usage,
+		egress:  map[string]int64{},
+		ingress: map[string]int64{},
+	}
+}
+
+// allows reports whether moving size bytes from src to dest stays inside both
+// backends' limits, counting what this plan has already committed.
+//
+// Draining is deliberately not consulted: a drain exists to move data off a
+// draining backend, so excluding it as a source would stall the operation it
+// is meant to perform. This is why the check is WithinLimits rather than
+// EligibleForWrite, which excludes draining backends.
+func (b *usageBudget) allows(src, dest string, size int64) bool {
+	if b == nil || b.usage == nil {
+		return true
+	}
+	if !b.usage.WithinLimits(src, getObjectOp, b.egress[src]+size, 0) {
+		return false
+	}
+	return b.usage.WithinLimits(dest, putObjectOp, 0, b.ingress[dest]+size)
+}
+
+// commit records a planned move against both backends' allowances.
+func (b *usageBudget) commit(src, dest string, size int64) {
+	if b == nil {
+		return
+	}
+	b.egress[src] += size
+	b.ingress[dest] += size
 }

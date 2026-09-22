@@ -19,6 +19,10 @@ import (
 	"time"
 )
 
+// -------------------------------------------------------------------------
+// TYPES
+// -------------------------------------------------------------------------
+
 // RateLimitConfig holds per-IP rate limiting settings. Disabled by default.
 type RateLimitConfig struct {
 	Enabled         bool          `yaml:"enabled"`
@@ -32,21 +36,19 @@ type RateLimitConfig struct {
 // CircuitBreakerConfig holds settings for the database circuit breaker. When
 // the database becomes unreachable, the proxy enters degraded mode: reads
 // broadcast to all backends, writes return 503.
+//
+// DegradedBroadcastParallelism only means anything when ParallelBroadcast is
+// on. Zero probes every configured backend at once; a positive value makes the
+// probes a rolling window, launching the first N and replenishing from the
+// pending list as each one fails, so at most N are ever in flight.
 type CircuitBreakerConfig struct {
-	FailureThreshold  int           `yaml:"failure_threshold"`  // Consecutive failures before opening (default: 3)
-	OpenTimeout       time.Duration `yaml:"open_timeout"`       // Delay before probing recovery (default: 15s)
-	CacheTTL          time.Duration `yaml:"cache_ttl"`          // TTL for key->backend cache during degraded reads (default: 60s)
-	ParallelBroadcast bool          `yaml:"parallel_broadcast"` // Fan-out reads to all backends in parallel during degraded mode (default: false)
-	// DegradedBroadcastParallelism caps the number of backends probed
-	// concurrently during a parallel degraded-mode broadcast. 0 means no
-	// cap (every configured backend is probed at once, the historical
-	// behaviour). With a positive value, probes run as a rolling window:
-	// the first N are launched immediately, and each failure replenishes
-	// the next pending backend so at most N goroutines are in flight at
-	// any time. Only meaningful when ParallelBroadcast is true.
-	DegradedBroadcastParallelism int `yaml:"degraded_broadcast_parallelism"`
-	// DegradedReadsEnabled opts out of degraded-mode broadcasts (default true; set false to fail fast on DB outage).
-	DegradedReadsEnabled *bool `yaml:"degraded_reads_enabled"`
+	FailureThreshold  int           `yaml:"failure_threshold"`  // consecutive failures before opening (default 3)
+	OpenTimeout       time.Duration `yaml:"open_timeout"`       // delay before probing recovery (default 15s)
+	CacheTTL          time.Duration `yaml:"cache_ttl"`          // TTL for the key->backend cache during degraded reads (default 60s)
+	ParallelBroadcast bool          `yaml:"parallel_broadcast"` // fan degraded reads out to all backends at once (default false)
+
+	DegradedBroadcastParallelism int   `yaml:"degraded_broadcast_parallelism"` // 0 is uncapped
+	DegradedReadsEnabled         *bool `yaml:"degraded_reads_enabled"`         // default true; false fails fast on a DB outage
 }
 
 // BackendCircuitBreakerConfig holds settings for per-backend circuit breakers.
@@ -59,6 +61,10 @@ type BackendCircuitBreakerConfig struct {
 	OpenTimeout      time.Duration `yaml:"open_timeout"`      // Delay before probing recovery (default: 5m)
 }
 
+// -------------------------------------------------------------------------
+// INTERNALS
+// -------------------------------------------------------------------------
+
 // setDefaultsAndValidate sets defaults and validate.
 func (r *RateLimitConfig) setDefaultsAndValidate() []error {
 	var errs []error
@@ -68,7 +74,7 @@ func (r *RateLimitConfig) setDefaultsAndValidate() []error {
 	// rate limiting.
 	for _, cidr := range r.TrustedProxies {
 		if _, _, err := net.ParseCIDR(cidr); err != nil {
-			errs = append(errs, fmt.Errorf("%w: %q: %v", ErrInvalidCIDR, cidr, err))
+			errs = append(errs, fmt.Errorf("%w: %q: %w", ErrInvalidCIDR, cidr, err))
 		}
 	}
 
@@ -96,11 +102,11 @@ func (cb *CircuitBreakerConfig) setDefaults() {
 	cb.FailureThreshold = defaulted(cb.FailureThreshold, 3)
 	cb.OpenTimeout = defaulted(cb.OpenTimeout, 15*time.Second)
 	cb.CacheTTL = defaulted(cb.CacheTTL, 60*time.Second)
-	// DegradedBroadcastParallelism intentionally has no positive
-	// default: zero preserves the historical "fan out to every backend"
-	// behaviour; operators opt into the rolling-window cap by setting a
-	// positive value. A negative value is normalised to zero so a typo
-	// cannot accidentally disable the broadcast entirely.
+	// DegradedBroadcastParallelism intentionally has no positive default:
+	// zero means fan out to every backend, and operators opt into the
+	// rolling-window cap by setting a positive value. A negative value is
+	// normalised to zero so a typo cannot accidentally disable the
+	// broadcast entirely.
 	if cb.DegradedBroadcastParallelism < 0 {
 		cb.DegradedBroadcastParallelism = 0
 	}

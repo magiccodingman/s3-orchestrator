@@ -20,15 +20,45 @@ import (
 	"testing/synctest"
 	"time"
 
-	"github.com/afreidah/s3-orchestrator/internal/observe/telemetry"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+
+	"github.com/afreidah/s3-orchestrator/internal/observe/telemetry"
 )
+
+// -------------------------------------------------------------------------
+// CONSTRUCTOR
+// -------------------------------------------------------------------------
+
+// newAdmissionFor builds a controller over a semaphore the test owns. Production
+// wires the semaphore externally (di.admissionSemFor) so background workers share
+// one budget with HTTP requests; these helpers keep that shape without each test
+// spelling out the channel.
+func newAdmissionFor(maxConcurrent int) *AdmissionController {
+	return newAdmissionWithLimits(maxConcurrent, AdmissionLimits{})
+}
+
+// newAdmissionWithLimits is newAdmissionFor for the tests that exercise
+// shedding or the admission wait, which are constructor arguments rather than
+// something a test can set after the fact.
+func newAdmissionWithLimits(maxConcurrent int, lim AdmissionLimits) *AdmissionController {
+	return NewAdmissionControllerFromSem(make(chan struct{}, maxConcurrent), lim)
+}
+
+// newSplitAdmissionFor is newAdmissionFor for the split read/write variant.
+func newSplitAdmissionFor(maxReads, maxWrites int) *AdmissionController {
+	return NewSplitAdmissionControllerFromSem(
+		make(chan struct{}, maxReads), make(chan struct{}, maxWrites), AdmissionLimits{})
+}
+
+// -------------------------------------------------------------------------
+// PUBLIC API
+// -------------------------------------------------------------------------
 
 // TestAdmissionController_AllowsWithinLimit verifies the admission controller allows within limit contract.
 // Asserts that request : got , want 200.
 func TestAdmissionController_AllowsWithinLimit(t *testing.T) {
 	t.Parallel()
-	ac := NewAdmissionController(2)
+	ac := newAdmissionFor(2)
 
 	handler := ac.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -49,7 +79,7 @@ func TestAdmissionController_AllowsWithinLimit(t *testing.T) {
 // Asserts that second request: got , want 503.
 func TestAdmissionController_RejectsOverLimit(t *testing.T) {
 	t.Parallel()
-	ac := NewAdmissionController(1)
+	ac := newAdmissionFor(1)
 
 	// entered signals that the handler goroutine has acquired the semaphore.
 	// Buffered so the send always succeeds even if the test hasn't reached
@@ -102,7 +132,7 @@ func TestAdmissionController_RejectsOverLimit(t *testing.T) {
 // Asserts that first request: got , want 200.
 func TestAdmissionController_ReleasesOnCompletion(t *testing.T) {
 	t.Parallel()
-	ac := NewAdmissionController(1)
+	ac := newAdmissionFor(1)
 
 	handler := ac.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -129,7 +159,7 @@ func TestAdmissionController_ReleasesOnCompletion(t *testing.T) {
 // Asserts that status = , want 503.
 func TestAdmissionController_IncrementsMetric(t *testing.T) {
 	t.Parallel()
-	ac := NewAdmissionController(1)
+	ac := newAdmissionFor(1)
 
 	entered := make(chan struct{}, 1)
 	hold := make(chan struct{})
@@ -174,7 +204,7 @@ func TestAdmissionController_IncrementsMetric(t *testing.T) {
 // Asserts that second write: got , want 503.
 func TestSplitAdmission_WriteFull_ReadAllowed(t *testing.T) {
 	t.Parallel()
-	ac := NewSplitAdmissionController(2, 1)
+	ac := newSplitAdmissionFor(2, 1)
 
 	entered := make(chan struct{}, 2)
 	hold := make(chan struct{})
@@ -223,7 +253,7 @@ func TestSplitAdmission_WriteFull_ReadAllowed(t *testing.T) {
 // Asserts that second read: got , want 503.
 func TestSplitAdmission_ReadFull_WriteAllowed(t *testing.T) {
 	t.Parallel()
-	ac := NewSplitAdmissionController(1, 2)
+	ac := newSplitAdmissionFor(1, 2)
 
 	entered := make(chan struct{}, 2)
 	hold := make(chan struct{})
@@ -272,8 +302,7 @@ func TestSplitAdmission_ReadFull_WriteAllowed(t *testing.T) {
 // Asserts that shed /1000 at 80 occupancy (threshold 50), expected ~600.
 func TestAdmissionController_LoadShedding(t *testing.T) {
 	t.Parallel()
-	ac := NewAdmissionController(10)
-	ac.SetShedThreshold(0.5)
+	ac := newAdmissionWithLimits(10, AdmissionLimits{ShedThreshold: 0.5})
 
 	// Fill 8 of 10 slots -> 80% occupancy, above 50% threshold
 	for range 8 {
@@ -299,11 +328,10 @@ func TestAdmissionController_LoadShedding(t *testing.T) {
 	}
 }
 
-// TestAdmissionController_NoSheddingBelowThreshold verifies the admission controller no shedding below threshold path by exercising ac.SetShedThreshold.
+// TestAdmissionController_NoSheddingBelowThreshold verifies the admission controller no shedding below threshold path by exercising the shed threshold.
 func TestAdmissionController_NoSheddingBelowThreshold(t *testing.T) {
 	t.Parallel()
-	ac := NewAdmissionController(10)
-	ac.SetShedThreshold(0.8)
+	ac := newAdmissionWithLimits(10, AdmissionLimits{ShedThreshold: 0.8})
 
 	// 0% occupancy, well below 80% threshold  -  should never shed
 	for range 100 {
@@ -319,8 +347,7 @@ func TestAdmissionController_SheddingStartsAtThreshold(t *testing.T) {
 	t.Parallel()
 	// With capacity=10 and threshold=0.5, int(0.5*10) = 5.
 	// Shedding should start when occupancy reaches 5 (not 6).
-	ac := NewAdmissionController(10)
-	ac.SetShedThreshold(0.5)
+	ac := newAdmissionWithLimits(10, AdmissionLimits{ShedThreshold: 0.5})
 
 	// Fill exactly to threshold (5 of 10)
 	for range 5 {
@@ -374,7 +401,7 @@ func TestAdmissionController_SheddingStartsAtThreshold(t *testing.T) {
 // Asserts that PUT while DELETE holds write pool: got , want 503.
 func TestSplitAdmission_DeleteUsesWritePool(t *testing.T) {
 	t.Parallel()
-	ac := NewSplitAdmissionController(2, 1)
+	ac := newSplitAdmissionFor(2, 1)
 
 	entered := make(chan struct{}, 1)
 	hold := make(chan struct{})
@@ -410,8 +437,7 @@ func TestSplitAdmission_DeleteUsesWritePool(t *testing.T) {
 func TestAdmissionController_WaitAcquiresSlot(t *testing.T) {
 	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
-		ac := NewAdmissionController(1)
-		ac.SetAdmissionWait(200 * time.Millisecond)
+		ac := newAdmissionWithLimits(1, AdmissionLimits{Wait: 200 * time.Millisecond})
 
 		hold := make(chan struct{})
 		entered := make(chan struct{}, 1)
@@ -453,8 +479,7 @@ func TestAdmissionController_WaitAcquiresSlot(t *testing.T) {
 // Asserts that timed-out request: got , want 503.
 func TestAdmissionController_WaitTimesOut(t *testing.T) {
 	t.Parallel()
-	ac := NewAdmissionController(1)
-	ac.SetAdmissionWait(20 * time.Millisecond)
+	ac := newAdmissionWithLimits(1, AdmissionLimits{Wait: 20 * time.Millisecond})
 
 	hold := make(chan struct{})
 	entered := make(chan struct{}, 1)
@@ -491,10 +516,9 @@ func TestAdmissionController_WaitTimesOut(t *testing.T) {
 func TestAdmissionController_ClientCancelDuringWaitNotCountedAsRejection(t *testing.T) {
 	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
-		ac := NewAdmissionController(1)
 		// Generous wait so the test reliably observes the client-cancel branch
 		// rather than racing the timer.
-		ac.SetAdmissionWait(2 * time.Second)
+		ac := newAdmissionWithLimits(1, AdmissionLimits{Wait: 2 * time.Second})
 
 		hold := make(chan struct{})
 		entered := make(chan struct{}, 1)

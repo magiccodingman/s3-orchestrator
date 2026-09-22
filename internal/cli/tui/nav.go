@@ -4,9 +4,9 @@
 // Author: Alex Freidah
 //
 // The persistent left nav bar and the top-level section model. Sections are the
-// nav destinations (Files, Backends, and a Logs placeholder); the active
-// section drives what the content area to the right renders. The nav can take
-// focus (tab) for arrow-key selection, and letter shortcuts jump directly.
+// nav destinations (Files, Backends, Replication, Logs, Ops); the active section
+// drives what the content area to the right renders. The nav can take focus
+// (tab) for arrow-key selection, and letter shortcuts jump directly.
 // -------------------------------------------------------------------------------
 
 package tui
@@ -18,8 +18,14 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
+// -------------------------------------------------------------------------
+// CONSTANTS
+// -------------------------------------------------------------------------
+
 // sidebarWidth is the fixed content width of the left nav (excluding its border).
-const sidebarWidth = 14
+// It must fit the widest row: a two-column marker plus the longest label
+// ("Replication"), else lipgloss soft-wraps the row and mangles the layout.
+const sidebarWidth = 16
 
 // section is a top-level nav destination.
 type section int
@@ -27,7 +33,13 @@ type section int
 const (
 	sectionFiles section = iota
 	sectionBackends
+	sectionBuckets
+	sectionReplication
+	sectionWorkers
+	sectionCleanup
+	sectionCache
 	sectionLogs
+	sectionOps
 )
 
 // navEntry is one row in the left nav.
@@ -43,13 +55,19 @@ func navEntries() []navEntry {
 	return []navEntry{
 		{"Files", sectionFiles, true},
 		{"Backends", sectionBackends, true},
+		{"Buckets", sectionBuckets, true},
+		{"Replication", sectionReplication, true},
+		{"Workers", sectionWorkers, true},
+		{"Cleanup", sectionCleanup, true},
+		{"Cache", sectionCache, true},
 		{"Logs", sectionLogs, true},
+		{"Ops", sectionOps, true},
 	}
 }
 
 // selectableSections is the number of enabled nav destinations; it bounds the
 // nav cursor.
-const selectableSections = 3
+const selectableSections = 9
 
 // contentWidth is the width available to the content area beside the nav.
 func (m *model) contentWidth() int {
@@ -63,6 +81,10 @@ func (m *model) contentWidth() int {
 // (one column on each side); the rendered table is this much wider per column
 // than the sum of the declared column widths.
 const tableCellPad = 2
+
+// -------------------------------------------------------------------------
+// INTERNALS
+// -------------------------------------------------------------------------
 
 // fitFirstColumn sizes a table's leading name column to fill whatever the fixed
 // columns and per-cell padding leave, capped so short names don't sprawl across
@@ -79,6 +101,15 @@ func fitFirstColumn(contentWidth, fixedSum, cols, maxWidth int) int {
 	return budget
 }
 
+// navBack hands focus back to the nav with the cursor on the section the user
+// is leaving, so stepping out and back in lands where they were. Every content
+// pane binds it to the same keys.
+func (m *model) navBack() (tea.Model, tea.Cmd) {
+	m.navFocus = true
+	m.navCursor = int(m.section)
+	return m, nil
+}
+
 // selectSection switches the active section, drops nav focus, and loads the
 // section's data when entering it needs a fetch.
 func (m *model) selectSection(s section) (tea.Model, tea.Cmd) {
@@ -91,6 +122,33 @@ func (m *model) selectSection(s section) (tea.Model, tea.Cmd) {
 		m.resizeBackends()
 		cmd := m.loadStatus()
 		return m, cmd
+	case sectionBuckets:
+		m.buckets = bucketsView{loading: true, table: newTable()}
+		m.resizeBuckets()
+		cmd := m.loadBuckets()
+		return m, cmd
+	case sectionReplication:
+		return m.enterReplication()
+	case sectionWorkers:
+		m.workers = workersView{loading: true, table: newTable()}
+		m.resizeWorkers()
+		cmd := m.loadWorkers()
+		return m, cmd
+	case sectionCleanup:
+		m.cleanup = cleanupView{loading: true, queue: newTable(), dlq: newTable()}
+		m.resizeCleanup()
+		cmd := m.loadCleanup()
+		return m, cmd
+	case sectionCache:
+		m.cache.loading = m.cache.snap == nil
+		cmd := m.loadCache()
+		return m, cmd
+	case sectionOps:
+		// Entering from the nav is always the fleet-wide menu. A backend-scoped
+		// one is opened by the backends pane, which fills these in itself.
+		m.ops = opsView{actions: opsActions()}
+		m.resizeOps()
+		return m, nil
 	case sectionLogs:
 		m.logs = logsView{loading: true}
 		m.resizeLogs()
@@ -150,9 +208,28 @@ func (m *model) sidebarView() string {
 		b.WriteString(style.Render(marker + label))
 		b.WriteString("\n")
 	}
+
+	// Persistent DB-health indicator, below a divider, visible from any section.
+	b.WriteString(navDisabledStyle.Render(strings.Repeat("-", sidebarWidth-2)))
+	b.WriteString("\n")
+	b.WriteString(m.dbIndicator())
+
 	divider := lipgloss.Color("240")
 	if m.navFocus {
 		divider = lipgloss.Color("39")
 	}
 	return sidebarStyle.BorderForeground(divider).Width(sidebarWidth).Height(m.height).Render(b.String())
+}
+
+// dbIndicator renders the metadata DB health for the sidebar: green when
+// healthy, red when down, faint when not yet known.
+func (m *model) dbIndicator() string {
+	switch {
+	case m.dbHealthy == nil:
+		return navDisabledStyle.Render("db ?")
+	case *m.dbHealthy:
+		return statusOKStyle.Render("db ok")
+	default:
+		return statusErrStyle.Render("db DOWN")
+	}
 }

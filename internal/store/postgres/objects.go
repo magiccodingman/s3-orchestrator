@@ -17,8 +17,8 @@ package postgres
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
-	"time"
 
 	"github.com/afreidah/s3-orchestrator/internal/store/core"
 	db "github.com/afreidah/s3-orchestrator/internal/store/postgres/sqlc"
@@ -27,56 +27,6 @@ import (
 // -------------------------------------------------------------------------
 // OBJECT LOCATION OPERATIONS
 // -------------------------------------------------------------------------
-
-// RecordObject atomically inserts or updates an object location, handling
-// overwrites by returning displaced copies for cleanup. Delegates to
-// core.RecordObject which composes lock, displacement, insert, and
-// quota update against the postgres TxAdapter.
-func (s *Store) RecordObject(ctx context.Context, key, backend string, size int64, enc *core.EncryptionMeta) ([]core.DeletedCopy, error) {
-	return core.RecordObject(ctx, s, key, backend, size, enc)
-}
-
-// RecordObjectAndClearPending performs the same atomic commit as
-// RecordObject and additionally deletes the matching pending_objects
-// intent inside the same transaction. Delegates to core.
-func (s *Store) RecordObjectAndClearPending(ctx context.Context, key, backend string, size int64, enc *core.EncryptionMeta, intentID string) ([]core.DeletedCopy, error) {
-	return core.RecordObjectAndClearPending(ctx, s, key, backend, size, enc, intentID)
-}
-
-// insertParamsFromEnc builds InsertObjectLocationParams, attaching
-// encryption and content-hash metadata when provided.
-func insertParamsFromEnc(key, backend string, size int64, enc *core.EncryptionMeta) db.InsertObjectLocationParams {
-	params := db.InsertObjectLocationParams{
-		ObjectKey:   key,
-		BackendName: backend,
-		SizeBytes:   size,
-	}
-	if enc == nil {
-		return params
-	}
-	if enc.Encrypted {
-		params.Encrypted = true
-		params.EncryptionKey = enc.EncryptionKey
-		params.KeyID = &enc.KeyID
-		params.PlaintextSize = &enc.PlaintextSize
-	}
-	params.ContentHash = strPtr(enc.ContentHash)
-	return params
-}
-
-// DeleteObject removes all copies of an object and decrements their
-// quotas. Returns all deleted copies, or ErrObjectNotFound if the
-// object doesn't exist. Delegates to core.DeleteObject.
-func (s *Store) DeleteObject(ctx context.Context, key string) ([]core.DeletedCopy, error) {
-	return core.DeleteObject(ctx, s, key)
-}
-
-// DeleteObjectsBatch delegates to core.DeleteObjectsBatch which
-// removes every supplied key in one transaction and returns per-key
-// displaced copies for backend cleanup.
-func (s *Store) DeleteObjectsBatch(ctx context.Context, keys []string) (map[string][]core.DeletedCopy, error) {
-	return core.DeleteObjectsBatch(ctx, s, keys)
-}
 
 // ListObjectsByBackend returns objects stored on a specific backend, ordered by
 // size ascending (smallest first). Used by the rebalancer to find movable objects.
@@ -108,13 +58,6 @@ func (s *Store) ListObjectsByBackendKeyAsc(ctx context.Context, backendName, aft
 	return toSlimObjectLocations(rows), nil
 }
 
-// MoveObjectLocation atomically moves a copy of an object from one
-// backend to another. Returns (0, nil) if the source copy is gone or
-// the target already has a copy. Delegates to core.MoveObjectLocation.
-func (s *Store) MoveObjectLocation(ctx context.Context, key, fromBackend, toBackend string) (int64, error) {
-	return core.MoveObjectLocation(ctx, s, key, fromBackend, toBackend)
-}
-
 // ListObjects returns objects matching the given prefix, sorted by key.
 // Supports pagination via startAfter and maxKeys. Returns one extra row to
 // detect truncation.
@@ -123,7 +66,6 @@ func (s *Store) ListObjects(ctx context.Context, prefix, startAfter string, maxK
 		maxKeys = 1000
 	}
 
-	// --- Escape LIKE wildcards in prefix ---
 	escapedPrefix := likeEscaper.Replace(prefix)
 
 	// Fetch one extra to detect truncation
@@ -137,7 +79,31 @@ func (s *Store) ListObjects(ctx context.Context, prefix, startAfter string, maxK
 	}
 
 	objects := toSlimObjectLocations(rows)
+	for i := range rows {
+		objects[i].Identity = listedIdentity(rows[i].Etag)
+	}
 	return core.BuildListPage(objects, maxKeys), nil
+}
+
+// CountObjectsByPrefix returns how many distinct keys live under a prefix,
+// which is what answers whether a bucket still holds anything.
+func (s *Store) CountObjectsByPrefix(ctx context.Context, prefix string) (int64, error) {
+	n, err := s.queries.CountObjectsByPrefix(ctx, likeEscaper.Replace(prefix))
+	if err != nil {
+		return 0, fmt.Errorf("failed to count objects by prefix: %w", err)
+	}
+	return n, nil
+}
+
+// listedIdentity builds the identity a listing row carries. A listing selects
+// the ETag and nothing else of the identity, which is all a Contents entry
+// reports; NULL means the object has not learned one yet and the entry carries
+// no ETag rather than a wrong one.
+func listedIdentity(etag *string) *core.ObjectIdentity {
+	if etag == nil || *etag == "" {
+		return nil
+	}
+	return &core.ObjectIdentity{ETag: *etag}
 }
 
 // ListObjectsDelimited groups a delimiter listing in Postgres through the
@@ -175,6 +141,7 @@ func (s *Store) ListObjectsDelimited(ctx context.Context, prefix, delimiter, sta
 				BackendName: r.BackendName,
 				SizeBytes:   r.SizeBytes,
 				CreatedAt:   r.CreatedAt.Time,
+				Identity:    listedIdentity(&r.Etag),
 			}
 		}
 		entries[i] = e
@@ -182,15 +149,31 @@ func (s *Store) ListObjectsDelimited(ctx context.Context, prefix, delimiter, sta
 	return core.BuildDelimitedPage(entries, maxKeys), nil
 }
 
-// ListExpiredObjects returns one row per unique key matching the given prefix
-// whose created_at is older than cutoff, up to limit rows. Used by lifecycle
-// expiration to find objects eligible for deletion.
-func (s *Store) ListExpiredObjects(ctx context.Context, prefix string, cutoff time.Time, limit int) ([]core.ObjectLocation, error) {
-	escapedPrefix := likeEscaper.Replace(prefix)
+// ListExpiredObjects returns one row per unique key matching the query's
+// filters whose created_at is older than its cutoff, up to Limit rows. Used by
+// lifecycle expiration to find objects eligible for deletion.
+//
+// Tags travel as a JSON object rather than parallel arrays because sqlc's
+// catalog has no two-argument unnest, and pairing a key to its own value is
+// what makes the filter an intersection rather than a cross product.
+func (s *Store) ListExpiredObjects(ctx context.Context, q core.ExpiredObjectsQuery) ([]core.ObjectLocation, error) {
+	// Encoded as {} rather than null when unset: SQL does not promise to
+	// short-circuit the OR that guards the subquery, and jsonb_each_text
+	// errors on a JSON null where it yields no rows for an empty object.
+	filter := q.Tags
+	if filter == nil {
+		filter = map[string]string{}
+	}
+	tags, err := json.Marshal(filter)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode lifecycle tag filter: %w", err)
+	}
 	rows, err := s.queries.ListExpiredObjects(ctx, db.ListExpiredObjectsParams{
-		Prefix:  escapedPrefix,
-		Cutoff:  pgTimestamptz(cutoff),
-		MaxKeys: int32(limit), //nolint:gosec // G115: limit is a small caller-controlled batch size
+		Prefix:   likeEscaper.Replace(q.Prefix),
+		Cutoff:   pgTimestamptz(q.Cutoff),
+		TagCount: int32(len(q.Tags)), //nolint:gosec // G115: capped at MaxTagsPerObject by config validation
+		Tags:     tags,
+		MaxKeys:  int32(q.Limit), //nolint:gosec // G115: limit is a small caller-controlled batch size
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to list expired objects: %w", err)
@@ -290,13 +273,24 @@ func (s *Store) ListDirectoryChildren(ctx context.Context, prefix, startAfter st
 	return result, nil
 }
 
-// -------------------------------------------------------------------------
-// SYNC OPERATIONS
-// -------------------------------------------------------------------------
-
-// ImportObject records a pre-existing object in the database without
-// overwriting. Returns true if the object was imported, false if it
-// already existed for this backend. Delegates to core.ImportObject.
-func (s *Store) ImportObject(ctx context.Context, key, backend string, size int64) (bool, error) {
-	return core.ImportObject(ctx, s, key, backend, size)
+// RecordObjectIdentity fills the identity columns a read had to ask a backend
+// for. Applied to every copy of the key: a per-copy value is what lets a
+// failover change the ETag under a conditional request.
+func (s *Store) RecordObjectIdentity(ctx context.Context, key string, id *core.ObjectIdentity) error {
+	if id == nil {
+		return nil
+	}
+	meta, err := core.EncodeUserMetadata(id.UserMetadata)
+	if err != nil {
+		return err
+	}
+	if err := s.queries.RecordObjectIdentity(ctx, db.RecordObjectIdentityParams{
+		ObjectKey:    key,
+		Etag:         strPtr(id.ETag),
+		ContentType:  strPtr(id.ContentType),
+		UserMetadata: meta,
+	}); err != nil {
+		return fmt.Errorf("record object identity: %w", err)
+	}
+	return nil
 }

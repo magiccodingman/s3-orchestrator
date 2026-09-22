@@ -18,7 +18,13 @@ import (
 	"context"
 	"fmt"
 	"testing"
+
+	"github.com/afreidah/s3-orchestrator/internal/store/core"
 )
+
+// -------------------------------------------------------------------------
+// PUBLIC API
+// -------------------------------------------------------------------------
 
 // TestStoreInt_ListObjectsDelimited_GroupsAndLeaves verifies keys fold into
 // CommonPrefixes at the first delimiter after the prefix while leaf objects pass
@@ -34,10 +40,10 @@ func TestStoreInt_ListObjectsDelimited_GroupsAndLeaves(t *testing.T) {
 		prefix + "file1.txt", prefix + "file2.txt",
 	}
 	for _, k := range keys {
-		if _, err := s.RecordObject(ctx, k, "backend-a", 10, nil); err != nil {
+		if _, _, err := s.RecordObject(ctx, &core.RecordObjectRequest{Key: k, Copies: []core.ObjectCopy{{Backend: "backend-a"}}, Size: 10}); err != nil {
 			t.Fatalf("RecordObject(%s): %v", k, err)
 		}
-		t.Cleanup(func() { _, _ = s.DeleteObject(ctx, k) })
+		t.Cleanup(func() { _, _, _ = s.DeleteObject(ctx, k) })
 	}
 
 	res, err := s.ListObjectsDelimited(ctx, prefix, "/", "", 1000)
@@ -80,6 +86,10 @@ func TestStoreInt_ListObjectsDelimited_PaginationNoDuplicate(t *testing.T) {
 	}
 }
 
+// -------------------------------------------------------------------------
+// INTERNALS
+// -------------------------------------------------------------------------
+
 // seedPGDelimiterGroups records groups x perGroup keys as
 // "<prefix>g<G>/k<K>.txt" and registers per-key cleanup that runs at test end.
 func seedPGDelimiterGroups(t *testing.T, s *Store, prefix string, groups, perGroup int) {
@@ -88,10 +98,10 @@ func seedPGDelimiterGroups(t *testing.T, s *Store, prefix string, groups, perGro
 	for g := range groups {
 		for k := range perGroup {
 			key := fmt.Sprintf("%sg%d/k%d.txt", prefix, g, k)
-			if _, err := s.RecordObject(ctx, key, "backend-a", 1, nil); err != nil {
+			if _, _, err := s.RecordObject(ctx, &core.RecordObjectRequest{Key: key, Copies: []core.ObjectCopy{{Backend: "backend-a"}}, Size: 1}); err != nil {
 				t.Fatalf("RecordObject(%s): %v", key, err)
 			}
-			t.Cleanup(func() { _, _ = s.DeleteObject(ctx, key) })
+			t.Cleanup(func() { _, _, _ = s.DeleteObject(ctx, key) })
 		}
 	}
 }

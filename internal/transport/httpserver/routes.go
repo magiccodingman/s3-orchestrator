@@ -5,8 +5,9 @@
 //
 // Mounts admin, UI, and S3 handlers on the main mux with the configured
 // middleware stack: rate limiting (optional), admission control (split or
-// single-channel), and request shedding. Route registration is gated by
-// daemon mode so the worker-only mode does not expose S3 or UI surfaces.
+// single-channel), request shedding, and browser CORS. Route registration is
+// gated by daemon mode so the worker-only mode does not expose S3 or UI
+// surfaces.
 // -------------------------------------------------------------------------------
 
 package httpserver
@@ -22,19 +23,21 @@ import (
 	"github.com/afreidah/s3-orchestrator/internal/config"
 	"github.com/afreidah/s3-orchestrator/internal/di"
 	"github.com/afreidah/s3-orchestrator/internal/observe/logfmt"
-	"github.com/afreidah/s3-orchestrator/internal/proxy"
+	"github.com/afreidah/s3-orchestrator/internal/proxy/infra"
 	"github.com/afreidah/s3-orchestrator/internal/transport/admin"
+	"github.com/afreidah/s3-orchestrator/internal/transport/cors"
 	"github.com/afreidah/s3-orchestrator/internal/transport/httputil"
 	"github.com/afreidah/s3-orchestrator/internal/transport/s3api"
 	"github.com/afreidah/s3-orchestrator/internal/transport/ui"
 )
 
-// registerAdminHandler mounts the admin API at /admin/ when the admin key is
-// configured. Returns nil silently when the admin surface is disabled.
-func registerAdminHandler(mux *http.ServeMux, inj do.Injector, cfg *config.Config) error {
-	if cfg.UI.AdminKey == "" {
-		return nil
-	}
+// registerAdminHandler mounts the admin API at /admin/.
+//
+// Always mounted: the surface authenticates credentials rather than a
+// configured token, so there is no setting that turns it off. What a caller
+// reaches on it is decided by the grants its credential holds, and a deployment
+// that has issued none simply has nobody able to call it.
+func registerAdminHandler(mux *http.ServeMux, inj do.Injector, _ *config.Config) error {
 	adminHandler, err := do.Invoke[*admin.Handler](inj)
 	if err != nil {
 		return fmt.Errorf("initialize admin handler: %w", err)
@@ -96,36 +99,36 @@ func registerUIHandler(mux *http.ServeMux, inj do.Injector, cfg *config.Config) 
 //
 // Admission model (see internal/di/backend.go admissionSemFor):
 //
-//   - Split mode (both MaxConcurrentReads and MaxConcurrentWrites set):
-//     a fresh read semaphore is created here sized to MaxConcurrentReads;
-//     it is local to the HTTP read path and never touched by background
-//     workers. The write half reuses manager.AdmissionSem() which the
-//     DI layer already sized to MaxConcurrentWrites - that channel is
-//     also the budget every background worker (cleanup, replication,
-//     rebalance, pending reaper, over-replication) acquires from via
-//     WithAdmission. So in split mode HTTP reads have their own ceiling
-//     while HTTP writes share their ceiling with worker activity.
-//   - Merged mode (only MaxConcurrentRequests set): manager.AdmissionSem()
-//     is the single global pool sized to MaxConcurrentRequests; HTTP
-//     reads, HTTP writes, and workers all contend for the same slots.
-//   - Neither set: no admission middleware is installed (manager.AdmissionSem()
-//     returns nil and the switch falls through).
-//
-// Operators sizing MaxConcurrentWrites in split mode should plan for
-// background worker activity to consume from the same budget.
+//   - Split mode (MaxConcurrentReads and MaxConcurrentWrites): reads get a
+//     fresh semaphore created here, local to the HTTP read path. Writes reuse
+//     the runtime's AdmissionSem(), which is also the budget every background
+//     worker acquires from, so HTTP writes share their ceiling with worker
+//     activity and operators should size it for both.
+//   - Merged mode (MaxConcurrentRequests): AdmissionSem() is one global pool
+//     that HTTP reads, HTTP writes and workers all contend for.
+//   - Neither set: no admission middleware is installed.
 //
 // Either form respects LoadShedThreshold and AdmissionWait when set.
+//
+// CORS wraps the S3 handler directly, inside both the rate limiter and
+// admission control. A preflight carries no credentials, so answering it
+// outside those two would leave the one request on this surface that anybody
+// can send bounded by nothing.
 func registerS3Handler(mux *http.ServeMux, inj do.Injector, cfg *config.Config) error {
-	manager, err := do.Invoke[*proxy.BackendManager](inj)
+	rt, err := do.Invoke[*infra.BackendRuntime](inj)
 	if err != nil {
-		return fmt.Errorf("initialize backend manager: %w", err)
+		return fmt.Errorf("initialize backend runtime: %w", err)
 	}
 	s3Server, err := do.Invoke[*s3api.Server](inj)
 	if err != nil {
 		return fmt.Errorf("initialize S3 server: %w", err)
 	}
+	corsPolicy, err := do.Invoke[*cors.Policy](inj)
+	if err != nil {
+		return fmt.Errorf("initialize CORS policy: %w", err)
+	}
 
-	var s3Handler http.Handler = s3Server
+	s3Handler := corsPolicy.Middleware(s3Server)
 	rlRes := di.Optional[*s3api.RateLimiter](inj)
 	if rlRes.Failed() {
 		slog.WarnContext(context.Background(),
@@ -137,26 +140,25 @@ func registerS3Handler(mux *http.ServeMux, inj do.Injector, cfg *config.Config) 
 		s3Handler = rl.Middleware(s3Handler)
 	}
 
+	limits := s3api.AdmissionLimits{
+		ShedThreshold: cfg.Server.LoadShedThreshold,
+		Wait:          cfg.Server.AdmissionWait,
+	}
+
 	var ac *s3api.AdmissionController
 	switch {
 	case cfg.Server.MaxConcurrentReads > 0 && cfg.Server.MaxConcurrentWrites > 0:
 		// Split-pool: dedicate a fresh read sem (HTTP-only) and reuse
-		// the manager's sem as the write+workers pool. See the func
+		// the runtime's sem as the write+workers pool. See the func
 		// doc above for the full model.
 		readSem := make(chan struct{}, cfg.Server.MaxConcurrentReads)
-		ac = s3api.NewSplitAdmissionControllerFromSem(readSem, manager.AdmissionSem())
+		ac = s3api.NewSplitAdmissionControllerFromSem(readSem, rt.AdmissionSem(), limits)
 	case cfg.Server.MaxConcurrentRequests > 0:
 		// Merged-pool: every request and every worker shares the
-		// manager's sem.
-		ac = s3api.NewAdmissionControllerFromSem(manager.AdmissionSem())
+		// runtime's sem.
+		ac = s3api.NewAdmissionControllerFromSem(rt.AdmissionSem(), limits)
 	}
 	if ac != nil {
-		if cfg.Server.LoadShedThreshold > 0 {
-			ac.SetShedThreshold(cfg.Server.LoadShedThreshold)
-		}
-		if cfg.Server.AdmissionWait > 0 {
-			ac.SetAdmissionWait(cfg.Server.AdmissionWait)
-		}
 		s3Handler = ac.Middleware(s3Handler)
 	}
 
@@ -182,4 +184,3 @@ func registerS3Handler(mux *http.ServeMux, inj do.Injector, cfg *config.Config) 
 func adminPanicWriter(w http.ResponseWriter, status int, _ string, message string) {
 	httputil.WriteJSONError(w, status, message)
 }
-

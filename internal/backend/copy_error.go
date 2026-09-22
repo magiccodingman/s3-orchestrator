@@ -4,7 +4,7 @@
 // Author: Alex Freidah
 //
 // Typed errors for the read/write phases of a backend-to-backend stream copy.
-// Producers (proxy.backendCore.StreamCopy) wrap the underlying backend error
+// Producers (infra.BackendRuntime.StreamCopy) wrap the underlying backend error
 // with a phase tag so consumers (the replicator's per-source retry loop) can
 // classify failures structurally - "destination is broken, do not try other
 // sources" vs "this source failed, move on to the next" - without inspecting
@@ -17,6 +17,17 @@ import (
 	"errors"
 	"fmt"
 )
+
+// CopyEndpoint pairs a backend client with the name its usage is charged to.
+//
+// A stream copy spends egress on one backend and ingress on another, so it
+// cannot admit or account for itself from the clients alone. Carrying the name
+// alongside the client is what lets the copy be checked against both backends'
+// limits at the point the bytes actually move, rather than at each call site.
+type CopyEndpoint struct {
+	Name    string
+	Backend ObjectBackend
+}
 
 // CopyPhase identifies which leg of a stream copy failed.
 type CopyPhase string
@@ -31,8 +42,8 @@ const (
 
 // CopyError tags a stream-copy failure with the phase that produced it
 // and preserves the underlying error for errors.Is / errors.As walks.
-// Error renders as "<phase>: <underlying>" so log output matches the
-// historical string-prefix shape.
+// Error renders as "<phase>: <underlying>", so a log line names the phase
+// before the cause.
 type CopyError struct {
 	Phase CopyPhase
 	Err   error

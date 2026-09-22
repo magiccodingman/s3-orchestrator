@@ -13,167 +13,77 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
+	"github.com/afreidah/s3-orchestrator/internal/backend/backendtest"
 	"github.com/afreidah/s3-orchestrator/internal/config"
 	"github.com/afreidah/s3-orchestrator/internal/proxy/proxytest"
 	"github.com/afreidah/s3-orchestrator/internal/store/core"
-	"github.com/afreidah/s3-orchestrator/internal/transport/auth"
 
 	s3be "github.com/afreidah/s3-orchestrator/internal/backend"
-	"github.com/afreidah/s3-orchestrator/internal/testutil"
+	"github.com/afreidah/s3-orchestrator/internal/store/storetest"
 
+	"go.uber.org/mock/gomock"
 	// serverMockBackend implements storage.ObjectBackend for server handler tests.
-	"github.com/afreidah/s3-orchestrator/internal/proxy"
 )
 
 // serverMockBackend is the in-memory ObjectBackend used by S3-handler
 // tests in this file. Holds objects in a map and lets tests inject
 // per-method errors (putErr, getErr, headErr, delErr) so each handler
-// branch can be exercised without spinning up MinIO.
-type serverMockBackend struct {
-	mu      sync.Mutex
-	objects map[string]serverMockObj
-	putErr  error
-	getErr  error
-	headErr error
-	delErr  error
-}
-
-// serverMockObj is one stored object inside serverMockBackend - the
-// payload plus the metadata fields the handler-test assertions read
-// (content-type, etag, last-modified, user metadata).
-type serverMockObj struct {
-	data         []byte
-	contentType  string
-	etag         string
-	lastModified time.Time
-	metadata     map[string]string
-}
-
-// newServerMockBackend constructs a new server mock backend.
-func newServerMockBackend() *serverMockBackend {
-	return &serverMockBackend{objects: make(map[string]serverMockObj)}
-}
-
-// PutObject satisfies backend.ObjectBackend by reading the body into
-// memory, recording the resulting object under key, and returning a
-// fixed test etag. Honours putErr so error-path tests can inject a
-// failure without touching the backend interface.
-func (b *serverMockBackend) PutObject(_ context.Context, key string, body io.Reader, _ int64, contentType string, metadata map[string]string) (string, error) {
-	if b.putErr != nil {
-		return "", b.putErr
-	}
-	data, err := io.ReadAll(body)
-	if err != nil {
-		return "", err
-	}
-	etag := `"test-etag"`
-	b.mu.Lock()
-	b.objects[key] = serverMockObj{data: data, contentType: contentType, etag: etag, metadata: metadata}
-	b.mu.Unlock()
-	return etag, nil
-}
-
-// GetObject returns object.
-func (b *serverMockBackend) GetObject(_ context.Context, key string, _ string) (*s3be.GetObjectResult, error) {
-	if b.getErr != nil {
-		return nil, b.getErr
-	}
-	b.mu.Lock()
-	obj, ok := b.objects[key]
-	b.mu.Unlock()
-	if !ok {
-		return nil, core.ErrObjectNotFound
-	}
-	return &s3be.GetObjectResult{
-		Body:         io.NopCloser(bytes.NewReader(obj.data)),
-		Size:         int64(len(obj.data)),
-		ContentType:  obj.contentType,
-		ETag:         obj.etag,
-		LastModified: obj.lastModified,
-		Metadata:     obj.metadata,
-	}, nil
-}
-
-// HeadObject satisfies backend.ObjectBackend by returning the stored
-// object's metadata. Honours headErr so HEAD-error path tests can
-// inject a failure independently of GET/PUT.
-func (b *serverMockBackend) HeadObject(_ context.Context, key string) (*s3be.HeadObjectResult, error) {
-	if b.headErr != nil {
-		return nil, b.headErr
-	}
-	b.mu.Lock()
-	obj, ok := b.objects[key]
-	b.mu.Unlock()
-	if !ok {
-		return nil, core.ErrObjectNotFound
-	}
-	return &s3be.HeadObjectResult{
-		Size:         int64(len(obj.data)),
-		ContentType:  obj.contentType,
-		ETag:         obj.etag,
-		LastModified: obj.lastModified,
-		Metadata:     obj.metadata,
-	}, nil
-}
-
-// DeleteObject deletes object.
-func (b *serverMockBackend) DeleteObject(_ context.Context, key string) error {
-	if b.delErr != nil {
-		return b.delErr
-	}
-	b.mu.Lock()
-	delete(b.objects, key)
-	b.mu.Unlock()
-	return nil
-}
-
 // newTestServer creates an httptest.Server wired with mock backends and store.
 // Returns the server, a cleanup func, and the mock store/backend for assertions.
-func newTestServer(t *testing.T) (*httptest.Server, *testutil.MockStore, *serverMockBackend) {
+func newTestServer(t *testing.T, opts ...func(*storetest.MockMetadataStore)) (*httptest.Server, *storetest.MockMetadataStore, *backendtest.InMemory) {
+	t.Helper()
+	return newTestServerWithQuota(t, nil, opts...)
+}
+
+// newTestServerWithQuota is newTestServer with the byte counter seeded, for the
+// tests whose subject is what the transport reports when a backend has no room.
+// A nil baseline leaves the single backend unlimited.
+func newTestServerWithQuota(
+	t *testing.T,
+	baselines map[string]core.BackendQuotaUsage,
+	opts ...func(*storetest.MockMetadataStore),
+) (*httptest.Server, *storetest.MockMetadataStore, *backendtest.InMemory) {
 	t.Helper()
 
-	backend := newServerMockBackend()
-	mockStore := testutil.NewMockStore(t)
-	mockStore.GetBackendResp = "b1"
+	backend := backendtest.NewInMemory()
+	mockStore := storetest.NewMockMetadataStore(gomock.NewController(t))
+	for _, opt := range opts {
+		opt(mockStore)
+	}
+	storetest.Permissive(mockStore)
 
-	mgr := proxytest.NewManager(t, &proxy.BackendManagerConfig{
-		Storage: proxy.StorageDeps{
-			Backends: map[string]s3be.ObjectBackend{"b1": backend},
-			Order:    []string{"b1"},
-		},
-		Stores: proxy.StoreDeps{
-			Metadata:  mockStore,
-			Dashboard: mockStore,
-		},
-		Policies: proxy.PolicyConfig{
+	st := proxytest.New(t, mockStore, &proxytest.StackOptions{
+		Runtime: proxytest.NewRuntime(&proxytest.RuntimeOptions{
+			Backends:        map[string]s3be.ObjectBackend{"b1": backend},
+			Order:           []string{"b1"},
 			RoutingStrategy: config.RoutingPack,
-		},
-		Operations: proxy.OperationalDeps{
-			Metrics: mockStore,
-		},
+			QuotaBaselines:  baselines,
+			Metrics:         mockStore,
+		}),
 	})
-	_ = proxytest.BuildWorkers(mgr, mockStore)
-	t.Cleanup(mgr.Close)
+	_ = proxytest.BuildWorkers(st, mockStore)
 
 	srv := &Server{
-		Manager:       mgr,
+		Objects:       st.Objects,
+		Multipart:     st.Multipart,
 		MaxObjectSize: 10 * 1024 * 1024, // 10MB
 	}
 
 	buckets := []config.BucketConfig{
 		{Name: "mybucket", Credentials: []config.CredentialConfig{
-			{Token: "test-token"},
+			testCredential(),
 		}},
 	}
-	srv.SetBucketAuth(auth.NewBucketRegistry(buckets))
+	srv.SetBucketAuth(mustBucketRegistry(t, buckets))
 
 	ts := httptest.NewServer(srv)
 	t.Cleanup(ts.Close)
@@ -194,10 +104,10 @@ func doReq(t *testing.T, ts *httptest.Server, method, url string, body io.Reader
 	if err != nil {
 		t.Fatal(err)
 	}
-	req.Header.Set("X-Proxy-Token", "test-token")
 	if body != nil {
 		req.Header.Set("Content-Type", "application/octet-stream")
 	}
+	signRequest(t, req)
 	resp, err := ts.Client().Do(req) //nolint:gosec // G704: test server URL
 	if err != nil {
 		t.Fatal(err)
@@ -217,7 +127,7 @@ func TestPut_Success(t *testing.T) {
 	data := []byte("hello world")
 
 	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPut, ts.URL+"/mybucket/testkey", bytes.NewReader(data))
-	req.Header.Set("X-Proxy-Token", "test-token")
+	signRequest(t, req)
 	req.Header.Set("Content-Type", "text/plain")
 	req.ContentLength = int64(len(data))
 	resp, err := ts.Client().Do(req) //nolint:gosec // G704: test server URL
@@ -232,7 +142,7 @@ func TestPut_Success(t *testing.T) {
 	if resp.Header.Get("ETag") == "" {
 		t.Error("expected ETag header")
 	}
-	if _, ok := backend.objects["mybucket/testkey"]; !ok {
+	if _, ok := backend.Objects["mybucket/testkey"]; !ok {
 		t.Error("object not stored on backend")
 	}
 }
@@ -241,12 +151,16 @@ func TestPut_Success(t *testing.T) {
 // Asserts that status = , want 411.
 func TestPut_MissingContentLength(t *testing.T) {
 	t.Parallel()
-	ts, _, _ := newTestServer(t)
+	// No ops expectation is registered, so any call past the request-validation
+	// check fails the test.
+	ts, _, _ := newOpsServer(t)
 
 	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPut, ts.URL+"/mybucket/testkey", strings.NewReader("data"))
-	req.Header.Set("X-Proxy-Token", "test-token")
-	// Explicitly set ContentLength to -1 to simulate missing Content-Length
+	// Explicitly set ContentLength to -1 to simulate missing Content-Length.
+	// Set before signing, so the signature does not cover a length the request
+	// then goes on not to send.
 	req.ContentLength = -1
+	signRequest(t, req)
 	resp, err := ts.Client().Do(req) //nolint:gosec // G704: test server URL
 	if err != nil {
 		t.Fatal(err)
@@ -262,7 +176,9 @@ func TestPut_MissingContentLength(t *testing.T) {
 // Asserts that status = , want 413.
 func TestPut_EntityTooLarge(t *testing.T) {
 	t.Parallel()
-	ts, _, _ := newTestServer(t)
+	// No ops expectation is registered, so any call past the request-validation
+	// check fails the test.
+	ts, _, _ := newOpsServer(t)
 
 	// Create a body whose size exceeds the limit.
 	// We use a LimitReader wrapping zeros so we don't allocate 20MB.
@@ -270,7 +186,7 @@ func TestPut_EntityTooLarge(t *testing.T) {
 	body := io.LimitReader(neverEndingReader{}, bigSize)
 
 	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPut, ts.URL+"/mybucket/testkey", body)
-	req.Header.Set("X-Proxy-Token", "test-token")
+	signRequest(t, req)
 	req.ContentLength = bigSize
 	resp, err := ts.Client().Do(req) //nolint:gosec // G704: test server URL
 	if err != nil {
@@ -299,14 +215,16 @@ func (neverEndingReader) Read(p []byte) (int, error) {
 // has an object_locations row, before any backend bytes are written.
 func TestPut_IfNoneMatchStarRejectsExistingKey(t *testing.T) {
 	t.Parallel()
-	ts, mockStore, backend := newTestServer(t)
-	mockStore.GetAllLocationsResp = []core.ObjectLocation{
-		{ObjectKey: "mybucket/testkey", BackendName: "test-backend", SizeBytes: 100},
-	}
+	ts, _, backend := newTestServer(t, func(m *storetest.MockMetadataStore) {
+		m.EXPECT().GetAllObjectLocations(gomock.Any(), gomock.Any()).
+			Return([]core.ObjectLocation{
+				{ObjectKey: "mybucket/testkey", BackendName: "test-backend", SizeBytes: 100},
+			}, nil).AnyTimes()
+	})
 
 	data := []byte("hello")
 	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPut, ts.URL+"/mybucket/testkey", bytes.NewReader(data))
-	req.Header.Set("X-Proxy-Token", "test-token")
+	signRequest(t, req)
 	req.Header.Set("If-None-Match", "*")
 	req.ContentLength = int64(len(data))
 	resp, err := ts.Client().Do(req) //nolint:gosec // G704: test server URL
@@ -318,7 +236,7 @@ func TestPut_IfNoneMatchStarRejectsExistingKey(t *testing.T) {
 	if resp.StatusCode != http.StatusPreconditionFailed {
 		t.Fatalf("status = %d, want 412", resp.StatusCode)
 	}
-	if _, ok := backend.objects["mybucket/testkey"]; ok {
+	if _, ok := backend.Objects["mybucket/testkey"]; ok {
 		t.Error("backend should not have stored bytes when precondition fails")
 	}
 }
@@ -327,11 +245,14 @@ func TestPut_IfNoneMatchStarRejectsExistingKey(t *testing.T) {
 // `If-None-Match: *` succeeds when no location row exists for the key.
 func TestPut_IfNoneMatchStarAllowsNewKey(t *testing.T) {
 	t.Parallel()
-	ts, _, backend := newTestServer(t)
+	ts, _, backend := newTestServer(t, func(m *storetest.MockMetadataStore) {
+		m.EXPECT().GetAllObjectLocations(gomock.Any(), gomock.Any()).
+			Return(nil, core.ErrObjectNotFound).AnyTimes()
+	})
 
 	data := []byte("hello")
 	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPut, ts.URL+"/mybucket/newkey", bytes.NewReader(data))
-	req.Header.Set("X-Proxy-Token", "test-token")
+	signRequest(t, req)
 	req.Header.Set("If-None-Match", "*")
 	req.ContentLength = int64(len(data))
 	resp, err := ts.Client().Do(req) //nolint:gosec // G704: test server URL
@@ -343,7 +264,7 @@ func TestPut_IfNoneMatchStarAllowsNewKey(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
-	if _, ok := backend.objects["mybucket/newkey"]; !ok {
+	if _, ok := backend.Objects["mybucket/newkey"]; !ok {
 		t.Error("object not stored on backend")
 	}
 }
@@ -354,14 +275,16 @@ func TestPut_IfNoneMatchStarAllowsNewKey(t *testing.T) {
 // are accepted and the upload proceeds normally.
 func TestPut_IfNoneMatchSpecificETagIgnored(t *testing.T) {
 	t.Parallel()
-	ts, mockStore, backend := newTestServer(t)
-	mockStore.GetAllLocationsResp = []core.ObjectLocation{
-		{ObjectKey: "mybucket/testkey", BackendName: "test-backend", SizeBytes: 100},
-	}
+	ts, _, backend := newTestServer(t, func(m *storetest.MockMetadataStore) {
+		m.EXPECT().GetAllObjectLocations(gomock.Any(), gomock.Any()).
+			Return([]core.ObjectLocation{
+				{ObjectKey: "mybucket/testkey", BackendName: "test-backend", SizeBytes: 100},
+			}, nil).AnyTimes()
+	})
 
 	data := []byte("hello")
 	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPut, ts.URL+"/mybucket/testkey", bytes.NewReader(data))
-	req.Header.Set("X-Proxy-Token", "test-token")
+	signRequest(t, req)
 	req.Header.Set("If-None-Match", `"some-etag"`)
 	req.ContentLength = int64(len(data))
 	resp, err := ts.Client().Do(req) //nolint:gosec // G704: test server URL
@@ -373,7 +296,7 @@ func TestPut_IfNoneMatchSpecificETagIgnored(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (specific etag form ignored on PUT)", resp.StatusCode)
 	}
-	if _, ok := backend.objects["mybucket/testkey"]; !ok {
+	if _, ok := backend.Objects["mybucket/testkey"]; !ok {
 		t.Error("object not stored on backend")
 	}
 }
@@ -382,11 +305,16 @@ func TestPut_IfNoneMatchSpecificETagIgnored(t *testing.T) {
 // Asserts that status = , want 507.
 func TestPut_QuotaExhausted(t *testing.T) {
 	t.Parallel()
-	ts, mockStore, _ := newTestServer(t)
-	mockStore.GetBackendErr = core.ErrNoSpaceAvailable
+	// The backend declines the claim, which is how one out of room reports
+	// itself: the headroom test is the insert that writes the write's intent,
+	// not a figure held in memory. Registered before the permissive defaults so
+	// this is the expectation the claim matches.
+	ts, _, _ := newTestServerWithQuota(t, nil, func(m *storetest.MockMetadataStore) {
+		m.EXPECT().InsertPendingIfFits(gomock.Any(), gomock.Any()).Return(false, nil).AnyTimes()
+	})
 
 	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPut, ts.URL+"/mybucket/testkey", strings.NewReader("data"))
-	req.Header.Set("X-Proxy-Token", "test-token")
+	signRequest(t, req)
 	req.ContentLength = 4
 	resp, err := ts.Client().Do(req) //nolint:gosec // G704: test server URL
 	if err != nil {
@@ -410,16 +338,17 @@ func TestPut_QuotaExhausted(t *testing.T) {
 // eligibleForWrite returns no backends.
 func TestPut_NoBackendCapacity_BodyIncludesCapacityHint(t *testing.T) {
 	t.Parallel()
-	mockStore := testutil.NewMockStore(t)
-	mockStore.GetBackendResp = "b1"
-	mockStore.GetQuotaStatsResp = map[string]core.QuotaStat{
-		"alpha": {BackendName: "alpha", BytesUsed: 1024, BytesLimit: 4096},
-		"beta":  {BackendName: "beta", BytesUsed: 2048, BytesLimit: 4096},
-	}
+	mockStore := storetest.NewMockMetadataStore(gomock.NewController(t))
+	mockStore.EXPECT().GetQuotaStats(gomock.Any()).
+		Return(map[string]core.QuotaStat{
+			"alpha": {BackendName: "alpha", BytesUsed: 1024, BytesLimit: 4096},
+			"beta":  {BackendName: "beta", BytesUsed: 2048, BytesLimit: 4096},
+		}, nil).AnyTimes()
+	storetest.Permissive(mockStore)
 	ts := newCapacityHintTestServer(t, mockStore)
 
 	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPut, ts.URL+"/mybucket/testkey", strings.NewReader("data"))
-	req.Header.Set("X-Proxy-Token", "test-token")
+	signRequest(t, req)
 	req.ContentLength = 4
 	resp, err := ts.Client().Do(req) //nolint:gosec // G704: test server URL
 	if err != nil {
@@ -454,13 +383,14 @@ func TestPut_NoBackendCapacity_BodyIncludesCapacityHint(t *testing.T) {
 // capacity-hint suffix.
 func TestPut_NoBackendCapacity_QuotaStatsErrFallsBack(t *testing.T) {
 	t.Parallel()
-	mockStore := testutil.NewMockStore(t)
-	mockStore.GetBackendResp = "b1"
-	mockStore.GetQuotaStatsErr = core.ErrDBUnavailable
+	mockStore := storetest.NewMockMetadataStore(gomock.NewController(t))
+	storetest.Permissive(mockStore)
+	mockStore.EXPECT().GetQuotaStats(gomock.Any()).
+		Return(nil, core.ErrDBUnavailable).AnyTimes()
 	ts := newCapacityHintTestServer(t, mockStore)
 
 	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPut, ts.URL+"/mybucket/testkey", strings.NewReader("data"))
-	req.Header.Set("X-Proxy-Token", "test-token")
+	signRequest(t, req)
 	req.ContentLength = 4
 	resp, err := ts.Client().Do(req) //nolint:gosec // G704: test server URL
 	if err != nil {
@@ -484,35 +414,27 @@ func TestPut_NoBackendCapacity_QuotaStatsErrFallsBack(t *testing.T) {
 // MaxObjectSizes=1, so any upload of more than one byte fails the
 // eligibleForWrite check and exercises the capacity-hint code path
 // in handlePut.
-func newCapacityHintTestServer(t *testing.T, mockStore *testutil.MockStore) *httptest.Server {
+func newCapacityHintTestServer(t *testing.T, mockStore *storetest.MockMetadataStore) *httptest.Server {
 	t.Helper()
-	backend := newServerMockBackend()
-	mgr := proxytest.NewManager(t, &proxy.BackendManagerConfig{
-		Storage: proxy.StorageDeps{
-			Backends: map[string]s3be.ObjectBackend{"b1": backend},
-			Order:    []string{"b1"},
-		},
-		Stores: proxy.StoreDeps{
-			Metadata:  mockStore,
-			Dashboard: mockStore,
-		},
-		Policies: proxy.PolicyConfig{
+	backend := backendtest.NewInMemory()
+	st := proxytest.New(t, mockStore, &proxytest.StackOptions{
+		Runtime: proxytest.NewRuntime(&proxytest.RuntimeOptions{
+			Backends:        map[string]s3be.ObjectBackend{"b1": backend},
+			Order:           []string{"b1"},
 			MaxObjectSizes:  map[string]int64{"b1": 1},
 			RoutingStrategy: config.RoutingPack,
-		},
-		Operations: proxy.OperationalDeps{
-			Metrics: mockStore,
-		},
+			Metrics:         mockStore,
+		}),
 	})
-	_ = proxytest.BuildWorkers(mgr, mockStore)
-	t.Cleanup(mgr.Close)
+	_ = proxytest.BuildWorkers(st, mockStore)
 
 	srv := &Server{
-		Manager:       mgr,
+		Objects:       st.Objects,
+		Multipart:     st.Multipart,
 		MaxObjectSize: 10 * 1024 * 1024,
 	}
-	srv.SetBucketAuth(auth.NewBucketRegistry([]config.BucketConfig{
-		{Name: "mybucket", Credentials: []config.CredentialConfig{{Token: "test-token"}}},
+	srv.SetBucketAuth(mustBucketRegistry(t, []config.BucketConfig{
+		{Name: "mybucket", Credentials: []config.CredentialConfig{testCredential()}},
 	}))
 	ts := httptest.NewServer(srv)
 	t.Cleanup(ts.Close)
@@ -523,11 +445,15 @@ func newCapacityHintTestServer(t *testing.T, mockStore *testutil.MockStore) *htt
 // Asserts that status = , want 503.
 func TestPut_DBUnavailable(t *testing.T) {
 	t.Parallel()
-	ts, mockStore, _ := newTestServer(t)
-	mockStore.GetBackendErr = core.ErrDBUnavailable
+	// The ledger is what fails now: placement is decided in memory, so a DB
+	// outage surfaces when the write is recorded rather than when it is placed.
+	ts, _, _ := newTestServer(t, func(m *storetest.MockMetadataStore) {
+		m.EXPECT().RecordObject(gomock.Any(), gomock.Any()).
+			Return(nil, nil, core.ErrDBUnavailable).AnyTimes()
+	})
 
 	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPut, ts.URL+"/mybucket/testkey", strings.NewReader("data"))
-	req.Header.Set("X-Proxy-Token", "test-token")
+	signRequest(t, req)
 	req.ContentLength = 4
 	resp, err := ts.Client().Do(req) //nolint:gosec // G704: test server URL
 	if err != nil {
@@ -548,16 +474,17 @@ func TestPut_DBUnavailable(t *testing.T) {
 // Asserts that status = , want 200.
 func TestGet_Success(t *testing.T) {
 	t.Parallel()
-	ts, mockStore, backend := newTestServer(t)
+	ts, _, backend := newTestServer(t, func(m *storetest.MockMetadataStore) {
+		m.EXPECT().GetAllObjectLocations(gomock.Any(), gomock.Any()).
+			Return([]core.ObjectLocation{
+				{ObjectKey: "mybucket/testkey", BackendName: "b1", SizeBytes: 5},
+			}, nil).AnyTimes()
+	})
 
 	// Pre-store an object
-	backend.objects["mybucket/testkey"] = serverMockObj{
-		data: []byte("hello"), contentType: "text/plain", etag: `"abc"`,
+	backend.Objects["mybucket/testkey"] = backendtest.Object{
+		Data: []byte("hello"), ContentType: "text/plain", ETag: `"abc"`,
 	}
-	mockStore.GetAllLocationsResp = []core.ObjectLocation{
-		{ObjectKey: "mybucket/testkey", BackendName: "b1", SizeBytes: 5},
-	}
-
 	resp := doReq(t, ts, http.MethodGet, ts.URL+"/mybucket/testkey", nil)
 	defer resp.Body.Close()
 
@@ -577,8 +504,10 @@ func TestGet_Success(t *testing.T) {
 // Asserts that status = , want 404.
 func TestGet_NotFound(t *testing.T) {
 	t.Parallel()
-	ts, mockStore, _ := newTestServer(t)
-	mockStore.GetAllLocationsErr = core.ErrObjectNotFound
+	ts, _, _ := newTestServer(t, func(m *storetest.MockMetadataStore) {
+		m.EXPECT().GetAllObjectLocations(gomock.Any(), gomock.Any()).
+			Return(nil, core.ErrObjectNotFound).AnyTimes()
+	})
 
 	resp := doReq(t, ts, http.MethodGet, ts.URL+"/mybucket/nonexistent", nil)
 	defer resp.Body.Close()
@@ -596,15 +525,16 @@ func TestGet_NotFound(t *testing.T) {
 // Asserts that status = , want 200.
 func TestHead_Success(t *testing.T) {
 	t.Parallel()
-	ts, mockStore, backend := newTestServer(t)
+	ts, _, backend := newTestServer(t, func(m *storetest.MockMetadataStore) {
+		m.EXPECT().GetAllObjectLocations(gomock.Any(), gomock.Any()).
+			Return([]core.ObjectLocation{
+				{ObjectKey: "mybucket/testkey", BackendName: "b1", SizeBytes: 5},
+			}, nil).AnyTimes()
+	})
 
-	backend.objects["mybucket/testkey"] = serverMockObj{
-		data: []byte("12345"), contentType: "text/plain", etag: `"abc"`,
+	backend.Objects["mybucket/testkey"] = backendtest.Object{
+		Data: []byte("12345"), ContentType: "text/plain", ETag: `"abc"`,
 	}
-	mockStore.GetAllLocationsResp = []core.ObjectLocation{
-		{ObjectKey: "mybucket/testkey", BackendName: "b1", SizeBytes: 5},
-	}
-
 	resp := doReq(t, ts, http.MethodHead, ts.URL+"/mybucket/testkey", nil)
 	defer resp.Body.Close()
 
@@ -626,8 +556,10 @@ func TestHead_Success(t *testing.T) {
 // Asserts that status = , want 404.
 func TestHead_NotFound(t *testing.T) {
 	t.Parallel()
-	ts, mockStore, _ := newTestServer(t)
-	mockStore.GetAllLocationsErr = core.ErrObjectNotFound
+	ts, _, _ := newTestServer(t, func(m *storetest.MockMetadataStore) {
+		m.EXPECT().GetAllObjectLocations(gomock.Any(), gomock.Any()).
+			Return(nil, core.ErrObjectNotFound).AnyTimes()
+	})
 
 	resp := doReq(t, ts, http.MethodHead, ts.URL+"/mybucket/nonexistent", nil)
 	defer resp.Body.Close()
@@ -645,16 +577,17 @@ func TestHead_NotFound(t *testing.T) {
 // Asserts that status = , want 200.
 func TestGet_LastModifiedHeader(t *testing.T) {
 	t.Parallel()
-	ts, mockStore, backend := newTestServer(t)
+	ts, _, backend := newTestServer(t, func(m *storetest.MockMetadataStore) {
+		m.EXPECT().GetAllObjectLocations(gomock.Any(), gomock.Any()).
+			Return([]core.ObjectLocation{
+				{ObjectKey: "mybucket/testkey", BackendName: "b1", SizeBytes: 5,
+					CreatedAt: time.Date(2025, 6, 15, 12, 0, 0, 0, time.UTC)},
+			}, nil).AnyTimes()
+	})
 
-	backend.objects["mybucket/testkey"] = serverMockObj{
-		data: []byte("hello"), contentType: "text/plain", etag: `"abc"`,
+	backend.Objects["mybucket/testkey"] = backendtest.Object{
+		Data: []byte("hello"), ContentType: "text/plain", ETag: `"abc"`,
 	}
-	mockStore.GetAllLocationsResp = []core.ObjectLocation{
-		{ObjectKey: "mybucket/testkey", BackendName: "b1", SizeBytes: 5,
-			CreatedAt: time.Date(2025, 6, 15, 12, 0, 0, 0, time.UTC)},
-	}
-
 	resp := doReq(t, ts, http.MethodGet, ts.URL+"/mybucket/testkey", nil)
 	defer resp.Body.Close()
 
@@ -669,201 +602,44 @@ func TestGet_LastModifiedHeader(t *testing.T) {
 	}
 }
 
-// TestGet_ConditionalIfNoneMatch verifies the get conditional if none match contract.
-// Asserts that status = , want 304.
-func TestGet_ConditionalIfNoneMatch(t *testing.T) {
+// TestConditionalRequests covers the precondition headers on GET and HEAD:
+// which verdict each one reaches against a known ETag and modification time,
+// and the status that verdict produces. The cases differ only in what they ask
+// about the same object, so they are stated as data rather than as one
+// function each.
+func TestConditionalRequests(t *testing.T) {
 	t.Parallel()
-	ts, mockStore, backend := newTestServer(t)
+	ts, modified := condServer(t)
 
-	backend.objects["mybucket/testkey"] = serverMockObj{
-		data: []byte("hello"), contentType: "text/plain", etag: `"abc"`,
-	}
-	mockStore.GetAllLocationsResp = []core.ObjectLocation{
-		{ObjectKey: "mybucket/testkey", BackendName: "b1", SizeBytes: 5},
-	}
+	// Stated relative to the object's own modification time, which is what
+	// makes each expected verdict readable without doing date arithmetic.
+	httpTime := func(t time.Time) string { return t.UTC().Format(http.TimeFormat) }
 
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, ts.URL+"/mybucket/testkey", nil)
-	req.Header.Set("X-Proxy-Token", "test-token")
-	req.Header.Set("If-None-Match", `"abc"`)
-	resp, err := ts.Client().Do(req) //nolint:gosec // G704: test server URL
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusNotModified {
-		t.Fatalf("status = %d, want 304", resp.StatusCode)
-	}
-}
-
-// TestGet_ConditionalIfNoneMatchMismatch verifies the get conditional if none match mismatch contract.
-// Asserts that status = , want 200.
-func TestGet_ConditionalIfNoneMatchMismatch(t *testing.T) {
-	t.Parallel()
-	ts, mockStore, backend := newTestServer(t)
-
-	backend.objects["mybucket/testkey"] = serverMockObj{
-		data: []byte("hello"), contentType: "text/plain", etag: `"abc"`,
-	}
-	mockStore.GetAllLocationsResp = []core.ObjectLocation{
-		{ObjectKey: "mybucket/testkey", BackendName: "b1", SizeBytes: 5},
+	tests := []struct {
+		name   string
+		method string
+		header string
+		value  string
+		want   int
+	}{
+		{"if-none-match matching etag", http.MethodGet, "If-None-Match", `"abc"`, http.StatusNotModified},
+		{"if-none-match other etag", http.MethodGet, "If-None-Match", `"different"`, http.StatusOK},
+		{"if-match other etag", http.MethodGet, "If-Match", `"wrong"`, http.StatusPreconditionFailed},
+		{"head if-none-match matching etag", http.MethodHead, "If-None-Match", `"abc"`, http.StatusNotModified},
+		{"if-modified-since after the write", http.MethodGet, "If-Modified-Since", httpTime(modified.Add(time.Hour)), http.StatusNotModified},
+		{"if-modified-since before the write", http.MethodGet, "If-Modified-Since", httpTime(modified.Add(-time.Hour)), http.StatusOK},
+		{"if-unmodified-since before the write", http.MethodGet, "If-Unmodified-Since", httpTime(modified.Add(-time.Hour)), http.StatusPreconditionFailed},
 	}
 
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, ts.URL+"/mybucket/testkey", nil)
-	req.Header.Set("X-Proxy-Token", "test-token")
-	req.Header.Set("If-None-Match", `"different"`)
-	resp, err := ts.Client().Do(req) //nolint:gosec // G704: test server URL
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200", resp.StatusCode)
-	}
-}
-
-// TestGet_ConditionalIfMatch verifies the get conditional if match contract.
-// Asserts that status = , want 412.
-func TestGet_ConditionalIfMatch(t *testing.T) {
-	t.Parallel()
-	ts, mockStore, backend := newTestServer(t)
-
-	backend.objects["mybucket/testkey"] = serverMockObj{
-		data: []byte("hello"), contentType: "text/plain", etag: `"abc"`,
-	}
-	mockStore.GetAllLocationsResp = []core.ObjectLocation{
-		{ObjectKey: "mybucket/testkey", BackendName: "b1", SizeBytes: 5},
-	}
-
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, ts.URL+"/mybucket/testkey", nil)
-	req.Header.Set("X-Proxy-Token", "test-token")
-	req.Header.Set("If-Match", `"wrong"`)
-	resp, err := ts.Client().Do(req) //nolint:gosec // G704: test server URL
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusPreconditionFailed {
-		t.Fatalf("status = %d, want 412", resp.StatusCode)
-	}
-}
-
-// TestHead_ConditionalIfNoneMatch verifies the head conditional if none match contract.
-// Asserts that status = , want 304.
-func TestHead_ConditionalIfNoneMatch(t *testing.T) {
-	t.Parallel()
-	ts, mockStore, backend := newTestServer(t)
-
-	backend.objects["mybucket/testkey"] = serverMockObj{
-		data: []byte("hello"), contentType: "text/plain", etag: `"abc"`,
-	}
-	mockStore.GetAllLocationsResp = []core.ObjectLocation{
-		{ObjectKey: "mybucket/testkey", BackendName: "b1", SizeBytes: 5},
-	}
-
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodHead, ts.URL+"/mybucket/testkey", nil)
-	req.Header.Set("X-Proxy-Token", "test-token")
-	req.Header.Set("If-None-Match", `"abc"`)
-	resp, err := ts.Client().Do(req) //nolint:gosec // G704: test server URL
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusNotModified {
-		t.Fatalf("status = %d, want 304", resp.StatusCode)
-	}
-}
-
-// TestGet_ConditionalIfModifiedSince verifies the get conditional if modified since contract.
-// Asserts that status = , want 304.
-func TestGet_ConditionalIfModifiedSince(t *testing.T) {
-	t.Parallel()
-	ts, mockStore, backend := newTestServer(t)
-
-	objTime := time.Date(2025, 6, 15, 12, 0, 0, 0, time.UTC)
-	backend.objects["mybucket/testkey"] = serverMockObj{
-		data: []byte("hello"), contentType: "text/plain", etag: `"abc"`,
-		lastModified: objTime,
-	}
-	mockStore.GetAllLocationsResp = []core.ObjectLocation{
-		{ObjectKey: "mybucket/testkey", BackendName: "b1", SizeBytes: 5},
-	}
-
-	// Request with a time after the object's last modification -> 304
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, ts.URL+"/mybucket/testkey", nil)
-	req.Header.Set("X-Proxy-Token", "test-token")
-	req.Header.Set("If-Modified-Since", objTime.Add(time.Hour).UTC().Format(http.TimeFormat))
-	resp, err := ts.Client().Do(req) //nolint:gosec // G704: test server URL
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusNotModified {
-		t.Fatalf("status = %d, want 304", resp.StatusCode)
-	}
-}
-
-// TestGet_ConditionalIfModifiedSinceNewer verifies the get conditional if modified since newer contract.
-// Asserts that status = , want 200.
-func TestGet_ConditionalIfModifiedSinceNewer(t *testing.T) {
-	t.Parallel()
-	ts, mockStore, backend := newTestServer(t)
-
-	objTime := time.Date(2025, 6, 15, 12, 0, 0, 0, time.UTC)
-	backend.objects["mybucket/testkey"] = serverMockObj{
-		data: []byte("hello"), contentType: "text/plain", etag: `"abc"`,
-		lastModified: objTime,
-	}
-	mockStore.GetAllLocationsResp = []core.ObjectLocation{
-		{ObjectKey: "mybucket/testkey", BackendName: "b1", SizeBytes: 5},
-	}
-
-	// Request with a time before the object's last modification -> 200
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, ts.URL+"/mybucket/testkey", nil)
-	req.Header.Set("X-Proxy-Token", "test-token")
-	req.Header.Set("If-Modified-Since", objTime.Add(-time.Hour).UTC().Format(http.TimeFormat))
-	resp, err := ts.Client().Do(req) //nolint:gosec // G704: test server URL
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200", resp.StatusCode)
-	}
-}
-
-// TestGet_ConditionalIfUnmodifiedSince verifies the get conditional if unmodified since contract.
-// Asserts that status = , want 412.
-func TestGet_ConditionalIfUnmodifiedSince(t *testing.T) {
-	t.Parallel()
-	ts, mockStore, backend := newTestServer(t)
-
-	objTime := time.Date(2025, 6, 15, 12, 0, 0, 0, time.UTC)
-	backend.objects["mybucket/testkey"] = serverMockObj{
-		data: []byte("hello"), contentType: "text/plain", etag: `"abc"`,
-		lastModified: objTime,
-	}
-	mockStore.GetAllLocationsResp = []core.ObjectLocation{
-		{ObjectKey: "mybucket/testkey", BackendName: "b1", SizeBytes: 5},
-	}
-
-	// Object was modified after the given time -> 412
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, ts.URL+"/mybucket/testkey", nil)
-	req.Header.Set("X-Proxy-Token", "test-token")
-	req.Header.Set("If-Unmodified-Since", objTime.Add(-time.Hour).UTC().Format(http.TimeFormat))
-	resp, err := ts.Client().Do(req) //nolint:gosec // G704: test server URL
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusPreconditionFailed {
-		t.Fatalf("status = %d, want 412", resp.StatusCode)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			resp := condReq(t, ts, tt.method, map[string]string{tt.header: tt.value})
+			defer resp.Body.Close()
+			if resp.StatusCode != tt.want {
+				t.Errorf("status = %d, want %d", resp.StatusCode, tt.want)
+			}
+		})
 	}
 }
 
@@ -871,17 +647,18 @@ func TestGet_ConditionalIfUnmodifiedSince(t *testing.T) {
 // Asserts that status = , want 200.
 func TestGet_LastModifiedHeaderSet(t *testing.T) {
 	t.Parallel()
-	ts, mockStore, backend := newTestServer(t)
+	ts, _, backend := newTestServer(t, func(m *storetest.MockMetadataStore) {
+		m.EXPECT().GetAllObjectLocations(gomock.Any(), gomock.Any()).
+			Return([]core.ObjectLocation{
+				{ObjectKey: "mybucket/testkey", BackendName: "b1", SizeBytes: 5},
+			}, nil).AnyTimes()
+	})
 
 	objTime := time.Date(2025, 6, 15, 12, 0, 0, 0, time.UTC)
-	backend.objects["mybucket/testkey"] = serverMockObj{
-		data: []byte("hello"), contentType: "text/plain", etag: `"abc"`,
-		lastModified: objTime,
+	backend.Objects["mybucket/testkey"] = backendtest.Object{
+		Data: []byte("hello"), ContentType: "text/plain", ETag: `"abc"`,
+		LastModified: objTime,
 	}
-	mockStore.GetAllLocationsResp = []core.ObjectLocation{
-		{ObjectKey: "mybucket/testkey", BackendName: "b1", SizeBytes: 5},
-	}
-
 	resp := doReq(t, ts, http.MethodGet, ts.URL+"/mybucket/testkey", nil)
 	defer resp.Body.Close()
 
@@ -903,17 +680,18 @@ func TestGet_LastModifiedHeaderSet(t *testing.T) {
 // Asserts that status = , want 200.
 func TestHead_LastModifiedHeaderSet(t *testing.T) {
 	t.Parallel()
-	ts, mockStore, backend := newTestServer(t)
+	ts, _, backend := newTestServer(t, func(m *storetest.MockMetadataStore) {
+		m.EXPECT().GetAllObjectLocations(gomock.Any(), gomock.Any()).
+			Return([]core.ObjectLocation{
+				{ObjectKey: "mybucket/testkey", BackendName: "b1", SizeBytes: 5},
+			}, nil).AnyTimes()
+	})
 
 	objTime := time.Date(2025, 6, 15, 12, 0, 0, 0, time.UTC)
-	backend.objects["mybucket/testkey"] = serverMockObj{
-		data: []byte("hello"), contentType: "text/plain", etag: `"abc"`,
-		lastModified: objTime,
+	backend.Objects["mybucket/testkey"] = backendtest.Object{
+		Data: []byte("hello"), ContentType: "text/plain", ETag: `"abc"`,
+		LastModified: objTime,
 	}
-	mockStore.GetAllLocationsResp = []core.ObjectLocation{
-		{ObjectKey: "mybucket/testkey", BackendName: "b1", SizeBytes: 5},
-	}
-
 	resp := doReq(t, ts, http.MethodHead, ts.URL+"/mybucket/testkey", nil)
 	defer resp.Body.Close()
 
@@ -943,7 +721,7 @@ func TestPut_MetadataStored(t *testing.T) {
 	data := []byte("hello")
 
 	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPut, ts.URL+"/mybucket/metakey", bytes.NewReader(data))
-	req.Header.Set("X-Proxy-Token", "test-token")
+	signRequest(t, req)
 	req.Header.Set("Content-Type", "text/plain")
 	req.Header.Set("X-Amz-Meta-Project", "acme")
 	req.Header.Set("X-Amz-Meta-Env", "prod")
@@ -957,12 +735,12 @@ func TestPut_MetadataStored(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
-	obj, ok := backend.objects["mybucket/metakey"]
+	obj, ok := backend.Objects["mybucket/metakey"]
 	if !ok {
 		t.Fatal("object not stored")
 	}
-	if obj.metadata["project"] != "acme" || obj.metadata["env"] != "prod" {
-		t.Errorf("metadata = %v, want project=acme env=prod", obj.metadata)
+	if obj.Metadata["project"] != "acme" || obj.Metadata["env"] != "prod" {
+		t.Errorf("metadata = %v, want project=acme env=prod", obj.Metadata)
 	}
 }
 
@@ -970,16 +748,17 @@ func TestPut_MetadataStored(t *testing.T) {
 // Asserts that status = , want 200.
 func TestGet_MetadataReturned(t *testing.T) {
 	t.Parallel()
-	ts, mockStore, backend := newTestServer(t)
+	ts, _, backend := newTestServer(t, func(m *storetest.MockMetadataStore) {
+		m.EXPECT().GetAllObjectLocations(gomock.Any(), gomock.Any()).
+			Return([]core.ObjectLocation{
+				{ObjectKey: "mybucket/metakey", BackendName: "b1", SizeBytes: 5},
+			}, nil).AnyTimes()
+	})
 
-	backend.objects["mybucket/metakey"] = serverMockObj{
-		data: []byte("hello"), contentType: "text/plain", etag: `"abc"`,
-		metadata: map[string]string{"project": "acme", "env": "prod"},
+	backend.Objects["mybucket/metakey"] = backendtest.Object{
+		Data: []byte("hello"), ContentType: "text/plain", ETag: `"abc"`,
+		Metadata: map[string]string{"project": "acme", "env": "prod"},
 	}
-	mockStore.GetAllLocationsResp = []core.ObjectLocation{
-		{ObjectKey: "mybucket/metakey", BackendName: "b1", SizeBytes: 5},
-	}
-
 	resp := doReq(t, ts, http.MethodGet, ts.URL+"/mybucket/metakey", nil)
 	defer resp.Body.Close()
 
@@ -998,16 +777,17 @@ func TestGet_MetadataReturned(t *testing.T) {
 // Asserts that status = , want 200.
 func TestHead_MetadataReturned(t *testing.T) {
 	t.Parallel()
-	ts, mockStore, backend := newTestServer(t)
+	ts, _, backend := newTestServer(t, func(m *storetest.MockMetadataStore) {
+		m.EXPECT().GetAllObjectLocations(gomock.Any(), gomock.Any()).
+			Return([]core.ObjectLocation{
+				{ObjectKey: "mybucket/metakey", BackendName: "b1", SizeBytes: 5},
+			}, nil).AnyTimes()
+	})
 
-	backend.objects["mybucket/metakey"] = serverMockObj{
-		data: []byte("hello"), contentType: "text/plain", etag: `"abc"`,
-		metadata: map[string]string{"project": "acme"},
+	backend.Objects["mybucket/metakey"] = backendtest.Object{
+		Data: []byte("hello"), ContentType: "text/plain", ETag: `"abc"`,
+		Metadata: map[string]string{"project": "acme"},
 	}
-	mockStore.GetAllLocationsResp = []core.ObjectLocation{
-		{ObjectKey: "mybucket/metakey", BackendName: "b1", SizeBytes: 5},
-	}
-
 	resp := doReq(t, ts, http.MethodHead, ts.URL+"/mybucket/metakey", nil)
 	defer resp.Body.Close()
 
@@ -1027,7 +807,7 @@ func TestPut_MetadataTooLarge(t *testing.T) {
 	data := []byte("hello")
 
 	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPut, ts.URL+"/mybucket/metakey", bytes.NewReader(data))
-	req.Header.Set("X-Proxy-Token", "test-token")
+	signRequest(t, req)
 	req.Header.Set("Content-Type", "text/plain")
 	req.Header.Set("X-Amz-Meta-Big", strings.Repeat("x", maxUserMetadataBytes+1))
 	req.ContentLength = int64(len(data))
@@ -1050,13 +830,14 @@ func TestPut_MetadataTooLarge(t *testing.T) {
 // Asserts that status = , want 204.
 func TestDelete_Success(t *testing.T) {
 	t.Parallel()
-	ts, mockStore, backend := newTestServer(t)
+	ts, _, backend := newTestServer(t, func(m *storetest.MockMetadataStore) {
+		m.EXPECT().DeleteObject(gomock.Any(), gomock.Any()).
+			Return([]core.DeletedCopy{
+				{BackendName: "b1", SizeBytes: 2},
+			}, core.QuotaDeltas{"b1": -2}, nil).AnyTimes()
+	})
 
-	backend.objects["mybucket/testkey"] = serverMockObj{data: []byte("hi")}
-	mockStore.DeleteObjectResp = []core.DeletedCopy{
-		{BackendName: "b1", SizeBytes: 2},
-	}
-
+	backend.Objects["mybucket/testkey"] = backendtest.Object{Data: []byte("hi")}
 	resp := doReq(t, ts, http.MethodDelete, ts.URL+"/mybucket/testkey", nil)
 	defer resp.Body.Close()
 
@@ -1069,8 +850,10 @@ func TestDelete_Success(t *testing.T) {
 // Asserts that status = , want 204.
 func TestDelete_IdempotentForMissing(t *testing.T) {
 	t.Parallel()
-	ts, mockStore, _ := newTestServer(t)
-	mockStore.DeleteObjectErr = core.ErrObjectNotFound
+	ts, _, _ := newTestServer(t, func(m *storetest.MockMetadataStore) {
+		m.EXPECT().DeleteObject(gomock.Any(), gomock.Any()).
+			Return(nil, nil, core.ErrObjectNotFound).AnyTimes()
+	})
 
 	resp := doReq(t, ts, http.MethodDelete, ts.URL+"/mybucket/nonexistent", nil)
 	defer resp.Body.Close()
@@ -1089,14 +872,23 @@ func TestDelete_IdempotentForMissing(t *testing.T) {
 // Asserts that status = , want 200.
 func TestDeleteObjects_Success(t *testing.T) {
 	t.Parallel()
-	ts, mockStore, backend := newTestServer(t)
+	ts, _, backend := newTestServer(t, func(m *storetest.MockMetadataStore) {
+		m.EXPECT().DeleteObject(gomock.Any(), gomock.Any()).
+			Return([]core.DeletedCopy{{BackendName: "b1", SizeBytes: 1}}, core.QuotaDeltas{"b1": -1}, nil).AnyTimes()
+		m.EXPECT().DeleteObjectsBatch(gomock.Any(), gomock.Any()).
+			DoAndReturn(func(_ context.Context, keys []string) (map[string][]core.DeletedCopy, core.QuotaDeltas, error) {
+				out := make(map[string][]core.DeletedCopy, len(keys))
+				deltas := core.QuotaDeltas{}
+				for _, k := range keys {
+					out[k] = []core.DeletedCopy{{BackendName: "b1", SizeBytes: 1}}
+					deltas.Add("b1", -1)
+				}
+				return out, deltas, nil
+			}).AnyTimes()
+	})
 
-	backend.objects["mybucket/key1"] = serverMockObj{data: []byte("a")}
-	backend.objects["mybucket/key2"] = serverMockObj{data: []byte("b")}
-	mockStore.DeleteObjectFunc = func(key string) ([]core.DeletedCopy, error) {
-		return []core.DeletedCopy{{BackendName: "b1", SizeBytes: 1}}, nil
-	}
-
+	backend.Objects["mybucket/key1"] = backendtest.Object{Data: []byte("a")}
+	backend.Objects["mybucket/key2"] = backendtest.Object{Data: []byte("b")}
 	body := strings.NewReader(`<Delete><Object><Key>key1</Key></Object><Object><Key>key2</Key></Object></Delete>`)
 	resp := doReq(t, ts, http.MethodPost, ts.URL+"/mybucket?delete", body)
 	defer resp.Body.Close()
@@ -1118,10 +910,20 @@ func TestDeleteObjects_Success(t *testing.T) {
 // Asserts that status = , want 200.
 func TestDeleteObjects_QuietMode(t *testing.T) {
 	t.Parallel()
-	ts, mockStore, _ := newTestServer(t)
-	mockStore.DeleteObjectFunc = func(key string) ([]core.DeletedCopy, error) {
-		return []core.DeletedCopy{{BackendName: "b1", SizeBytes: 1}}, nil
-	}
+	ts, _, _ := newTestServer(t, func(m *storetest.MockMetadataStore) {
+		m.EXPECT().DeleteObject(gomock.Any(), gomock.Any()).
+			Return([]core.DeletedCopy{{BackendName: "b1", SizeBytes: 1}}, core.QuotaDeltas{"b1": -1}, nil).AnyTimes()
+		m.EXPECT().DeleteObjectsBatch(gomock.Any(), gomock.Any()).
+			DoAndReturn(func(_ context.Context, keys []string) (map[string][]core.DeletedCopy, core.QuotaDeltas, error) {
+				out := make(map[string][]core.DeletedCopy, len(keys))
+				deltas := core.QuotaDeltas{}
+				for _, k := range keys {
+					out[k] = []core.DeletedCopy{{BackendName: "b1", SizeBytes: 1}}
+					deltas.Add("b1", -1)
+				}
+				return out, deltas, nil
+			}).AnyTimes()
+	})
 
 	body := strings.NewReader(`<Delete><Quiet>true</Quiet><Object><Key>key1</Key></Object></Delete>`)
 	resp := doReq(t, ts, http.MethodPost, ts.URL+"/mybucket?delete", body)
@@ -1194,8 +996,10 @@ func TestDeleteObjects_EmptyRequest(t *testing.T) {
 // applying to one key.
 func TestDeleteObjects_WholeBatchFailure(t *testing.T) {
 	t.Parallel()
-	ts, mockStore, _ := newTestServer(t)
-	mockStore.DeleteObjectsBatchErr = &core.S3Error{StatusCode: 500, Code: "InternalError", Message: "db error"}
+	ts, _, _ := newTestServer(t, func(m *storetest.MockMetadataStore) {
+		m.EXPECT().DeleteObjectsBatch(gomock.Any(), gomock.Any()).
+			Return(nil, nil, &core.S3Error{StatusCode: 500, Code: "InternalError", Message: "db error"}).AnyTimes()
+	})
 
 	body := strings.NewReader(`<Delete><Object><Key>good</Key></Object><Object><Key>bad</Key></Object></Delete>`)
 	resp := doReq(t, ts, http.MethodPost, ts.URL+"/mybucket?delete", body)
@@ -1224,8 +1028,10 @@ func TestDeleteObjects_TypedErrorSurfaces(t *testing.T) {
 	t.Parallel()
 
 	// Typed S3Error case.
-	ts, mockStore, _ := newTestServer(t)
-	mockStore.DeleteObjectsBatchErr = &core.S3Error{StatusCode: 503, Code: "ServiceUnavailable", Message: "db down"}
+	ts, _, _ := newTestServer(t, func(m *storetest.MockMetadataStore) {
+		m.EXPECT().DeleteObjectsBatch(gomock.Any(), gomock.Any()).
+			Return(nil, nil, &core.S3Error{StatusCode: 503, Code: "ServiceUnavailable", Message: "db down"}).AnyTimes()
+	})
 
 	body := strings.NewReader(`<Delete><Object><Key>k1</Key></Object><Object><Key>k2</Key></Object></Delete>`)
 	resp := doReq(t, ts, http.MethodPost, ts.URL+"/mybucket?delete", body)
@@ -1241,8 +1047,10 @@ func TestDeleteObjects_TypedErrorSurfaces(t *testing.T) {
 	}
 
 	// Untyped error case -> InternalError fallback.
-	tsUntyped, mockStoreUntyped, _ := newTestServer(t)
-	mockStoreUntyped.DeleteObjectsBatchErr = errors.New("untyped backend error")
+	tsUntyped, _, _ := newTestServer(t, func(m *storetest.MockMetadataStore) {
+		m.EXPECT().DeleteObjectsBatch(gomock.Any(), gomock.Any()).
+			Return(nil, nil, errors.New("untyped backend error")).AnyTimes()
+	})
 
 	bodyUntyped := strings.NewReader(`<Delete><Object><Key>k1</Key></Object></Delete>`)
 	respUntyped := doReq(t, ts, http.MethodPost, tsUntyped.URL+"/mybucket?delete", bodyUntyped)
@@ -1263,18 +1071,19 @@ func TestDeleteObjects_TypedErrorSurfaces(t *testing.T) {
 // Asserts that status = , want 200. body:.
 func TestCopy_Success(t *testing.T) {
 	t.Parallel()
-	ts, mockStore, backend := newTestServer(t)
+	ts, _, backend := newTestServer(t, func(m *storetest.MockMetadataStore) {
+		m.EXPECT().GetAllObjectLocations(gomock.Any(), gomock.Any()).
+			Return([]core.ObjectLocation{
+				{ObjectKey: "mybucket/source-key", BackendName: "b1", SizeBytes: 7},
+			}, nil).AnyTimes()
+	})
 
 	// Pre-store source object
-	backend.objects["mybucket/source-key"] = serverMockObj{
-		data: []byte("copy me"), contentType: "text/plain", etag: `"src"`,
+	backend.Objects["mybucket/source-key"] = backendtest.Object{
+		Data: []byte("copy me"), ContentType: "text/plain", ETag: `"src"`,
 	}
-	mockStore.GetAllLocationsResp = []core.ObjectLocation{
-		{ObjectKey: "mybucket/source-key", BackendName: "b1", SizeBytes: 7},
-	}
-
 	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPut, ts.URL+"/mybucket/dest-key", nil)
-	req.Header.Set("X-Proxy-Token", "test-token")
+	signRequest(t, req)
 	req.Header.Set("X-Amz-Copy-Source", "/mybucket/source-key")
 	req.ContentLength = 0
 	resp, err := ts.Client().Do(req) //nolint:gosec // G704: test server URL
@@ -1299,11 +1108,13 @@ func TestCopy_Success(t *testing.T) {
 // Asserts that status = , want 404.
 func TestCopy_SourceNotFound(t *testing.T) {
 	t.Parallel()
-	ts, mockStore, _ := newTestServer(t)
-	mockStore.GetAllLocationsErr = core.ErrObjectNotFound
+	ts, _, _ := newTestServer(t, func(m *storetest.MockMetadataStore) {
+		m.EXPECT().GetAllObjectLocations(gomock.Any(), gomock.Any()).
+			Return(nil, core.ErrObjectNotFound).AnyTimes()
+	})
 
 	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPut, ts.URL+"/mybucket/dest-key", nil)
-	req.Header.Set("X-Proxy-Token", "test-token")
+	signRequest(t, req)
 	req.Header.Set("X-Amz-Copy-Source", "/mybucket/no-such-key")
 	req.ContentLength = 0
 	resp, err := ts.Client().Do(req) //nolint:gosec // G704: test server URL
@@ -1321,18 +1132,19 @@ func TestCopy_SourceNotFound(t *testing.T) {
 // Asserts that status = , want 200. body:.
 func TestCopy_URLEncodedSource(t *testing.T) {
 	t.Parallel()
-	ts, mockStore, backend := newTestServer(t)
+	ts, _, backend := newTestServer(t, func(m *storetest.MockMetadataStore) {
+		m.EXPECT().GetAllObjectLocations(gomock.Any(), gomock.Any()).
+			Return([]core.ObjectLocation{
+				{ObjectKey: "mybucket/my file.txt", BackendName: "b1", SizeBytes: 7},
+			}, nil).AnyTimes()
+	})
 
 	// Pre-store source object with a space in the key
-	backend.objects["mybucket/my file.txt"] = serverMockObj{
-		data: []byte("encoded"), contentType: "text/plain", etag: `"enc"`,
+	backend.Objects["mybucket/my file.txt"] = backendtest.Object{
+		Data: []byte("encoded"), ContentType: "text/plain", ETag: `"enc"`,
 	}
-	mockStore.GetAllLocationsResp = []core.ObjectLocation{
-		{ObjectKey: "mybucket/my file.txt", BackendName: "b1", SizeBytes: 7},
-	}
-
 	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPut, ts.URL+"/mybucket/dest-key", nil)
-	req.Header.Set("X-Proxy-Token", "test-token")
+	signRequest(t, req)
 	req.Header.Set("X-Amz-Copy-Source", "/mybucket/my%20file.txt")
 	req.ContentLength = 0
 	resp, err := ts.Client().Do(req) //nolint:gosec // G704: test server URL
@@ -1359,7 +1171,7 @@ func TestCopy_CrossBucketDenied(t *testing.T) {
 	ts, _, _ := newTestServer(t)
 
 	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPut, ts.URL+"/mybucket/dest-key", nil)
-	req.Header.Set("X-Proxy-Token", "test-token")
+	signRequest(t, req)
 	req.Header.Set("X-Amz-Copy-Source", "/otherbucket/source-key")
 	req.ContentLength = 0
 	resp, err := ts.Client().Do(req) //nolint:gosec // G704: test server URL
@@ -1384,7 +1196,7 @@ func TestAuth_BadCredentials(t *testing.T) {
 	ts, _, _ := newTestServer(t)
 
 	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, ts.URL+"/mybucket/testkey", nil)
-	req.Header.Set("X-Proxy-Token", "wrong-token")
+	signRequestAs(t, req, "AKIANOTAREALKEY", "not-the-right-secret")
 	resp, err := ts.Client().Do(req) //nolint:gosec // G704: test server URL
 	if err != nil {
 		t.Fatal(err)
@@ -1404,7 +1216,7 @@ func TestAuth_BucketMismatch(t *testing.T) {
 
 	// Token is valid for "mybucket" but request goes to "otherbucket"
 	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, ts.URL+"/otherbucket/testkey", nil)
-	req.Header.Set("X-Proxy-Token", "test-token")
+	signRequest(t, req)
 	resp, err := ts.Client().Do(req) //nolint:gosec // G704: test server URL
 	if err != nil {
 		t.Fatal(err)
@@ -1422,7 +1234,7 @@ func TestAuth_AccessDeniedDoesNotLeakBucketName(t *testing.T) {
 	ts, _, _ := newTestServer(t)
 
 	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, ts.URL+"/otherbucket/testkey", nil)
-	req.Header.Set("X-Proxy-Token", "test-token")
+	signRequest(t, req)
 	resp, err := ts.Client().Do(req) //nolint:gosec // G704: test server URL
 	if err != nil {
 		t.Fatal(err)
@@ -1446,7 +1258,7 @@ func TestUnsupportedMethod(t *testing.T) {
 	ts, _, _ := newTestServer(t)
 
 	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPatch, ts.URL+"/mybucket/testkey", nil)
-	req.Header.Set("X-Proxy-Token", "test-token")
+	signRequest(t, req)
 	resp, err := ts.Client().Do(req) //nolint:gosec // G704: test server URL
 	if err != nil {
 		t.Fatal(err)
@@ -1462,12 +1274,14 @@ func TestUnsupportedMethod(t *testing.T) {
 // Asserts that status = , want 200.
 func TestBucketOnlyGET_RoutesToList(t *testing.T) {
 	t.Parallel()
-	ts, mockStore, _ := newTestServer(t)
-	mockStore.ListObjectsResp = &core.ListObjectsResult{
-		Objects: []core.ObjectLocation{
-			{ObjectKey: "mybucket/file.txt", BackendName: "b1", SizeBytes: 100, CreatedAt: time.Now()},
-		},
-	}
+	ts, _, _ := newTestServer(t, func(m *storetest.MockMetadataStore) {
+		m.EXPECT().ListObjects(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+			Return(&core.ListObjectsResult{
+				Objects: []core.ObjectLocation{
+					{ObjectKey: "mybucket/file.txt", BackendName: "b1", SizeBytes: 100, CreatedAt: time.Now()},
+				},
+			}, nil).AnyTimes()
+	})
 
 	resp := doReq(t, ts, http.MethodGet, ts.URL+"/mybucket/", nil)
 	defer resp.Body.Close()
@@ -1479,5 +1293,242 @@ func TestBucketOnlyGET_RoutesToList(t *testing.T) {
 	ct := resp.Header.Get("Content-Type")
 	if !strings.Contains(ct, "application/xml") {
 		t.Errorf("Content-Type = %q, want application/xml", ct)
+	}
+}
+
+// -------------------------------------------------------------------------
+// RANGE + CONDITIONAL HEADERS
+// -------------------------------------------------------------------------
+
+// condServer serves one 11-byte object with a known ETag and Last-Modified,
+// which is all any conditional case needs, ranged or not.
+func condServer(t *testing.T) (*httptest.Server, time.Time) {
+	t.Helper()
+	modified := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	ts, _, backend := newTestServer(t, func(m *storetest.MockMetadataStore) {
+		m.EXPECT().GetAllObjectLocations(gomock.Any(), gomock.Any()).
+			Return([]core.ObjectLocation{
+				{ObjectKey: "mybucket/testkey", BackendName: "b1", SizeBytes: 11},
+			}, nil).AnyTimes()
+	})
+	backend.Put("mybucket/testkey", &backendtest.Object{
+		Data:         []byte("hello world"),
+		ContentType:  "text/plain",
+		ETag:         `"abc"`,
+		LastModified: modified,
+	})
+	return ts, modified
+}
+
+// condReq issues one request against the fixed key with the supplied headers.
+func condReq(t *testing.T, ts *httptest.Server, method string, headers map[string]string) *http.Response {
+	t.Helper()
+	req, _ := http.NewRequestWithContext(context.Background(), method, ts.URL+"/mybucket/testkey", nil)
+	signRequest(t, req)
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := ts.Client().Do(req) //nolint:gosec // G704: test server URL
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp
+}
+
+// rangeCondGet issues a ranged GET carrying the supplied conditional headers.
+func rangeCondGet(t *testing.T, ts *httptest.Server, headers map[string]string) *http.Response {
+	t.Helper()
+	withRange := map[string]string{"Range": "bytes=0-4"}
+	maps.Copy(withRange, headers)
+	return condReq(t, ts, http.MethodGet, withRange)
+}
+
+// TestGet_RangeHonorsPreconditions pins the fix for the corruption case: a
+// failed precondition aborts the request even when only a range was asked
+// for. Serving 206 here let a resumable download splice bytes from a
+// replaced object onto what it had already fetched.
+func TestGet_RangeHonorsPreconditions(t *testing.T) {
+	t.Parallel()
+	ts, modified := condServer(t)
+
+	for _, c := range []struct {
+		name    string
+		headers map[string]string
+		want    int
+	}{
+		{"if-match mismatch", map[string]string{"If-Match": `"stale"`}, http.StatusPreconditionFailed},
+		{"if-match hit", map[string]string{"If-Match": `"abc"`}, http.StatusPartialContent},
+		{"if-match star", map[string]string{"If-Match": "*"}, http.StatusPartialContent},
+		{"if-none-match hit", map[string]string{"If-None-Match": `"abc"`}, http.StatusNotModified},
+		{"if-none-match miss", map[string]string{"If-None-Match": `"other"`}, http.StatusPartialContent},
+		{
+			"if-unmodified-since older than the object",
+			map[string]string{"If-Unmodified-Since": modified.Add(-time.Hour).Format(http.TimeFormat)},
+			http.StatusPreconditionFailed,
+		},
+		{
+			"if-modified-since newer than the object",
+			map[string]string{"If-Modified-Since": modified.Add(time.Hour).Format(http.TimeFormat)},
+			http.StatusNotModified,
+		},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			resp := rangeCondGet(t, ts, c.headers)
+			defer resp.Body.Close()
+			if resp.StatusCode != c.want {
+				body, _ := io.ReadAll(resp.Body)
+				t.Fatalf("status = %d, want %d; body=%s", resp.StatusCode, c.want, body)
+			}
+		})
+	}
+}
+
+// TestGet_NotModifiedCarriesValidators asserts a 304 still carries the ETag
+// it would have carried on a 200, which is what lets a cache refresh its
+// stored validator instead of discarding the entry.
+func TestGet_NotModifiedCarriesValidators(t *testing.T) {
+	t.Parallel()
+	ts, _ := condServer(t)
+
+	resp := rangeCondGet(t, ts, map[string]string{"If-None-Match": `"abc"`})
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotModified {
+		t.Fatalf("status = %d, want 304", resp.StatusCode)
+	}
+	if got := resp.Header.Get("ETag"); got != `"abc"` {
+		t.Errorf("ETag = %q, want %q on a 304", got, `"abc"`)
+	}
+	if resp.Header.Get("Last-Modified") == "" {
+		t.Error("Last-Modified missing on a 304")
+	}
+}
+
+// TestGet_IfRange pins the range-or-restart contract: a matching validator
+// serves the range, and a stale one serves the whole object instead of a
+// partial the client would have spliced onto bytes from another version.
+func TestGet_IfRange(t *testing.T) {
+	t.Parallel()
+	ts, modified := condServer(t)
+
+	for _, c := range []struct {
+		name     string
+		ifRange  string
+		want     int
+		wantBody string
+	}{
+		{"matching etag serves the range", `"abc"`, http.StatusPartialContent, "hello"},
+		{"stale etag serves the whole object", `"stale"`, http.StatusOK, "hello world"},
+		{
+			"matching date serves the range",
+			modified.Format(http.TimeFormat), http.StatusPartialContent, "hello",
+		},
+		{
+			"stale date serves the whole object",
+			modified.Add(-time.Hour).Format(http.TimeFormat), http.StatusOK, "hello world",
+		},
+		// A weak validator cannot safely gate a partial response, so it is
+		// treated as a mismatch and the whole object is served.
+		{"weak etag serves the whole object", `W/"abc"`, http.StatusOK, "hello world"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			resp := rangeCondGet(t, ts, map[string]string{"If-Range": c.ifRange})
+			defer resp.Body.Close()
+			if resp.StatusCode != c.want {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, c.want)
+			}
+			body, _ := io.ReadAll(resp.Body)
+			if string(body) != c.wantBody {
+				t.Errorf("body = %q, want %q", body, c.wantBody)
+			}
+			if c.want == http.StatusOK && resp.Header.Get("Content-Range") != "" {
+				t.Error("a full response must not carry Content-Range")
+			}
+		})
+	}
+}
+
+// TestGet_RangeWithoutConditionalsStillPartial guards against the fix
+// over-reaching: a plain ranged GET is unaffected.
+func TestGet_RangeWithoutConditionalsStillPartial(t *testing.T) {
+	t.Parallel()
+	ts, _ := condServer(t)
+
+	resp := rangeCondGet(t, ts, nil)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusPartialContent {
+		t.Fatalf("status = %d, want 206", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "hello" {
+		t.Errorf("body = %q, want %q", body, "hello")
+	}
+}
+
+// TestDeleteObjects_RejectsSecondDocument proves the one-document rule is wired
+// into the live route, not just the helper. Two concatenated documents used to
+// parse as the first alone, so the orchestrator deleted one key set while the
+// full body described another.
+func TestDeleteObjects_RejectsSecondDocument(t *testing.T) {
+	t.Parallel()
+	ts, _, _ := newTestServer(t)
+
+	body := strings.NewReader(
+		`<Delete><Object><Key>a.txt</Key></Object></Delete>` +
+			`<Delete><Object><Key>b.txt</Key></Object></Delete>`)
+	resp := doReq(t, ts, http.MethodPost, ts.URL+"/mybucket?delete", body)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+}
+
+// TestDeleteObjects_RejectsOversizedBody proves an over-ceiling body is
+// reported as too large through the live route, rather than being truncated
+// and blamed on the client's XML.
+func TestDeleteObjects_RejectsOversizedBody(t *testing.T) {
+	t.Parallel()
+	ts, _, _ := newTestServer(t)
+
+	var b strings.Builder
+	b.WriteString(`<Delete>`)
+	for b.Len() < maxDeleteObjectsBody+1024 {
+		b.WriteString(`<Object><Key>`)
+		b.WriteString(strings.Repeat("k", 1024))
+		b.WriteString(`</Key></Object>`)
+	}
+	b.WriteString(`</Delete>`)
+
+	resp := doReq(t, ts, http.MethodPost, ts.URL+"/mybucket?delete", strings.NewReader(b.String()))
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413", resp.StatusCode)
+	}
+}
+
+// TestDeleteObjects_AcceptsMaximumLegalRequest pins the ceiling above what S3
+// permits: 1000 keys at the maximum key length. The previous 1 MB limit sat
+// under this, so a legal request was truncated and rejected as malformed.
+func TestDeleteObjects_AcceptsMaximumLegalRequest(t *testing.T) {
+	t.Parallel()
+	ts, _, _ := newTestServer(t)
+
+	var b strings.Builder
+	b.WriteString(`<Delete>`)
+	for i := range 1000 {
+		fmt.Fprintf(&b, `<Object><Key>%s%03d</Key></Object>`, strings.Repeat("k", 1021), i)
+	}
+	b.WriteString(`</Delete>`)
+
+	resp := doReq(t, ts, http.MethodPost, ts.URL+"/mybucket?delete", strings.NewReader(b.String()))
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusRequestEntityTooLarge {
+		t.Fatalf("a legal 1000-key request must not be rejected as too large (body %d bytes)", b.Len())
 	}
 }

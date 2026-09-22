@@ -4,9 +4,8 @@
 // Author: Alex Freidah
 //
 // One Provide<Worker> per background worker. Each provider invokes the
-// central *proxy.BackendManager (which satisfies worker.Ops / CleanupOps /
-// ScrubberOps via promoted backendCore methods plus its own write-path
-// helpers) and the wide core.MetadataStore, which already satisfies every
+// backend runtime (which satisfies worker.Ops / CleanupOps / ScrubberOps),
+// the write coordinator, and the opened store, which already satisfies every
 // per-worker store contract via implicit interface satisfaction. The
 // resolveWorkerCore / resolveWorkerCoreWithCfg helpers centralize that
 // dependency pattern so each provider stays a single short call plus the
@@ -21,30 +20,29 @@ import (
 
 	"github.com/samber/do/v2"
 
+	"github.com/afreidah/s3-orchestrator/internal/compression"
 	"github.com/afreidah/s3-orchestrator/internal/config"
 	"github.com/afreidah/s3-orchestrator/internal/encryption"
 	"github.com/afreidah/s3-orchestrator/internal/instanceid"
-	"github.com/afreidah/s3-orchestrator/internal/proxy"
+	"github.com/afreidah/s3-orchestrator/internal/provisioning"
 	"github.com/afreidah/s3-orchestrator/internal/proxy/drain"
 	"github.com/afreidah/s3-orchestrator/internal/proxy/infra"
 	"github.com/afreidah/s3-orchestrator/internal/proxy/multipart"
+	"github.com/afreidah/s3-orchestrator/internal/proxy/reconcile"
+	"github.com/afreidah/s3-orchestrator/internal/proxy/usage"
 	"github.com/afreidah/s3-orchestrator/internal/proxy/writepath"
-	"github.com/afreidah/s3-orchestrator/internal/store/core"
 	"github.com/afreidah/s3-orchestrator/internal/worker"
 )
 
-// Error-wrap formats shared by the worker dependency-resolution helpers so
-// the wrapped message stays identical across providers.
-const (
-	errResolveConfig        = "resolve Config: %w"
-	errResolveRuntime       = "resolve BackendRuntime: %w"
-	errResolveMetadataStore = "resolve MetadataStore: %w"
-)
+// -------------------------------------------------------------------------
+// TYPES
+// -------------------------------------------------------------------------
 
 // workerCore bundles the dependencies every background worker needs.
 type workerCore struct {
-	Mgr    *proxy.BackendManager
-	Stores core.MetadataStore
+	Runtime *infra.BackendRuntime
+	Coord   *writepath.Coordinator
+	Stores  metadataStore
 }
 
 // workerCoreWithCfg extends workerCore with *config.Config for workers
@@ -54,41 +52,40 @@ type workerCoreWithCfg struct {
 	Cfg *config.Config
 }
 
-// resolveWorkerCore resolves the BackendManager + MetadataStore pair every
-// worker provider depends on. Errors are wrapped with the dependency name
-// so a missing provider points at the right registration site.
+// -------------------------------------------------------------------------
+// INTERNALS
+// -------------------------------------------------------------------------
+
+// workerCoreFrom pulls the runtime, coordinator and store through an
+// in-flight resolver, so a caller that needs more than the core resolves
+// everything in one batch. Errors are wrapped with the dependency name so a
+// missing provider points at the right registration site.
+func workerCoreFrom(r *resolver) workerCore {
+	return workerCore{
+		Runtime: r.ResolveNamed[*infra.BackendRuntime]("BackendRuntime"),
+		Coord:   r.ResolveNamed[*writepath.Coordinator]("WriteCoordinator"),
+		Stores:  r.ResolveNamed[metadataStore]("MetadataStore"),
+	}
+}
+
+// resolveWorkerCore resolves the pair every worker provider depends on.
 func resolveWorkerCore(i do.Injector) (workerCore, error) {
-	var c workerCore
-	mgr, err := do.Invoke[*proxy.BackendManager](i)
-	if err != nil {
-		return c, fmt.Errorf("resolve BackendManager: %w", err)
-	}
-	stores, err := do.Invoke[core.MetadataStore](i)
-	if err != nil {
-		return c, fmt.Errorf(errResolveMetadataStore, err)
-	}
-	c.Mgr = mgr
-	c.Stores = stores
-	return c, nil
+	r := newResolver(i)
+	return workerCoreFrom(r), r.err
 }
 
 // resolveWorkerCoreWithCfg pulls *config.Config first, then the worker
 // core, mirroring the historic resolution order. Resolving config first
-// lets feature-gated providers short-circuit before touching the manager.
+// lets feature-gated providers short-circuit before touching the runtime.
 func resolveWorkerCoreWithCfg(i do.Injector) (workerCoreWithCfg, error) {
-	var c workerCoreWithCfg
-	cfg, err := do.Invoke[*config.Config](i)
-	if err != nil {
-		return c, fmt.Errorf(errResolveConfig, err)
-	}
-	core, err := resolveWorkerCore(i)
-	if err != nil {
-		return c, err
-	}
-	c.workerCore = core
-	c.Cfg = cfg
-	return c, nil
+	r := newResolver(i)
+	cfg := r.ResolveNamed[*config.Config]("Config")
+	return workerCoreWithCfg{workerCore: workerCoreFrom(r), Cfg: cfg}, r.err
 }
+
+// -------------------------------------------------------------------------
+// PUBLIC API
+// -------------------------------------------------------------------------
 
 // ProvideRebalancer constructs the rebalancer worker.
 func ProvideRebalancer(i do.Injector) (*worker.Rebalancer, error) {
@@ -96,16 +93,48 @@ func ProvideRebalancer(i do.Injector) (*worker.Rebalancer, error) {
 	if err != nil {
 		return nil, err
 	}
-	return worker.NewRebalancer(c.Mgr.Runtime(), c.Mgr, c.Stores), nil
+	return worker.NewRebalancer(c.Runtime, c.Coord, c.Stores), nil
 }
 
-// ProvideReplicator constructs the replication worker.
+// ProvideReplicator constructs the replication worker. It takes the encryptor
+// and codec because integrity.verify_on_replicate reads a new copy back, and
+// undoing its stored form is what makes the digest comparable to content_hash.
 func ProvideReplicator(i do.Injector) (*worker.Replicator, error) {
-	c, err := resolveWorkerCore(i)
+	c, err := resolveWorkerCoreWithCfg(i)
 	if err != nil {
 		return nil, err
 	}
-	return worker.NewReplicator(c.Mgr.Runtime(), c.Mgr, c.Stores), nil
+	enc, codec, err := resolveStoredForm(i, c.Cfg)
+	if err != nil {
+		return nil, err
+	}
+	return worker.NewReplicator(worker.ReplicatorDeps{
+		Ops:       c.Runtime,
+		Placement: c.Coord,
+		Store:     c.Stores,
+		Encryptor: enc,
+		Codec:     codec,
+	}), nil
+}
+
+// resolveStoredForm resolves the two optional decoders a worker needs to turn
+// stored bytes back into the plaintext a content hash covers.
+//
+// The codec is resolved whether or not compression is enabled for writes:
+// objects already stored compressed still have to be readable after an operator
+// turns the feature off.
+func resolveStoredForm(i do.Injector, cfg *config.Config) (*encryption.Encryptor, *compression.Codec, error) {
+	var enc *encryption.Encryptor
+	if cfg.Encryption.Enabled {
+		if e, err := do.Invoke[*encryption.Encryptor](i); err == nil {
+			enc = e
+		}
+	}
+	codec, err := do.Invoke[*compression.Codec](i)
+	if err != nil {
+		return nil, nil, err
+	}
+	return enc, codec, nil
 }
 
 // ProvideOverReplicationCleaner constructs the over-replication cleanup worker.
@@ -114,33 +143,25 @@ func ProvideOverReplicationCleaner(i do.Injector) (*worker.OverReplicationCleane
 	if err != nil {
 		return nil, err
 	}
-	return worker.NewOverReplicationCleaner(c.Mgr.Runtime(), c.Mgr, c.Stores), nil
+	return worker.NewOverReplicationCleaner(c.Runtime, c.Coord, c.Stores), nil
 }
 
 // ProvideCleanupWorker constructs the cleanup-queue worker. It resolves
-// the backend runtime and store directly rather than through the manager
-// so the drain manager (which takes this worker's ProcessCleanupQueue
-// hook) can be built before the manager.
+// the backend runtime and store directly so the drain manager (which
+// takes this worker's ProcessCleanupQueue hook) can be built from the
+// same pieces without an ordering dependency between the two.
 func ProvideCleanupWorker(i do.Injector) (*worker.CleanupWorker, error) {
-	cfg, err := do.Invoke[*config.Config](i)
-	if err != nil {
-		return nil, fmt.Errorf(errResolveConfig, err)
-	}
-	rt, err := do.Invoke[*infra.BackendRuntime](i)
-	if err != nil {
-		return nil, fmt.Errorf(errResolveRuntime, err)
-	}
-	stores, err := do.Invoke[core.MetadataStore](i)
-	if err != nil {
-		return nil, fmt.Errorf(errResolveMetadataStore, err)
+	r := newResolver(i)
+	cfg := r.ResolveNamed[*config.Config]("Config")
+	rt := r.ResolveNamed[*infra.BackendRuntime]("BackendRuntime")
+	stores := r.ResolveNamed[metadataStore]("MetadataStore")
+	id := r.ResolveNamed[instanceid.ID]("InstanceID")
+	if r.err != nil {
+		return nil, r.err
 	}
 	concurrency := cfg.CleanupQueue.Concurrency
 	if concurrency <= 0 {
 		concurrency = 10
-	}
-	id, err := do.Invoke[instanceid.ID](i)
-	if err != nil {
-		return nil, fmt.Errorf("resolve InstanceID: %w", err)
 	}
 	return worker.NewCleanupWorker(worker.CleanupWorkerDeps{
 		Ops:              rt,
@@ -158,11 +179,7 @@ func ProvideCleanupWorker(i do.Injector) (*worker.CleanupWorker, error) {
 // off" signal — it surfaces as an error so Optional[*worker.PendingReaper]
 // reports Failed instead of conflating it with Disabled.
 func ProvidePendingReaper(i do.Injector) (*worker.PendingReaper, error) {
-	cfg, err := do.Invoke[*config.Config](i)
-	if err != nil {
-		return nil, fmt.Errorf(errResolveConfig, err)
-	}
-	c, err := resolveWorkerCore(i)
+	c, err := resolveWorkerCoreWithCfg(i)
 	if err != nil {
 		return nil, err
 	}
@@ -170,11 +187,11 @@ func ProvidePendingReaper(i do.Injector) (*worker.PendingReaper, error) {
 		return nil, fmt.Errorf("pending pattern enabled but MetadataStore resolved to nil")
 	}
 	return worker.NewPendingReaper(worker.PendingReaperDeps{
-		Ops:       c.Mgr.Runtime(),
-		Placement: c.Mgr,
+		Ops:       c.Runtime,
+		Placement: c.Coord,
 		Store:     c.Stores,
-		MinAge:    cfg.WritePath.PendingPattern.MinAge,
-		BatchSize: cfg.WritePath.PendingPattern.BatchSize,
+		MinAge:    c.Cfg.WritePath.PendingPattern.MinAge,
+		BatchSize: c.Cfg.WritePath.PendingPattern.BatchSize,
 	}), nil
 }
 
@@ -184,17 +201,16 @@ func ProvideScrubber(i do.Injector) (*worker.Scrubber, error) {
 	if err != nil {
 		return nil, err
 	}
-	var enc *encryption.Encryptor
-	if c.Cfg.Encryption.Enabled {
-		if e, err := do.Invoke[*encryption.Encryptor](i); err == nil {
-			enc = e
-		}
+	enc, codec, err := resolveStoredForm(i, c.Cfg)
+	if err != nil {
+		return nil, err
 	}
 	return worker.NewScrubber(worker.ScrubberDeps{
-		Ops:       c.Mgr.Runtime(),
-		Placement: c.Mgr,
+		Ops:       c.Runtime,
+		Placement: c.Coord,
 		Store:     c.Stores,
 		Encryptor: enc,
+		Codec:     codec,
 	}), nil
 }
 
@@ -208,39 +224,40 @@ func ProvideReconciler(i do.Injector) (*worker.Reconciler, error) {
 	if err != nil {
 		return nil, err
 	}
-	bktNames := make([]string, len(c.Cfg.Buckets))
-	for idx, b := range c.Cfg.Buckets {
-		bktNames[idx] = b.Name
+	declared, err := do.Invoke[*provisioning.Declared](i)
+	if err != nil {
+		return nil, err
 	}
-	return worker.NewReconciler(c.Mgr, bktNames), nil
+	rec, err := do.Invoke[*reconcile.Manager](i)
+	if err != nil {
+		return nil, err
+	}
+	usageSvc, err := do.Invoke[*usage.Service](i)
+	if err != nil {
+		return nil, err
+	}
+	return worker.NewReconciler(&worker.ReconcilerDeps{
+		Syncer:  rec,
+		Fleet:   c.Runtime,
+		Usage:   usageSvc,
+		Buckets: declared,
+	}), nil
 }
 
 // ProvideDrainManager constructs the drain manager from the backend
 // runtime (fleet/copy/delete primitives), the write coordinator (its
-// mover), the wide MetadataStore for the object/quota/lifecycle role
-// surfaces, the multipart manager's abort hook, and the cleanup worker's
-// queue flush. None of these is the BackendManager, so drain builds
-// before the manager and is injected into it.
+// mover), the opened store for the object/quota/lifecycle role surfaces,
+// the multipart manager's abort hook, and the cleanup worker's queue
+// flush.
 func ProvideDrainManager(i do.Injector) (*drain.Manager, error) {
-	rt, err := do.Invoke[*infra.BackendRuntime](i)
-	if err != nil {
-		return nil, fmt.Errorf(errResolveRuntime, err)
-	}
-	coord, err := do.Invoke[*writepath.Coordinator](i)
-	if err != nil {
-		return nil, fmt.Errorf("resolve WriteCoordinator: %w", err)
-	}
-	stores, err := do.Invoke[core.MetadataStore](i)
-	if err != nil {
-		return nil, fmt.Errorf(errResolveMetadataStore, err)
-	}
-	mp, err := do.Invoke[*multipart.Manager](i)
-	if err != nil {
-		return nil, fmt.Errorf("resolve MultipartManager: %w", err)
-	}
-	cleanup, err := do.Invoke[*worker.CleanupWorker](i)
-	if err != nil {
-		return nil, fmt.Errorf("resolve CleanupWorker: %w", err)
+	r := newResolver(i)
+	rt := r.ResolveNamed[*infra.BackendRuntime]("BackendRuntime")
+	coord := r.ResolveNamed[*writepath.Coordinator]("WriteCoordinator")
+	stores := r.ResolveNamed[metadataStore]("MetadataStore")
+	mp := r.ResolveNamed[*multipart.Manager]("MultipartManager")
+	cleanup := r.ResolveNamed[*worker.CleanupWorker]("CleanupWorker")
+	if r.err != nil {
+		return nil, r.err
 	}
 	// drain wants a (processed, failed) callback; adapt the WorkSummary return
 	// so drain stays decoupled from worker.WorkSummary.

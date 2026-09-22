@@ -10,10 +10,23 @@ import (
 
 type BackendQuota struct {
 	BackendName string
-	BytesUsed   int64
 	BytesLimit  int64
 	UpdatedAt   pgtype.Timestamptz
 	OrphanBytes int64
+}
+
+type BackendQuotaStripe struct {
+	BackendName string
+	StripeID    int16
+	BytesUsed   int64
+}
+
+type BackendRequestUsage struct {
+	BackendName string
+	Period      string
+	Pool        string
+	Requests    int64
+	UpdatedAt   pgtype.Timestamptz
 }
 
 type BackendUsage struct {
@@ -23,6 +36,13 @@ type BackendUsage struct {
 	EgressBytes  int64
 	IngressBytes int64
 	UpdatedAt    pgtype.Timestamptz
+}
+
+type Bucket struct {
+	Name                string
+	MaxMultipartUploads int32
+	Cors                []byte
+	CreatedAt           pgtype.Timestamptz
 }
 
 type CleanupDlq struct {
@@ -52,6 +72,24 @@ type CleanupQueue struct {
 	ClaimedBy   *string
 }
 
+type Credential struct {
+	AccessKeyID string
+	UserID      string
+	Secret      string
+	Label       *string
+	Disabled    bool
+	CreatedAt   pgtype.Timestamptz
+	LastUsedAt  pgtype.Timestamptz
+}
+
+type Grant struct {
+	UserID       string
+	ResourceName string
+	CreatedAt    pgtype.Timestamptz
+	Permissions  string
+	ResourceKind string
+}
+
 type MultipartPart struct {
 	UploadID      string
 	PartNumber    int32
@@ -62,6 +100,7 @@ type MultipartPart struct {
 	EncryptionKey []byte
 	KeyID         *string
 	PlaintextSize *int64
+	PlaintextEtag *string
 }
 
 type MultipartUpload struct {
@@ -73,6 +112,7 @@ type MultipartUpload struct {
 	Metadata      []byte
 	EncryptionKey []byte
 	KeyID         *string
+	Tagging       *string
 }
 
 type NotificationOutbox struct {
@@ -87,26 +127,57 @@ type NotificationOutbox struct {
 }
 
 type ObjectLocation struct {
-	ObjectKey     string
-	BackendName   string
-	SizeBytes     int64
-	CreatedAt     pgtype.Timestamptz
-	Encrypted     bool
-	EncryptionKey []byte
-	KeyID         *string
-	PlaintextSize *int64
-	ContentHash   *string
+	ObjectKey                string
+	BackendName              string
+	SizeBytes                int64
+	CreatedAt                pgtype.Timestamptz
+	Encrypted                bool
+	EncryptionKey            []byte
+	KeyID                    *string
+	PlaintextSize            *int64
+	ContentHash              *string
+	Managed                  bool
+	LastScrubbedAt           pgtype.Timestamptz
+	CompressionAlgorithm     *string
+	CompressionLevel         *string
+	CompressionFormatVersion *int16
+	LogicalSize              *int64
+	CompressionProbeSize     *int64
+	CompressionProbeLevel    *string
+	Etag                     *string
+	ContentType              *string
+	UserMetadata             []byte
+}
+
+type ObjectTag struct {
+	ObjectKey string
+	TagKey    string
+	TagValue  string
 }
 
 type PendingObject struct {
-	IntentID      string
-	ObjectKey     string
-	BackendName   string
-	SizeBytes     int64
-	Encrypted     bool
-	EncryptionKey []byte
-	KeyID         *string
-	PlaintextSize *int64
-	ContentHash   *string
-	CreatedAt     pgtype.Timestamptz
+	IntentID                 string
+	ObjectKey                string
+	BackendName              string
+	SizeBytes                int64
+	Encrypted                bool
+	EncryptionKey            []byte
+	KeyID                    *string
+	PlaintextSize            *int64
+	ContentHash              *string
+	CreatedAt                pgtype.Timestamptz
+	CompressionAlgorithm     *string
+	CompressionLevel         *string
+	CompressionFormatVersion *int16
+	LogicalSize              *int64
+	Etag                     *string
+	ContentType              *string
+	UserMetadata             []byte
+	Role                     string
+}
+
+type User struct {
+	ID        string
+	Name      string
+	CreatedAt pgtype.Timestamptz
 }

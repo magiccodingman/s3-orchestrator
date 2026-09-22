@@ -21,6 +21,10 @@ import (
 	"github.com/afreidah/s3-orchestrator/internal/observe/telemetry"
 )
 
+// -------------------------------------------------------------------------
+// TYPES
+// -------------------------------------------------------------------------
+
 // CircuitBreakerBackend wraps an ObjectBackend with circuit breaker protection.
 // All S3 operations are guarded: when the circuit is open, calls immediately
 // return ErrBackendUnavailable without touching the real backend.
@@ -32,10 +36,6 @@ type CircuitBreakerBackend struct {
 // Compile-time check.
 var _ ObjectBackend = (*CircuitBreakerBackend)(nil)
 
-// NewCircuitBreakerBackend wraps a backend with per-backend circuit breaker
-// logic. The breaker is wired to the telemetry hook so transitions surface
-// on the standard CircuitBreaker* metrics and the BackendCircuit*
-// notification events.
 // CircuitBreakerConfig configures the circuit breaker wrapping a backend.
 type CircuitBreakerConfig struct {
 	Name      string
@@ -43,6 +43,10 @@ type CircuitBreakerConfig struct {
 	Timeout   time.Duration
 }
 
+// NewCircuitBreakerBackend wraps a backend with per-backend circuit breaker
+// logic. The breaker is wired to the telemetry hook so transitions surface
+// on the standard CircuitBreaker* metrics and the BackendCircuit*
+// notification events.
 func NewCircuitBreakerBackend(real ObjectBackend, cfg CircuitBreakerConfig) *CircuitBreakerBackend {
 	cb := breaker.NewCircuitBreaker(breaker.Config{
 		Name:      cfg.Name,
@@ -81,46 +85,50 @@ func isBackendError(err error) bool {
 	return !IsNotFound(err)
 }
 
+// -------------------------------------------------------------------------
+// PUBLIC API
+// -------------------------------------------------------------------------
+
 // PutObject uploads an object to the backend with circuit breaker protection.
 func (cb *CircuitBreakerBackend) PutObject(ctx context.Context, key string, body io.Reader, size int64, contentType string, metadata map[string]string) (string, error) {
-	return breaker.CBCall(cb.CircuitBreaker, func() (string, error) {
+	return cb.Call(func() (string, error) {
 		return cb.real.PutObject(ctx, key, body, size, contentType, metadata)
 	})
 }
 
 // GetObject retrieves an object from the backend with circuit breaker protection.
 func (cb *CircuitBreakerBackend) GetObject(ctx context.Context, key string, rangeHeader string) (*GetObjectResult, error) {
-	return breaker.CBCall(cb.CircuitBreaker, func() (*GetObjectResult, error) {
+	return cb.Call(func() (*GetObjectResult, error) {
 		return cb.real.GetObject(ctx, key, rangeHeader)
 	})
 }
 
 // HeadObject retrieves object metadata with circuit breaker protection.
 func (cb *CircuitBreakerBackend) HeadObject(ctx context.Context, key string) (*HeadObjectResult, error) {
-	return breaker.CBCall(cb.CircuitBreaker, func() (*HeadObjectResult, error) {
+	return cb.Call(func() (*HeadObjectResult, error) {
 		return cb.real.HeadObject(ctx, key)
 	})
 }
 
 // DeleteObject removes an object from the backend with circuit breaker protection.
 func (cb *CircuitBreakerBackend) DeleteObject(ctx context.Context, key string) error {
-	return breaker.CBCallNoResult(cb.CircuitBreaker, func() error {
+	return cb.CallNoResult(func() error {
 		return cb.real.DeleteObject(ctx, key)
 	})
 }
 
 // CopyObject forwards a server-side copy through the circuit breaker
-// when the wrapped backend implements BackendCopier. When it does not,
+// when the wrapped backend implements Copier. When it does not,
 // returns ErrCopyNotSupported so the caller falls back to materialized
 // copy. CopyObject failures count toward the same breaker as other
 // operations so a misbehaving backend's native copy path trips the
 // breaker just like its PutObject/GetObject path.
 func (cb *CircuitBreakerBackend) CopyObject(ctx context.Context, srcKey, dstKey, contentType string, metadata map[string]string) (string, error) {
-	copier, ok := cb.real.(BackendCopier)
+	copier, ok := cb.real.(Copier)
 	if !ok {
 		return "", ErrCopyNotSupported
 	}
-	return breaker.CBCall(cb.CircuitBreaker, func() (string, error) {
+	return cb.Call(func() (string, error) {
 		return copier.CopyObject(ctx, srcKey, dstKey, contentType, metadata)
 	})
 }

@@ -33,10 +33,8 @@ import (
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 
 	"github.com/afreidah/s3-orchestrator/internal/config"
-	"github.com/afreidah/s3-orchestrator/internal/proxy"
 	"github.com/afreidah/s3-orchestrator/internal/proxy/proxytest"
 	"github.com/afreidah/s3-orchestrator/internal/store/core"
-	"github.com/afreidah/s3-orchestrator/internal/transport/auth"
 	"github.com/afreidah/s3-orchestrator/internal/transport/s3api"
 
 	// -------------------------------------------------------------------------
@@ -751,7 +749,7 @@ func walkCommonPrefixes(t *testing.T, ctx context.Context, client *s3.Client, pr
 
 // TestListObjectsV2_DelimiterPaginationNoDuplicateCommonPrefix is the
 // end-to-end regression for issue #660. It seeds a deep CommonPrefix
-// group large enough to span the manager's store-page boundary, then
+// group large enough to span the object manager's store-page boundary, then
 // walks ListObjectsV2 with a delimiter via NextContinuationToken and
 // asserts no CommonPrefix appears in more than one paginated response.
 //
@@ -809,7 +807,7 @@ func TestReconcile_StaleRowSweepsCleanupQueue(t *testing.T) {
 	// Seed an object_locations row pointing at a key that was never
 	// uploaded to the backend, plus a cleanup_queue entry for the same
 	// key+backend with a corresponding orphan_bytes credit.
-	if _, err := testStore.RecordObject(ctx, staleKey, backend, sizeBytes, nil); err != nil {
+	if _, _, err := testStore.RecordObject(ctx, &core.RecordObjectRequest{Key: staleKey, Size: sizeBytes, Copies: []core.ObjectCopy{{Backend: backend}}}); err != nil {
 		t.Fatalf("seed RecordObject: %v", err)
 	}
 	if err := testStore.EnqueueCleanup(ctx, backend, staleKey, "test-seed", sizeBytes); err != nil {
@@ -832,7 +830,7 @@ func TestReconcile_StaleRowSweepsCleanupQueue(t *testing.T) {
 
 	// Run reconcile. Backend has no objects, DB has one stale row, so
 	// the delete path fires for our seeded key.
-	res, err := testManager.ReconcileBackend(ctx, backend, virtualBucket, []string{virtualBucket})
+	res, err := testReconciler.ReconcileBackend(ctx, backend, []string{virtualBucket})
 	if err != nil {
 		t.Fatalf("ReconcileBackend: %v", err)
 	}
@@ -950,31 +948,25 @@ func TestSpreadWriteRouting_DistributesAcrossBackends(t *testing.T) {
 	ctx := context.Background()
 	_ = ctx
 	stores := newStores(testStore)
-	spreadManager := proxytest.NewManager(t, &proxy.BackendManagerConfig{
-		Storage: proxy.StorageDeps{
-			Backends: testBackends,
-			Order:    testBackendOrder,
-		},
-		Stores: proxy.StoreDeps{
-			Metadata:  stores,
-			Dashboard: testStore,
-		},
-		Policies: proxy.PolicyConfig{
-			CacheTTL:        60 * time.Second,
+	spreadStack := proxytest.New(t, stores, &proxytest.StackOptions{
+		Runtime: proxytest.NewRuntime(&proxytest.RuntimeOptions{
+			Backends:        testBackends,
+			Order:           testBackendOrder,
 			BackendTimeout:  30 * time.Second,
 			RoutingStrategy: config.RoutingSpread,
-		},
-		Operations: proxy.OperationalDeps{
-			Metrics: newMetricsAdapter(testStore),
-		},
+			Metrics:         newMetricsAdapter(testStore),
+		}),
+		CacheTTL:       60 * time.Second,
+		BackendTimeout: 30 * time.Second,
 	})
-	_ = spreadManager
-	_ = proxytest.BuildWorkers(spreadManager, stores)
+	registerStack(t, spreadStack)
+	_ = proxytest.BuildWorkers(spreadStack, stores)
 	spreadSrv := &s3api.Server{
-		Manager: spreadManager,
+		Objects:   spreadStack.Objects,
+		Multipart: spreadStack.Multipart,
 	}
 	_ = spreadSrv
-	spreadSrv.SetBucketAuth(auth.NewBucketRegistry([]config.BucketConfig{{
+	spreadSrv.SetBucketAuth(mustBucketRegistry(t, []config.BucketConfig{{
 		Name: virtualBucket,
 		Credentials: []config.CredentialConfig{{
 			AccessKeyID:     "test",
@@ -1002,7 +994,7 @@ func TestSpreadWriteRouting_DistributesAcrossBackends(t *testing.T) {
 	_ = spreadClient
 
 	resetState(t)
-	spreadManager.ClearCache()
+	spreadStack.Objects.LocationCache().Clear()
 
 	keys := make([]string, 4)
 	for i := range keys {
@@ -1051,31 +1043,25 @@ func TestSpreadWriteRouting_PreferLeastUtilizedAfterImbalance(t *testing.T) {
 	ctx := context.Background()
 	_ = ctx
 	stores := newStores(testStore)
-	spreadManager := proxytest.NewManager(t, &proxy.BackendManagerConfig{
-		Storage: proxy.StorageDeps{
-			Backends: testBackends,
-			Order:    testBackendOrder,
-		},
-		Stores: proxy.StoreDeps{
-			Metadata:  stores,
-			Dashboard: testStore,
-		},
-		Policies: proxy.PolicyConfig{
-			CacheTTL:        60 * time.Second,
+	spreadStack := proxytest.New(t, stores, &proxytest.StackOptions{
+		Runtime: proxytest.NewRuntime(&proxytest.RuntimeOptions{
+			Backends:        testBackends,
+			Order:           testBackendOrder,
 			BackendTimeout:  30 * time.Second,
 			RoutingStrategy: config.RoutingSpread,
-		},
-		Operations: proxy.OperationalDeps{
-			Metrics: newMetricsAdapter(testStore),
-		},
+			Metrics:         newMetricsAdapter(testStore),
+		}),
+		CacheTTL:       60 * time.Second,
+		BackendTimeout: 30 * time.Second,
 	})
-	_ = spreadManager
-	_ = proxytest.BuildWorkers(spreadManager, stores)
+	registerStack(t, spreadStack)
+	_ = proxytest.BuildWorkers(spreadStack, stores)
 	spreadSrv := &s3api.Server{
-		Manager: spreadManager,
+		Objects:   spreadStack.Objects,
+		Multipart: spreadStack.Multipart,
 	}
 	_ = spreadSrv
-	spreadSrv.SetBucketAuth(auth.NewBucketRegistry([]config.BucketConfig{{
+	spreadSrv.SetBucketAuth(mustBucketRegistry(t, []config.BucketConfig{{
 		Name: virtualBucket,
 		Credentials: []config.CredentialConfig{{
 			AccessKeyID:     "test",
@@ -1103,11 +1089,14 @@ func TestSpreadWriteRouting_PreferLeastUtilizedAfterImbalance(t *testing.T) {
 	_ = spreadClient
 
 	resetState(t)
-	spreadManager.ClearCache()
+	spreadStack.Objects.LocationCache().Clear()
 
-	if _, err := testStore.RecordObject(ctx, uniqueKey(t, "prefill"), "minio-1", 512, nil); err != nil {
+	if _, _, err := testStore.RecordObject(ctx, &core.RecordObjectRequest{Key: uniqueKey(t, "prefill"), Copies: []core.ObjectCopy{{Backend: "minio-1"}}, Size: 512}); err != nil {
 		t.Fatalf("RecordObject prefill: %v", err)
 	}
+	// The record charged the counter in its own transaction; the tracker still
+	// has to reload before spread sees the imbalance rather than two zeros.
+	refreshQuota(t)
 
 	keys := make([]string, 3)
 	for i := range keys {
@@ -1137,31 +1126,25 @@ func TestSpreadWriteRouting_ContrastWithPackBehavior(t *testing.T) {
 	ctx := context.Background()
 	_ = ctx
 	stores := newStores(testStore)
-	spreadManager := proxytest.NewManager(t, &proxy.BackendManagerConfig{
-		Storage: proxy.StorageDeps{
-			Backends: testBackends,
-			Order:    testBackendOrder,
-		},
-		Stores: proxy.StoreDeps{
-			Metadata:  stores,
-			Dashboard: testStore,
-		},
-		Policies: proxy.PolicyConfig{
-			CacheTTL:        60 * time.Second,
+	spreadStack := proxytest.New(t, stores, &proxytest.StackOptions{
+		Runtime: proxytest.NewRuntime(&proxytest.RuntimeOptions{
+			Backends:        testBackends,
+			Order:           testBackendOrder,
 			BackendTimeout:  30 * time.Second,
 			RoutingStrategy: config.RoutingSpread,
-		},
-		Operations: proxy.OperationalDeps{
-			Metrics: newMetricsAdapter(testStore),
-		},
+			Metrics:         newMetricsAdapter(testStore),
+		}),
+		CacheTTL:       60 * time.Second,
+		BackendTimeout: 30 * time.Second,
 	})
-	_ = spreadManager
-	_ = proxytest.BuildWorkers(spreadManager, stores)
+	registerStack(t, spreadStack)
+	_ = proxytest.BuildWorkers(spreadStack, stores)
 	spreadSrv := &s3api.Server{
-		Manager: spreadManager,
+		Objects:   spreadStack.Objects,
+		Multipart: spreadStack.Multipart,
 	}
 	_ = spreadSrv
-	spreadSrv.SetBucketAuth(auth.NewBucketRegistry([]config.BucketConfig{{
+	spreadSrv.SetBucketAuth(mustBucketRegistry(t, []config.BucketConfig{{
 		Name: virtualBucket,
 		Credentials: []config.CredentialConfig{{
 			AccessKeyID:     "test",
@@ -1189,8 +1172,8 @@ func TestSpreadWriteRouting_ContrastWithPackBehavior(t *testing.T) {
 	_ = spreadClient
 
 	resetState(t)
-	spreadManager.ClearCache()
-	testManager.ClearCache()
+	spreadStack.Objects.LocationCache().Clear()
+	testStack.Objects.LocationCache().Clear()
 
 	packClient := newS3Client(t)
 	packKeys := make([]string, 4)
@@ -1218,7 +1201,7 @@ func TestSpreadWriteRouting_ContrastWithPackBehavior(t *testing.T) {
 	}
 
 	resetState(t)
-	spreadManager.ClearCache()
+	spreadStack.Objects.LocationCache().Clear()
 
 	spreadKeys := make([]string, 4)
 	for i := range spreadKeys {
@@ -1256,48 +1239,23 @@ func TestRebalancePackTight(t *testing.T) {
 	ctx := context.Background()
 	resetState(t)
 
+	ws := newWriteSet(t, client)
+
 	// Setup: fill minio-1 to force overflow, then free space so pack can pull back.
 	// Step 1: fill minio-1 completely
 	fillKey := uniqueKey(t, "pack-fill")
-	_, err := client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket:        aws.String(virtualBucket),
-		Key:           aws.String(fillKey),
-		Body:          bytes.NewReader(bytes.Repeat([]byte("F"), 1024)),
-		ContentLength: aws.Int64(1024),
-	})
-	if err != nil {
-		t.Fatalf("PutObject fill: %v", err)
-	}
+	ws.put(ctx, fillKey, bytes.Repeat([]byte("F"), 1024))
 
 	// Step 2: these overflow to minio-2 (minio-1 is full)
-	for i := range 3 {
-		key := fmt.Sprintf("rebal-pack/obj-%d-%d", i, time.Now().UnixNano())
-		_, err := client.PutObject(ctx, &s3.PutObjectInput{
-			Bucket:        aws.String(virtualBucket),
-			Key:           aws.String(key),
-			Body:          bytes.NewReader(bytes.Repeat([]byte("P"), 100)),
-			ContentLength: aws.Int64(100),
-		})
-		if err != nil {
-			t.Fatalf("PutObject overflow %d: %v", i, err)
-		}
-	}
+	ws.seed(ctx, "rebal-pack/obj", 3, 100)
 
 	// Step 3: delete fill and put a smaller object so minio-1 has room
 	_, _ = client.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: aws.String(virtualBucket),
 		Key:    aws.String(fillKey),
 	})
-	refillKey := uniqueKey(t, "pack-refill")
-	_, err = client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket:        aws.String(virtualBucket),
-		Key:           aws.String(refillKey),
-		Body:          bytes.NewReader(bytes.Repeat([]byte("R"), 600)),
-		ContentLength: aws.Int64(600),
-	})
-	if err != nil {
-		t.Fatalf("PutObject refill: %v", err)
-	}
+	ws.drop(fillKey)
+	ws.put(ctx, uniqueKey(t, "pack-refill"), bytes.Repeat([]byte("R"), 600))
 
 	// State: minio-1=600/1024 (58.6%), minio-2=300/2048 (14.6%)
 	// minio-1 is more full and has 424 bytes free, enough for 3 x 100-byte objects
@@ -1313,11 +1271,13 @@ func TestRebalancePackTight(t *testing.T) {
 		Threshold: 0,
 	}
 
-	movedSum, err := testWorkers.Rebalancer.Rebalance(ctx, packCfg)
+	flushQuota(t)
+	movedSum, err := testWorkers.Rebalancer.Rebalance(ctx, packCfg, nil)
 	moved := movedSum.Succeeded
 	if err != nil {
 		t.Fatalf("Rebalance: %v", err)
 	}
+	ws.assertIntact(ctx, "after pack")
 
 	m1Used := queryQuotaUsed(t, "minio-1")
 	m2Used := queryQuotaUsed(t, "minio-2")
@@ -1339,22 +1299,13 @@ func TestRebalancePackTight(t *testing.T) {
 
 	// No-op case: all objects already on the most-full backend
 	resetState(t)
+	ws.forget()
 
-	for i := range 5 {
-		key := fmt.Sprintf("rebal-pack/noop-%d-%d", i, time.Now().UnixNano())
-		_, err := client.PutObject(ctx, &s3.PutObjectInput{
-			Bucket:        aws.String(virtualBucket),
-			Key:           aws.String(key),
-			Body:          bytes.NewReader(bytes.Repeat([]byte("N"), 200)),
-			ContentLength: aws.Int64(200),
-		})
-		if err != nil {
-			t.Fatalf("PutObject noop %d: %v", i, err)
-		}
-	}
+	ws.seed(ctx, "rebal-pack/noop", 5, 200)
 
 	// minio-1 is 97.6% (1000/1024), minio-2 is 0%  -  nothing to consolidate
-	movedSum, err = testWorkers.Rebalancer.Rebalance(ctx, packCfg)
+	flushQuota(t)
+	movedSum, err = testWorkers.Rebalancer.Rebalance(ctx, packCfg, nil)
 	moved = movedSum.Succeeded
 	if err != nil {
 		t.Fatalf("Rebalance noop: %v", err)
@@ -1363,68 +1314,42 @@ func TestRebalancePackTight(t *testing.T) {
 	if moved != 0 {
 		t.Errorf("pack moved %d objects, want 0 (nothing to consolidate)", moved)
 	}
+	ws.assertIntact(ctx, "after noop pack")
 }
 
 // TestRebalancePackTinyToFuller_DestHasRoom is one of the sub-cases extracted from the
 // original mega-TestRebalancePackTinyToFuller; behaviour is preserved.
 func TestRebalancePackTinyToFuller_DestHasRoom(t *testing.T) {
 	client := newS3Client(t)
-	_ = client
 	ctx := context.Background()
-	_ = ctx
 	packCfg := config.RebalanceConfig{
 		Enabled:   true,
 		Strategy:  "pack",
 		BatchSize: 10,
 		Threshold: 0,
 	}
-	_ = packCfg
 
 	resetState(t)
+	ws := newWriteSet(t, client)
 
 	fillKey := uniqueKey(t, "tiny-fill")
-	_, err := client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket:        aws.String(virtualBucket),
-		Key:           aws.String(fillKey),
-		Body:          bytes.NewReader(bytes.Repeat([]byte("F"), 1024)),
-		ContentLength: aws.Int64(1024),
-	})
-	if err != nil {
-		t.Fatalf("PutObject fill: %v", err)
-	}
-
-	bigKey := uniqueKey(t, "tiny-big")
-	_, err = client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket:        aws.String(virtualBucket),
-		Key:           aws.String(bigKey),
-		Body:          bytes.NewReader(bytes.Repeat([]byte("B"), 1000)),
-		ContentLength: aws.Int64(1000),
-	})
-	if err != nil {
-		t.Fatalf("PutObject big: %v", err)
-	}
+	ws.put(ctx, fillKey, bytes.Repeat([]byte("F"), 1024))
+	ws.put(ctx, uniqueKey(t, "tiny-big"), bytes.Repeat([]byte("B"), 1000))
 
 	_, _ = client.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: aws.String(virtualBucket),
 		Key:    aws.String(fillKey),
 	})
-	tinyKey := uniqueKey(t, "tiny-obj")
-	_, err = client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket:        aws.String(virtualBucket),
-		Key:           aws.String(tinyKey),
-		Body:          bytes.NewReader(bytes.Repeat([]byte("T"), 100)),
-		ContentLength: aws.Int64(100),
-	})
-	if err != nil {
-		t.Fatalf("PutObject tiny: %v", err)
-	}
+	ws.drop(fillKey)
+	ws.put(ctx, uniqueKey(t, "tiny-obj"), bytes.Repeat([]byte("T"), 100))
 
 	m1Before := queryQuotaUsed(t, "minio-1")
 	m2Before := queryQuotaUsed(t, "minio-2")
 	t.Logf("before: minio-1=%d (%.1f%%) minio-2=%d (%.1f%%)",
 		m1Before, float64(m1Before)/1024*100, m2Before, float64(m2Before)/2048*100)
 
-	movedSum, err := testWorkers.Rebalancer.Rebalance(ctx, packCfg)
+	flushQuota(t)
+	movedSum, err := testWorkers.Rebalancer.Rebalance(ctx, packCfg, nil)
 	moved := movedSum.Succeeded
 	if err != nil {
 		t.Fatalf("Rebalance: %v", err)
@@ -1445,73 +1370,40 @@ func TestRebalancePackTinyToFuller_DestHasRoom(t *testing.T) {
 		t.Errorf("minio-1 bytes_used = %d, want 0", m1Used)
 	}
 
-	_, err = client.HeadObject(ctx, &s3.HeadObjectInput{
-		Bucket: aws.String(virtualBucket),
-		Key:    aws.String(tinyKey),
-	})
-	if err != nil {
-		t.Errorf("tiny object not accessible: %v", err)
-	}
+	ws.assertIntact(ctx, "after pack to fuller destination")
 }
 
 // TestRebalancePackTinyToFuller_DestIsFull is one of the sub-cases extracted from the
 // original mega-TestRebalancePackTinyToFuller; behaviour is preserved.
 func TestRebalancePackTinyToFuller_DestIsFull(t *testing.T) {
 	client := newS3Client(t)
-	_ = client
 	ctx := context.Background()
-	_ = ctx
 	packCfg := config.RebalanceConfig{
 		Enabled:   true,
 		Strategy:  "pack",
 		BatchSize: 10,
 		Threshold: 0,
 	}
-	_ = packCfg
 
 	resetState(t)
+	ws := newWriteSet(t, client)
 
 	fillKey := uniqueKey(t, "full-fill")
-	_, err := client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket:        aws.String(virtualBucket),
-		Key:           aws.String(fillKey),
-		Body:          bytes.NewReader(bytes.Repeat([]byte("F"), 1024)),
-		ContentLength: aws.Int64(1024),
-	})
-	if err != nil {
-		t.Fatalf("PutObject fill: %v", err)
-	}
-
-	bigKey := uniqueKey(t, "full-big")
-	_, err = client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket:        aws.String(virtualBucket),
-		Key:           aws.String(bigKey),
-		Body:          bytes.NewReader(bytes.Repeat([]byte("B"), 2048)),
-		ContentLength: aws.Int64(2048),
-	})
-	if err != nil {
-		t.Fatalf("PutObject big: %v", err)
-	}
+	ws.put(ctx, fillKey, bytes.Repeat([]byte("F"), 1024))
+	ws.put(ctx, uniqueKey(t, "full-big"), bytes.Repeat([]byte("B"), 2048))
 
 	_, _ = client.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: aws.String(virtualBucket),
 		Key:    aws.String(fillKey),
 	})
-	tinyKey := uniqueKey(t, "full-tiny")
-	_, err = client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket:        aws.String(virtualBucket),
-		Key:           aws.String(tinyKey),
-		Body:          bytes.NewReader(bytes.Repeat([]byte("T"), 100)),
-		ContentLength: aws.Int64(100),
-	})
-	if err != nil {
-		t.Fatalf("PutObject tiny: %v", err)
-	}
+	ws.drop(fillKey)
+	ws.put(ctx, uniqueKey(t, "full-tiny"), bytes.Repeat([]byte("T"), 100))
 
 	t.Logf("before: minio-1=%d minio-2=%d",
 		queryQuotaUsed(t, "minio-1"), queryQuotaUsed(t, "minio-2"))
 
-	movedSum, err := testWorkers.Rebalancer.Rebalance(ctx, packCfg)
+	flushQuota(t)
+	movedSum, err := testWorkers.Rebalancer.Rebalance(ctx, packCfg, nil)
 	moved := movedSum.Succeeded
 	if err != nil {
 		t.Fatalf("Rebalance: %v", err)
@@ -1526,6 +1418,8 @@ func TestRebalancePackTinyToFuller_DestIsFull(t *testing.T) {
 	if got := queryQuotaUsed(t, "minio-1"); got != 100 {
 		t.Errorf("minio-1 bytes_used = %d, want 100", got)
 	}
+
+	ws.assertIntact(ctx, "after pack blocked by full destination")
 }
 
 // TestRebalanceSpreadEven verifies the rebalance spread even contract.
@@ -1538,18 +1432,8 @@ func TestRebalanceSpreadEven(t *testing.T) {
 	// Fill minio-1 near capacity: 5 x 200 = 1000 bytes (97.6% of 1024)
 	// minio-2 is empty (0% of 2048)
 	// Spread should equalize: target = 1000/3072 = 32.5%
-	for i := range 5 {
-		key := fmt.Sprintf("rebal-spread/obj-%d-%d", i, time.Now().UnixNano())
-		_, err := client.PutObject(ctx, &s3.PutObjectInput{
-			Bucket:        aws.String(virtualBucket),
-			Key:           aws.String(key),
-			Body:          bytes.NewReader(bytes.Repeat([]byte("S"), 200)),
-			ContentLength: aws.Int64(200),
-		})
-		if err != nil {
-			t.Fatalf("PutObject %d: %v", i, err)
-		}
-	}
+	ws := newWriteSet(t, client)
+	ws.seed(ctx, "rebal-spread/obj", 5, 200)
 
 	// Verify initial state
 	if got := queryQuotaUsed(t, "minio-1"); got != 1000 {
@@ -1566,7 +1450,8 @@ func TestRebalanceSpreadEven(t *testing.T) {
 		Threshold: 0,
 	}
 
-	movedSum, err := testWorkers.Rebalancer.Rebalance(ctx, spreadCfg)
+	flushQuota(t)
+	movedSum, err := testWorkers.Rebalancer.Rebalance(ctx, spreadCfg, nil)
 	moved := movedSum.Succeeded
 	if err != nil {
 		t.Fatalf("Rebalance: %v", err)
@@ -1612,6 +1497,8 @@ func TestRebalanceSpreadEven(t *testing.T) {
 	if len(list.Contents) != 5 {
 		t.Errorf("listed %d objects, want 5", len(list.Contents))
 	}
+
+	ws.assertIntact(ctx, "after spread")
 }
 
 // TestRebalanceSpreadAlreadyBalanced verifies the rebalance spread already balanced contract.
@@ -1626,45 +1513,24 @@ func TestRebalanceSpreadAlreadyBalanced(t *testing.T) {
 	// Put 300 on minio-1 (29.3%), then fill minio-1 and overflow 600 to minio-2 (29.3%).
 	// Both near target -> spread should do nothing.
 
+	ws := newWriteSet(t, client)
+
 	// 300 bytes on minio-1
-	_, err := client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket:        aws.String(virtualBucket),
-		Key:           aws.String(uniqueKey(t, "bal")),
-		Body:          bytes.NewReader(bytes.Repeat([]byte("A"), 300)),
-		ContentLength: aws.Int64(300),
-	})
-	if err != nil {
-		t.Fatalf("PutObject: %v", err)
-	}
+	ws.put(ctx, uniqueKey(t, "bal"), bytes.Repeat([]byte("A"), 300))
 
 	// Fill minio-1 to force overflow
 	fillKey := uniqueKey(t, "bal-fill")
-	_, err = client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket:        aws.String(virtualBucket),
-		Key:           aws.String(fillKey),
-		Body:          bytes.NewReader(bytes.Repeat([]byte("F"), 724)),
-		ContentLength: aws.Int64(724),
-	})
-	if err != nil {
-		t.Fatalf("PutObject fill: %v", err)
-	}
+	ws.put(ctx, fillKey, bytes.Repeat([]byte("F"), 724))
 
 	// Overflow 600 to minio-2 (minio-1 has 0 bytes free now)
-	_, err = client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket:        aws.String(virtualBucket),
-		Key:           aws.String(uniqueKey(t, "bal-m2")),
-		Body:          bytes.NewReader(bytes.Repeat([]byte("B"), 600)),
-		ContentLength: aws.Int64(600),
-	})
-	if err != nil {
-		t.Fatalf("PutObject m2: %v", err)
-	}
+	ws.put(ctx, uniqueKey(t, "bal-m2"), bytes.Repeat([]byte("B"), 600))
 
 	// Delete fill to get minio-1 back to 300
 	_, _ = client.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: aws.String(virtualBucket),
 		Key:    aws.String(fillKey),
 	})
+	ws.drop(fillKey)
 
 	// State: minio-1=300/1024 (29.3%), minio-2=600/2048 (29.3%)
 	// Target = 900/3072 = 29.3%. Both at target already.
@@ -1680,7 +1546,8 @@ func TestRebalanceSpreadAlreadyBalanced(t *testing.T) {
 		Threshold: 0,
 	}
 
-	movedSum, err := testWorkers.Rebalancer.Rebalance(ctx, spreadCfg)
+	flushQuota(t)
+	movedSum, err := testWorkers.Rebalancer.Rebalance(ctx, spreadCfg, nil)
 	moved := movedSum.Succeeded
 	if err != nil {
 		t.Fatalf("Rebalance: %v", err)
@@ -1689,6 +1556,8 @@ func TestRebalanceSpreadAlreadyBalanced(t *testing.T) {
 	if moved != 0 {
 		t.Errorf("spread moved %d, want 0 (already balanced)", moved)
 	}
+
+	ws.assertIntact(ctx, "after balanced spread")
 }
 
 // TestRebalanceSpreadOversizedObject verifies the rebalance spread oversized object contract.
@@ -1702,25 +1571,9 @@ func TestRebalanceSpreadOversizedObject(t *testing.T) {
 	// Target = 1000/3072 = 32.5%. minio-1 excess = 1000 - 333 = 667 bytes.
 	// The 800-byte object is larger than the 667-byte excess, so spread should
 	// only move the 200-byte object.
-	_, err := client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket:        aws.String(virtualBucket),
-		Key:           aws.String(uniqueKey(t, "big")),
-		Body:          bytes.NewReader(bytes.Repeat([]byte("B"), 800)),
-		ContentLength: aws.Int64(800),
-	})
-	if err != nil {
-		t.Fatalf("PutObject big: %v", err)
-	}
-
-	_, err = client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket:        aws.String(virtualBucket),
-		Key:           aws.String(uniqueKey(t, "small")),
-		Body:          bytes.NewReader(bytes.Repeat([]byte("S"), 200)),
-		ContentLength: aws.Int64(200),
-	})
-	if err != nil {
-		t.Fatalf("PutObject small: %v", err)
-	}
+	ws := newWriteSet(t, client)
+	ws.put(ctx, uniqueKey(t, "big"), bytes.Repeat([]byte("B"), 800))
+	ws.put(ctx, uniqueKey(t, "small"), bytes.Repeat([]byte("S"), 200))
 
 	// State: minio-1=1000/1024 (97.6%), minio-2=0/2048 (0%)
 	spreadCfg := config.RebalanceConfig{
@@ -1730,7 +1583,8 @@ func TestRebalanceSpreadOversizedObject(t *testing.T) {
 		Threshold: 0,
 	}
 
-	movedSum, err := testWorkers.Rebalancer.Rebalance(ctx, spreadCfg)
+	flushQuota(t)
+	movedSum, err := testWorkers.Rebalancer.Rebalance(ctx, spreadCfg, nil)
 	moved := movedSum.Succeeded
 	if err != nil {
 		t.Fatalf("Rebalance: %v", err)
@@ -1751,6 +1605,8 @@ func TestRebalanceSpreadOversizedObject(t *testing.T) {
 	if m2Used != 200 {
 		t.Errorf("minio-2 = %d, want 200 (small object moved)", m2Used)
 	}
+
+	ws.assertIntact(ctx, "after oversized-object spread")
 }
 
 // TestRebalanceSpreadStableAcrossCycles verifies the rebalance spread stable across cycles contract.
@@ -1761,17 +1617,8 @@ func TestRebalanceSpreadStableAcrossCycles(t *testing.T) {
 	resetState(t)
 
 	// Setup: 5 x 200-byte objects on minio-1
-	for i := range 5 {
-		_, err := client.PutObject(ctx, &s3.PutObjectInput{
-			Bucket:        aws.String(virtualBucket),
-			Key:           aws.String(fmt.Sprintf("stable/obj-%d-%d", i, time.Now().UnixNano())),
-			Body:          bytes.NewReader(bytes.Repeat([]byte("S"), 200)),
-			ContentLength: aws.Int64(200),
-		})
-		if err != nil {
-			t.Fatalf("PutObject %d: %v", i, err)
-		}
-	}
+	ws := newWriteSet(t, client)
+	ws.seed(ctx, "stable/obj", 5, 200)
 
 	spreadCfg := config.RebalanceConfig{
 		Enabled:   true,
@@ -1781,7 +1628,8 @@ func TestRebalanceSpreadStableAcrossCycles(t *testing.T) {
 	}
 
 	// Cycle 1
-	moved1Sum, err := testWorkers.Rebalancer.Rebalance(ctx, spreadCfg)
+	flushQuota(t)
+	moved1Sum, err := testWorkers.Rebalancer.Rebalance(ctx, spreadCfg, nil)
 	moved1 := moved1Sum.Succeeded
 	if err != nil {
 		t.Fatalf("Cycle 1: %v", err)
@@ -1791,7 +1639,8 @@ func TestRebalanceSpreadStableAcrossCycles(t *testing.T) {
 	t.Logf("cycle 1: moved %d, minio-1=%d minio-2=%d", moved1, m1After1, m2After1)
 
 	// Cycle 2  -  should be a no-op, nothing bounces
-	moved2Sum, err := testWorkers.Rebalancer.Rebalance(ctx, spreadCfg)
+	flushQuota(t)
+	moved2Sum, err := testWorkers.Rebalancer.Rebalance(ctx, spreadCfg, nil)
 	moved2 := moved2Sum.Succeeded
 	if err != nil {
 		t.Fatalf("Cycle 2: %v", err)
@@ -1807,6 +1656,8 @@ func TestRebalanceSpreadStableAcrossCycles(t *testing.T) {
 		t.Errorf("state changed between cycles: before=(%d,%d) after=(%d,%d)",
 			m1After1, m2After1, m1After2, m2After2)
 	}
+
+	ws.assertIntact(ctx, "after two spread cycles")
 }
 
 // TestRebalanceSpreadBatchLimited verifies the rebalance spread batch limited contract.
@@ -1818,17 +1669,8 @@ func TestRebalanceSpreadBatchLimited(t *testing.T) {
 
 	// 5 x 100-byte objects on minio-1. With batch_size=2, it takes
 	// multiple cycles. No object should move twice.
-	for i := range 5 {
-		_, err := client.PutObject(ctx, &s3.PutObjectInput{
-			Bucket:        aws.String(virtualBucket),
-			Key:           aws.String(fmt.Sprintf("batch/obj-%d-%d", i, time.Now().UnixNano())),
-			Body:          bytes.NewReader(bytes.Repeat([]byte("B"), 100)),
-			ContentLength: aws.Int64(100),
-		})
-		if err != nil {
-			t.Fatalf("PutObject %d: %v", i, err)
-		}
-	}
+	ws := newWriteSet(t, client)
+	ws.seed(ctx, "batch/obj", 5, 100)
 
 	// State: minio-1=500/1024 (48.8%), minio-2=0/2048 (0%)
 	// Target = 500/3072 = 16.3%. minio-1 target = 167, excess = 333.
@@ -1841,7 +1683,8 @@ func TestRebalanceSpreadBatchLimited(t *testing.T) {
 	}
 
 	// Cycle 1: moves 2
-	moved1Sum, err := testWorkers.Rebalancer.Rebalance(ctx, smallBatchCfg)
+	flushQuota(t)
+	moved1Sum, err := testWorkers.Rebalancer.Rebalance(ctx, smallBatchCfg, nil)
 	moved1 := moved1Sum.Succeeded
 	if err != nil {
 		t.Fatalf("Cycle 1: %v", err)
@@ -1855,7 +1698,8 @@ func TestRebalanceSpreadBatchLimited(t *testing.T) {
 	}
 
 	// Cycle 2: moves remaining needed
-	moved2Sum, err := testWorkers.Rebalancer.Rebalance(ctx, smallBatchCfg)
+	flushQuota(t)
+	moved2Sum, err := testWorkers.Rebalancer.Rebalance(ctx, smallBatchCfg, nil)
 	moved2 := moved2Sum.Succeeded
 	if err != nil {
 		t.Fatalf("Cycle 2: %v", err)
@@ -1870,7 +1714,8 @@ func TestRebalanceSpreadBatchLimited(t *testing.T) {
 	}
 
 	// Cycle 3: should stabilize
-	moved3Sum, err := testWorkers.Rebalancer.Rebalance(ctx, smallBatchCfg)
+	flushQuota(t)
+	moved3Sum, err := testWorkers.Rebalancer.Rebalance(ctx, smallBatchCfg, nil)
 	moved3 := moved3Sum.Succeeded
 	if err != nil {
 		t.Fatalf("Cycle 3: %v", err)
@@ -1886,6 +1731,8 @@ func TestRebalanceSpreadBatchLimited(t *testing.T) {
 	if totalMoved > 5 {
 		t.Errorf("total moved = %d, want <= 5 (objects should not bounce)", totalMoved)
 	}
+
+	ws.assertIntact(ctx, "after batch-limited spread")
 }
 
 // TestRebalanceThresholdSkip verifies the rebalance threshold skip contract.
@@ -1895,41 +1742,16 @@ func TestRebalanceThresholdSkip(t *testing.T) {
 	ctx := context.Background()
 	resetState(t)
 
+	ws := newWriteSet(t, client)
+
 	// PUT a small object on each backend to create roughly balanced usage
-	key1 := uniqueKey(t, "threshold")
-	_, err := client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket:        aws.String(virtualBucket),
-		Key:           aws.String(key1),
-		Body:          bytes.NewReader(bytes.Repeat([]byte("T"), 100)),
-		ContentLength: aws.Int64(100),
-	})
-	if err != nil {
-		t.Fatalf("PutObject 1: %v", err)
-	}
+	ws.put(ctx, uniqueKey(t, "threshold"), bytes.Repeat([]byte("T"), 100))
 
 	// Fill minio-1 so it overflows to minio-2
-	fillKey := uniqueKey(t, "threshold-fill")
-	_, err = client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket:        aws.String(virtualBucket),
-		Key:           aws.String(fillKey),
-		Body:          bytes.NewReader(bytes.Repeat([]byte("F"), 1000)),
-		ContentLength: aws.Int64(1000),
-	})
-	if err != nil {
-		t.Fatalf("PutObject fill: %v", err)
-	}
+	ws.put(ctx, uniqueKey(t, "threshold-fill"), bytes.Repeat([]byte("F"), 1000))
 
 	// Put another small object that lands on minio-2
-	key2 := uniqueKey(t, "threshold2")
-	_, err = client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket:        aws.String(virtualBucket),
-		Key:           aws.String(key2),
-		Body:          bytes.NewReader(bytes.Repeat([]byte("U"), 200)),
-		ContentLength: aws.Int64(200),
-	})
-	if err != nil {
-		t.Fatalf("PutObject 2: %v", err)
-	}
+	ws.put(ctx, uniqueKey(t, "threshold2"), bytes.Repeat([]byte("U"), 200))
 
 	// With a high threshold, rebalance should skip
 	skipCfg := config.RebalanceConfig{
@@ -1939,7 +1761,8 @@ func TestRebalanceThresholdSkip(t *testing.T) {
 		Threshold: 0.99, // extremely high threshold
 	}
 
-	movedSum, err := testWorkers.Rebalancer.Rebalance(ctx, skipCfg)
+	flushQuota(t)
+	movedSum, err := testWorkers.Rebalancer.Rebalance(ctx, skipCfg, nil)
 	moved := movedSum.Succeeded
 	if err != nil {
 		t.Fatalf("Rebalance: %v", err)
@@ -1947,6 +1770,8 @@ func TestRebalanceThresholdSkip(t *testing.T) {
 	if moved != 0 {
 		t.Errorf("expected 0 moves with high threshold, got %d", moved)
 	}
+
+	ws.assertIntact(ctx, "after threshold-skipped rebalance")
 }
 
 // -------------------------------------------------------------------------
@@ -1984,12 +1809,12 @@ func TestReplicationBasic(t *testing.T) {
 		WorkerInterval: time.Minute,
 		BatchSize:      50,
 	}
-	created, err := testWorkers.Replicator.Replicate(ctx, replCfg, nil)
+	replSum, err := testWorkers.Replicator.Replicate(ctx, replCfg, nil)
 	if err != nil {
 		t.Fatalf("Replicate: %v", err)
 	}
-	if created != 1 {
-		t.Errorf("created = %d, want 1", created)
+	if replSum.CopiesCreated != 1 {
+		t.Errorf("created = %d, want 1", replSum.CopiesCreated)
 	}
 
 	// Should have 2 copies on different backends
@@ -2070,12 +1895,12 @@ func TestReplicationOverwrite(t *testing.T) {
 	}
 
 	// Replicate again
-	created, err := testWorkers.Replicator.Replicate(ctx, replCfg, nil)
+	replSum, err := testWorkers.Replicator.Replicate(ctx, replCfg, nil)
 	if err != nil {
 		t.Fatalf("Replicate v2: %v", err)
 	}
-	if created != 1 {
-		t.Errorf("created = %d, want 1", created)
+	if replSum.CopiesCreated != 1 {
+		t.Errorf("created = %d, want 1", replSum.CopiesCreated)
 	}
 
 	// Verify new content on GET
@@ -2240,21 +2065,21 @@ func TestReplicationAlreadyReplicated(t *testing.T) {
 	}
 
 	// First replication
-	created1, err := testWorkers.Replicator.Replicate(ctx, replCfg, nil)
+	firstSum, err := testWorkers.Replicator.Replicate(ctx, replCfg, nil)
 	if err != nil {
 		t.Fatalf("Replicate 1: %v", err)
 	}
-	if created1 != 1 {
-		t.Errorf("first replicate created = %d, want 1", created1)
+	if firstSum.CopiesCreated != 1 {
+		t.Errorf("first replicate created = %d, want 1", firstSum.CopiesCreated)
 	}
 
 	// Second replication  -  should be a no-op
-	created2, err := testWorkers.Replicator.Replicate(ctx, replCfg, nil)
+	secondSum, err := testWorkers.Replicator.Replicate(ctx, replCfg, nil)
 	if err != nil {
 		t.Fatalf("Replicate 2: %v", err)
 	}
-	if created2 != 0 {
-		t.Errorf("second replicate created = %d, want 0", created2)
+	if secondSum.CopiesCreated != 0 {
+		t.Errorf("second replicate created = %d, want 0", secondSum.CopiesCreated)
 	}
 }
 
@@ -2293,12 +2118,12 @@ func TestReplicationNoSpace(t *testing.T) {
 		WorkerInterval: time.Minute,
 		BatchSize:      50,
 	}
-	created, err := testWorkers.Replicator.Replicate(ctx, replCfg, nil)
+	replSum, err := testWorkers.Replicator.Replicate(ctx, replCfg, nil)
 	if err != nil {
 		t.Fatalf("Replicate: %v", err)
 	}
-	if created != 0 {
-		t.Errorf("created = %d, want 0 (no space for replicas)", created)
+	if replSum.CopiesCreated != 0 {
+		t.Errorf("created = %d, want 0 (no space for replicas)", replSum.CopiesCreated)
 	}
 }
 
@@ -2310,23 +2135,16 @@ func TestRebalancerWithReplicas(t *testing.T) {
 	resetState(t)
 
 	// Put an object and replicate it to 2 copies
+	ws := newWriteSet(t, client)
 	key := uniqueKey(t, "rebal-repl")
-	_, err := client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket:        aws.String(virtualBucket),
-		Key:           aws.String(key),
-		Body:          bytes.NewReader(bytes.Repeat([]byte("X"), 100)),
-		ContentLength: aws.Int64(100),
-	})
-	if err != nil {
-		t.Fatalf("PutObject: %v", err)
-	}
+	ws.put(ctx, key, bytes.Repeat([]byte("X"), 100))
 
 	replCfg := config.ReplicationConfig{
 		Factor:         2,
 		WorkerInterval: time.Minute,
 		BatchSize:      50,
 	}
-	_, err = testWorkers.Replicator.Replicate(ctx, replCfg, nil)
+	_, err := testWorkers.Replicator.Replicate(ctx, replCfg, nil)
 	if err != nil {
 		t.Fatalf("Replicate: %v", err)
 	}
@@ -2343,7 +2161,8 @@ func TestRebalancerWithReplicas(t *testing.T) {
 		BatchSize: 10,
 		Threshold: 0,
 	}
-	_, err = testWorkers.Rebalancer.Rebalance(ctx, rebalCfg)
+	flushQuota(t)
+	_, err = testWorkers.Rebalancer.Rebalance(ctx, rebalCfg, nil)
 	if err != nil {
 		t.Fatalf("Rebalance: %v", err)
 	}
@@ -2361,16 +2180,7 @@ func TestRebalancerWithReplicas(t *testing.T) {
 		seen[b] = true
 	}
 
-	// Object still accessible
-	resp, err := client.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: aws.String(virtualBucket),
-		Key:    aws.String(key),
-	})
-	if err != nil {
-		t.Fatalf("GetObject after rebalance: %v", err)
-	}
-	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
+	ws.assertIntact(ctx, "after rebalance with replicas")
 }
 
 // -------------------------------------------------------------------------
@@ -2384,7 +2194,7 @@ func TestOverReplicationBasic(t *testing.T) {
 	ctx := context.Background()
 	resetState(t)
 
-	_, workers := newThreeBackendManager(t)
+	_, workers := newThreeBackendStack(t)
 
 	key := uniqueKey(t, "overrepl-basic")
 	body := bytes.Repeat([]byte("O"), 100)
@@ -2415,7 +2225,7 @@ func TestOverReplicationBasic(t *testing.T) {
 	}
 
 	// Over-replication cleanup with factor=3 should be a no-op
-	removed, err := workers.OverReplicationCleaner.Clean(ctx, config.ReplicationConfig{
+	cleanSum, err := workers.OverReplicationCleaner.Clean(ctx, config.ReplicationConfig{
 		Factor:      3,
 		BatchSize:   50,
 		Concurrency: 1,
@@ -2423,12 +2233,12 @@ func TestOverReplicationBasic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Clean (at factor): %v", err)
 	}
-	if removed != 0 {
-		t.Errorf("expected 0 removed when at factor, got %d", removed)
+	if cleanSum.CopiesRemoved != 0 {
+		t.Errorf("expected 0 removed when at factor, got %d", cleanSum.CopiesRemoved)
 	}
 
 	// Now lower the factor to 2 -> object is over-replicated
-	removed, err = workers.OverReplicationCleaner.Clean(ctx, config.ReplicationConfig{
+	cleanSum, err = workers.OverReplicationCleaner.Clean(ctx, config.ReplicationConfig{
 		Factor:      2,
 		BatchSize:   50,
 		Concurrency: 1,
@@ -2436,8 +2246,8 @@ func TestOverReplicationBasic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Clean (over factor): %v", err)
 	}
-	if removed != 1 {
-		t.Errorf("expected 1 removed, got %d", removed)
+	if cleanSum.CopiesRemoved != 1 {
+		t.Errorf("expected 1 removed, got %d", cleanSum.CopiesRemoved)
 	}
 
 	// Should have exactly 2 copies remaining
@@ -2467,7 +2277,7 @@ func TestOverReplicationMultipleObjects(t *testing.T) {
 	ctx := context.Background()
 	resetState(t)
 
-	_, workers := newThreeBackendManager(t)
+	_, workers := newThreeBackendStack(t)
 
 	keys := make([]string, 3)
 	for i := range keys {
@@ -2500,7 +2310,7 @@ func TestOverReplicationMultipleObjects(t *testing.T) {
 	}
 
 	// Clean with factor=2 -> each object loses 1 copy
-	removed, err := workers.OverReplicationCleaner.Clean(ctx, config.ReplicationConfig{
+	cleanSum, err := workers.OverReplicationCleaner.Clean(ctx, config.ReplicationConfig{
 		Factor:      2,
 		BatchSize:   50,
 		Concurrency: 2,
@@ -2508,8 +2318,8 @@ func TestOverReplicationMultipleObjects(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Clean: %v", err)
 	}
-	if removed != 3 {
-		t.Errorf("expected 3 removed, got %d", removed)
+	if cleanSum.CopiesRemoved != 3 {
+		t.Errorf("expected 3 removed, got %d", cleanSum.CopiesRemoved)
 	}
 
 	for i, key := range keys {
@@ -2526,7 +2336,7 @@ func TestOverReplicationDrainingBackendRemovedFirst(t *testing.T) {
 	ctx := context.Background()
 	resetState(t)
 
-	mgr, workers := newThreeBackendManager(t)
+	st, workers := newThreeBackendStack(t)
 
 	key := uniqueKey(t, "overrepl-drain")
 	body := bytes.Repeat([]byte("D"), 100)
@@ -2561,11 +2371,11 @@ func TestOverReplicationDrainingBackendRemovedFirst(t *testing.T) {
 	// without launching the real drain goroutine -- that would race the
 	// explicit Clean below and remove the copy itself.
 	drainTarget := backends[0]
-	mgr.Drain().SeedActiveForTest(drainTarget)
-	defer mgr.Drain().ClearState()
+	st.Drain.SeedActiveForTest(drainTarget)
+	defer st.Drain.ClearState()
 
 	// Clean with factor=2 -> should remove 1 copy, preferring the draining backend (score 0)
-	removed, err := workers.OverReplicationCleaner.Clean(ctx, config.ReplicationConfig{
+	cleanSum, err := workers.OverReplicationCleaner.Clean(ctx, config.ReplicationConfig{
 		Factor:      2,
 		BatchSize:   50,
 		Concurrency: 1,
@@ -2573,8 +2383,8 @@ func TestOverReplicationDrainingBackendRemovedFirst(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Clean: %v", err)
 	}
-	if removed != 1 {
-		t.Errorf("expected 1 removed, got %d", removed)
+	if cleanSum.CopiesRemoved != 1 {
+		t.Errorf("expected 1 removed, got %d", cleanSum.CopiesRemoved)
 	}
 
 	// The draining backend's copy should have been removed
@@ -2588,19 +2398,9 @@ func TestOverReplicationDrainingBackendRemovedFirst(t *testing.T) {
 		}
 	}
 
-	// Data integrity check
-	resp, err := client.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: aws.String(virtualBucket),
-		Key:    aws.String(key),
-	})
-	if err != nil {
-		t.Fatalf("GetObject after drain cleanup: %v", err)
-	}
-	defer resp.Body.Close()
-	got, _ := io.ReadAll(resp.Body)
-	if !bytes.Equal(got, body) {
-		t.Errorf("body mismatch after drain cleanup")
-	}
+	// A GET fails over, so checking the proxy alone would not notice a bad
+	// survivor. Read every remaining copy.
+	assertObjectIntact(t, ctx, client, key, body, "after drain cleanup")
 }
 
 // TestOverReplicationQuotaFreed verifies the over replication quota freed contract.
@@ -2610,7 +2410,7 @@ func TestOverReplicationQuotaFreed(t *testing.T) {
 	ctx := context.Background()
 	resetState(t)
 
-	_, workers := newThreeBackendManager(t)
+	_, workers := newThreeBackendStack(t)
 
 	key := uniqueKey(t, "overrepl-quota")
 	size := int64(100)
@@ -2648,7 +2448,7 @@ func TestOverReplicationQuotaFreed(t *testing.T) {
 	}
 
 	// Clean with factor=2 -> remove 1 excess copy
-	removed, err := workers.OverReplicationCleaner.Clean(ctx, config.ReplicationConfig{
+	cleanSum, err := workers.OverReplicationCleaner.Clean(ctx, config.ReplicationConfig{
 		Factor:      2,
 		BatchSize:   50,
 		Concurrency: 1,
@@ -2656,8 +2456,8 @@ func TestOverReplicationQuotaFreed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Clean: %v", err)
 	}
-	if removed != 1 {
-		t.Errorf("expected 1 removed, got %d", removed)
+	if cleanSum.CopiesRemoved != 1 {
+		t.Errorf("expected 1 removed, got %d", cleanSum.CopiesRemoved)
 	}
 
 	// Find which backend lost its copy
@@ -2693,7 +2493,7 @@ func TestOverReplicationCountPending(t *testing.T) {
 	ctx := context.Background()
 	resetState(t)
 
-	_, workers := newThreeBackendManager(t)
+	_, workers := newThreeBackendStack(t)
 
 	key := uniqueKey(t, "overrepl-count")
 
@@ -2840,12 +2640,12 @@ func assertProxy404ForAll(t *testing.T, ctx context.Context, proxyClient *s3.Cli
 func importAllToMinio1(t *testing.T, ctx context.Context, keys []string, sizeBytes int64) {
 	t.Helper()
 	for _, key := range keys {
-		imported, err := testStore.ImportObject(ctx, internalKey(key), "minio-1", sizeBytes)
+		outcome, err := testStore.ImportObject(ctx, &core.ImportObjectRequest{Key: internalKey(key), Backend: "minio-1", Size: sizeBytes})
 		if err != nil {
 			t.Fatalf("ImportObject(%q): %v", key, err)
 		}
-		if !imported {
-			t.Errorf("ImportObject(%q) = false, want true", key)
+		if outcome != core.ImportInserted {
+			t.Errorf("ImportObject(%q) = %s, want inserted", key, outcome)
 		}
 	}
 }
@@ -2892,20 +2692,20 @@ func TestImportPreExistingObjects_ImportIdempotent(t *testing.T) {
 
 	store := testStore
 
-	imported, err := store.ImportObject(ctx, internalKey(key), "minio-1", 200)
+	imported, err := store.ImportObject(ctx, &core.ImportObjectRequest{Key: internalKey(key), Backend: "minio-1", Size: 200})
 	if err != nil {
 		t.Fatalf("ImportObject first: %v", err)
 	}
-	if !imported {
-		t.Error("first ImportObject = false, want true")
+	if imported != core.ImportInserted {
+		t.Errorf("first ImportObject = %s, want inserted", imported)
 	}
 
-	imported, err = store.ImportObject(ctx, internalKey(key), "minio-1", 200)
+	imported, err = store.ImportObject(ctx, &core.ImportObjectRequest{Key: internalKey(key), Backend: "minio-1", Size: 200})
 	if err != nil {
 		t.Fatalf("ImportObject second: %v", err)
 	}
-	if imported {
-		t.Error("second ImportObject = true, want false (idempotent skip)")
+	if imported != core.ImportSkippedExisting {
+		t.Errorf("second ImportObject = %s, want skipped_existing (idempotent skip)", imported)
 	}
 
 	if used := queryQuotaUsed(t, "minio-1"); used != 200 {
@@ -2941,12 +2741,12 @@ func TestImportPreExistingObjects_ImportDoesNotOverwriteProxyObject(t *testing.T
 	backend := queryObjectBackend(t, key)
 
 	store := testStore
-	imported, err := store.ImportObject(ctx, internalKey(key), backend, 150)
+	imported, err := store.ImportObject(ctx, &core.ImportObjectRequest{Key: internalKey(key), Backend: backend, Size: 150})
 	if err != nil {
 		t.Fatalf("ImportObject: %v", err)
 	}
-	if imported {
-		t.Error("ImportObject should skip existing proxy object")
+	if imported != core.ImportSkippedExisting {
+		t.Errorf("ImportObject = %s, want it to skip an existing proxy object", imported)
 	}
 
 	if used := queryQuotaUsed(t, backend); used != 150 {
@@ -3092,14 +2892,14 @@ func TestStore_RecordObject_OverwriteUpdatesQuota(t *testing.T) {
 
 	key := uniqueKey(t, "store-overwrite")
 
-	if _, err := testStore.RecordObject(ctx, internalKey(key), "minio-1", 100, nil); err != nil {
+	if _, _, err := testStore.RecordObject(ctx, &core.RecordObjectRequest{Key: internalKey(key), Copies: []core.ObjectCopy{{Backend: "minio-1"}}, Size: 100}); err != nil {
 		t.Fatalf("RecordObject A: %v", err)
 	}
 	if used := queryQuotaUsed(t, "minio-1"); used != 100 {
 		t.Fatalf("minio-1 after first record = %d, want 100", used)
 	}
 
-	if _, err := testStore.RecordObject(ctx, internalKey(key), "minio-2", 200, nil); err != nil {
+	if _, _, err := testStore.RecordObject(ctx, &core.RecordObjectRequest{Key: internalKey(key), Copies: []core.ObjectCopy{{Backend: "minio-2"}}, Size: 200}); err != nil {
 		t.Fatalf("RecordObject B: %v", err)
 	}
 
@@ -3128,7 +2928,7 @@ func TestStore_DeleteObject_NotFound(t *testing.T) {
 
 	resetState(t)
 
-	_, err := testStore.DeleteObject(ctx, "nonexistent-key-"+fmt.Sprintf("%d", time.Now().UnixNano()))
+	_, _, err := testStore.DeleteObject(ctx, "nonexistent-key-"+fmt.Sprintf("%d", time.Now().UnixNano()))
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -3152,7 +2952,7 @@ func TestStore_MoveObjectLocation_RaceSafe(t *testing.T) {
 
 	key := uniqueKey(t, "store-move")
 
-	if _, err := testStore.RecordObject(ctx, key, "minio-1", 100, nil); err != nil {
+	if _, _, err := testStore.RecordObject(ctx, &core.RecordObjectRequest{Key: key, Copies: []core.ObjectCopy{{Backend: "minio-1"}}, Size: 100}); err != nil {
 		t.Fatalf("RecordObject: %v", err)
 	}
 
@@ -3202,7 +3002,7 @@ func TestStore_ListObjects_PaginationAndEscaping(t *testing.T) {
 		prefix + "has_underscore",
 	}
 	for _, key := range wildcardKeys {
-		if _, err := testStore.RecordObject(ctx, key, "minio-1", 10, nil); err != nil {
+		if _, _, err := testStore.RecordObject(ctx, &core.RecordObjectRequest{Key: key, Copies: []core.ObjectCopy{{Backend: "minio-1"}}, Size: 10}); err != nil {
 			t.Fatalf("RecordObject(%q): %v", key, err)
 		}
 	}
@@ -3247,88 +3047,75 @@ func TestStore_ListObjects_PaginationAndEscaping(t *testing.T) {
 	}
 }
 
-// TestStore_GetBackendWithSpace_RespectsOrder is one of the sub-cases extracted from the
-// original mega-TestStore; behaviour is preserved.
-func TestStore_GetBackendWithSpace_RespectsOrder(t *testing.T) {
+// TestStore_MutationChargesTheCounterInItsOwnTransaction pins what makes the
+// counter unable to drift: a mutation moves it in the transaction that writes
+// the ledger row, so the byte total is correct against Postgres with no flush,
+// no in-memory state, and no reconcile in between.
+func TestStore_MutationChargesTheCounterInItsOwnTransaction(t *testing.T) {
 	ctx := context.Background()
-	_ = ctx
 
 	resetState(t)
 
-	name, err := testStore.GetBackendWithSpace(ctx, 10, []string{"minio-1", "minio-2"})
-	if err != nil {
-		t.Fatalf("GetBackendWithSpace: %v", err)
-	}
-	if name != "minio-1" {
-		t.Errorf("got %q, want %q (first in order)", name, "minio-1")
-	}
-
-	name, err = testStore.GetBackendWithSpace(ctx, 10, []string{"minio-2", "minio-1"})
-	if err != nil {
-		t.Fatalf("GetBackendWithSpace reversed: %v", err)
-	}
-	if name != "minio-2" {
-		t.Errorf("got %q, want %q (first in reversed order)", name, "minio-2")
-	}
-
-	if _, err := testStore.RecordObject(ctx, uniqueKey(t, "fill"), "minio-1", 1024, nil); err != nil {
-		t.Fatalf("RecordObject fill: %v", err)
-	}
-	name, err = testStore.GetBackendWithSpace(ctx, 1, []string{"minio-1", "minio-2"})
-	if err != nil {
-		t.Fatalf("GetBackendWithSpace after fill: %v", err)
-	}
-	if name != "minio-2" {
-		t.Errorf("got %q, want %q (minio-1 full)", name, "minio-2")
-	}
-}
-
-// TestStore_GetLeastUtilizedBackend_PicksLeastFull is one of the sub-cases extracted from the
-// original mega-TestStore; behaviour is preserved.
-func TestStore_GetLeastUtilizedBackend_PicksLeastFull(t *testing.T) {
-	ctx := context.Background()
-	_ = ctx
-
-	resetState(t)
-
-	name, err := testStore.GetLeastUtilizedBackend(ctx, 10, []string{"minio-1", "minio-2"})
-	if err != nil {
-		t.Fatalf("GetLeastUtilizedBackend empty: %v", err)
-	}
-	if name != "minio-1" && name != "minio-2" {
-		t.Errorf("unexpected backend %q", name)
-	}
-
-	if _, err := testStore.RecordObject(ctx, uniqueKey(t, "fill"), "minio-1", 500, nil); err != nil {
-		t.Fatalf("RecordObject fill: %v", err)
-	}
-	name, err = testStore.GetLeastUtilizedBackend(ctx, 10, []string{"minio-1", "minio-2"})
-	if err != nil {
-		t.Fatalf("GetLeastUtilizedBackend after fill: %v", err)
-	}
-	if name != "minio-2" {
-		t.Errorf("got %q, want %q (minio-2 is least utilized)", name, "minio-2")
-	}
-}
-
-// TestStore_GetLeastUtilizedBackend_RespectsMinSize is one of the sub-cases extracted from the
-// original mega-TestStore; behaviour is preserved.
-func TestStore_GetLeastUtilizedBackend_RespectsMinSize(t *testing.T) {
-	ctx := context.Background()
-	_ = ctx
-
-	resetState(t)
-
-	if _, err := testStore.RecordObject(ctx, uniqueKey(t, "full"), "minio-1", 1024, nil); err != nil {
+	key := internalKey(uniqueKey(t, "tx-charge"))
+	if _, _, err := testStore.RecordObject(ctx,
+		&core.RecordObjectRequest{Key: key, Copies: []core.ObjectCopy{{Backend: "minio-1"}}, Size: 700}); err != nil {
 		t.Fatalf("RecordObject: %v", err)
 	}
 
-	name, err := testStore.GetLeastUtilizedBackend(ctx, 1, []string{"minio-1", "minio-2"})
+	stats, err := testStore.GetQuotaStats(ctx)
 	if err != nil {
-		t.Fatalf("GetLeastUtilizedBackend: %v", err)
+		t.Fatalf("GetQuotaStats: %v", err)
 	}
-	if name != "minio-2" {
-		t.Errorf("got %q, want %q (minio-1 full)", name, "minio-2")
+	if stats["minio-1"].BytesUsed != 700 {
+		t.Fatalf("minio-1 bytes_used = %d, want 700 charged by the record's own tx", stats["minio-1"].BytesUsed)
+	}
+
+	// The credit lands on the same stripe the charge did, so the two cancel
+	// exactly rather than leaving one row high and another low.
+	if _, _, err := testStore.DeleteObject(ctx, key); err != nil {
+		t.Fatalf("DeleteObject: %v", err)
+	}
+	stats, err = testStore.GetQuotaStats(ctx)
+	if err != nil {
+		t.Fatalf("GetQuotaStats after delete: %v", err)
+	}
+	if stats["minio-1"].BytesUsed != 0 {
+		t.Errorf("minio-1 bytes_used = %d, want 0 after the delete credited it back", stats["minio-1"].BytesUsed)
+	}
+}
+
+// TestStore_ListBackendQuotaUsage_ReportsOccupancy drives the read half: the
+// baseline the tracker is primed from carries the ceiling, the counter, and the
+// bytes on the backend the counter does not cover.
+func TestStore_ListBackendQuotaUsage_ReportsOccupancy(t *testing.T) {
+	ctx := context.Background()
+
+	resetState(t)
+
+	if _, _, err := testStore.RecordObject(ctx, &core.RecordObjectRequest{
+		Key: internalKey(uniqueKey(t, "baseline")), Copies: []core.ObjectCopy{{Backend: "minio-1"}}, Size: 700,
+	}); err != nil {
+		t.Fatalf("RecordObject: %v", err)
+	}
+
+	usage, err := testStore.ListBackendQuotaUsage(ctx)
+	if err != nil {
+		t.Fatalf("ListBackendQuotaUsage: %v", err)
+	}
+	var got core.BackendQuotaUsage
+	for _, u := range usage {
+		if u.BackendName == "minio-1" {
+			got = u
+		}
+	}
+	if got.BackendName == "" {
+		t.Fatal("minio-1 absent from the usage listing")
+	}
+	if got.BytesUsed != 700 {
+		t.Errorf("BytesUsed = %d, want 700", got.BytesUsed)
+	}
+	if got.Occupied() < got.BytesUsed {
+		t.Errorf("Occupied() = %d, want at least BytesUsed %d", got.Occupied(), got.BytesUsed)
 	}
 }
 
@@ -3342,7 +3129,7 @@ func TestStore_RecordReplica_StaleSourceSkipped(t *testing.T) {
 
 	key := uniqueKey(t, "store-replica")
 
-	if _, err := testStore.RecordObject(ctx, key, "minio-1", 100, nil); err != nil {
+	if _, _, err := testStore.RecordObject(ctx, &core.RecordObjectRequest{Key: key, Copies: []core.ObjectCopy{{Backend: "minio-1"}}, Size: 100}); err != nil {
 		t.Fatalf("RecordObject: %v", err)
 	}
 
@@ -3357,11 +3144,11 @@ func TestStore_RecordReplica_StaleSourceSkipped(t *testing.T) {
 		t.Errorf("minio-2 after replica = %d, want 100", used)
 	}
 
-	if _, err := testStore.DeleteObject(ctx, key); err != nil {
+	if _, _, err := testStore.DeleteObject(ctx, key); err != nil {
 		t.Fatalf("DeleteObject: %v", err)
 	}
 
-	if _, err := testStore.RecordObject(ctx, key, "minio-2", 50, nil); err != nil {
+	if _, _, err := testStore.RecordObject(ctx, &core.RecordObjectRequest{Key: key, Copies: []core.ObjectCopy{{Backend: "minio-2"}}, Size: 50}); err != nil {
 		t.Fatalf("RecordObject fresh: %v", err)
 	}
 
@@ -3383,7 +3170,7 @@ func TestStore_RecordPart_InvalidPartNumber(t *testing.T) {
 	resetState(t)
 
 	for _, pn := range []int{0, -1, 10001, 1 << 20} {
-		err := testStore.RecordPart(ctx, "upload-invalid", pn, "\"etag\"", 100, nil)
+		err := testStore.RecordPart(ctx, &core.RecordPartParams{UploadID: "upload-invalid", PartNumber: pn, ETag: "\"etag\"", SizeBytes: 100})
 		if err == nil {
 			t.Errorf("RecordPart(%d) should fail, got nil", pn)
 		}
@@ -3449,11 +3236,11 @@ func runSyncPipeline(ctx context.Context, backend *s3be.S3Backend, prefix string
 	var imported, skipped int
 	err := backend.ListObjects(ctx, prefix, func(objects []s3be.ListedObject) error {
 		for _, obj := range objects {
-			ok, err := testStore.ImportObject(ctx, obj.Key, "minio-1", obj.SizeBytes)
+			outcome, err := testStore.ImportObject(ctx, &core.ImportObjectRequest{Key: obj.Key, Backend: "minio-1", Size: obj.SizeBytes})
 			if err != nil {
 				return fmt.Errorf("ImportObject(%s): %w", obj.Key, err)
 			}
-			if ok {
+			if outcome == core.ImportInserted {
 				imported++
 			} else {
 				skipped++
@@ -3510,10 +3297,11 @@ func TestAuthSigV4_ValidCredentials(t *testing.T) {
 		authSecret = "TESTSECRET0123456789abcdefghijklm"
 	)
 	authSrv := &s3api.Server{
-		Manager: testManager,
+		Objects:   testStack.Objects,
+		Multipart: testStack.Multipart,
 	}
 	_ = authSrv
-	authSrv.SetBucketAuth(auth.NewBucketRegistry([]config.BucketConfig{
+	authSrv.SetBucketAuth(mustBucketRegistry(t, []config.BucketConfig{
 		{
 			Name: virtualBucket,
 			Credentials: []config.CredentialConfig{
@@ -3587,10 +3375,11 @@ func TestAuthSigV4_WrongCredentials403(t *testing.T) {
 		authSecret = "TESTSECRET0123456789abcdefghijklm"
 	)
 	authSrv := &s3api.Server{
-		Manager: testManager,
+		Objects:   testStack.Objects,
+		Multipart: testStack.Multipart,
 	}
 	_ = authSrv
-	authSrv.SetBucketAuth(auth.NewBucketRegistry([]config.BucketConfig{
+	authSrv.SetBucketAuth(mustBucketRegistry(t, []config.BucketConfig{
 		{
 			Name: virtualBucket,
 			Credentials: []config.CredentialConfig{
@@ -3646,10 +3435,11 @@ func TestAuthSigV4_UnsignedRequest403(t *testing.T) {
 		authSecret = "TESTSECRET0123456789abcdefghijklm"
 	)
 	authSrv := &s3api.Server{
-		Manager: testManager,
+		Objects:   testStack.Objects,
+		Multipart: testStack.Multipart,
 	}
 	_ = authSrv
-	authSrv.SetBucketAuth(auth.NewBucketRegistry([]config.BucketConfig{
+	authSrv.SetBucketAuth(mustBucketRegistry(t, []config.BucketConfig{
 		{
 			Name: virtualBucket,
 			Credentials: []config.CredentialConfig{
@@ -3708,10 +3498,11 @@ func TestAuthSigV4_SpecialCharKeysSigV4(t *testing.T) {
 		authSecret = "TESTSECRET0123456789abcdefghijklm"
 	)
 	authSrv := &s3api.Server{
-		Manager: testManager,
+		Objects:   testStack.Objects,
+		Multipart: testStack.Multipart,
 	}
 	_ = authSrv
-	authSrv.SetBucketAuth(auth.NewBucketRegistry([]config.BucketConfig{
+	authSrv.SetBucketAuth(mustBucketRegistry(t, []config.BucketConfig{
 		{
 			Name: virtualBucket,
 			Credentials: []config.CredentialConfig{
@@ -3792,10 +3583,11 @@ func TestAuthSigV4_AccessDeniedDoesNotLeakBucketName(t *testing.T) {
 		authSecret = "TESTSECRET0123456789abcdefghijklm"
 	)
 	authSrv := &s3api.Server{
-		Manager: testManager,
+		Objects:   testStack.Objects,
+		Multipart: testStack.Multipart,
 	}
 	_ = authSrv
-	authSrv.SetBucketAuth(auth.NewBucketRegistry([]config.BucketConfig{
+	authSrv.SetBucketAuth(mustBucketRegistry(t, []config.BucketConfig{
 		{
 			Name: virtualBucket,
 			Credentials: []config.CredentialConfig{
@@ -4368,39 +4160,19 @@ func TestDrainBackend(t *testing.T) {
 	client := newS3Client(t)
 	ctx := context.Background()
 
-	keys := seedDrainObjects(t, ctx, client, 5, 50, "D")
+	ws := newWriteSet(t, client)
+	keys := ws.seed(ctx, "drain", 5, 50)
 	assertObjectsOnBackend(t, keys, "minio-1")
+	ws.assertIntact(ctx, "before drain")
 
-	if err := testManager.Drain().StartDrain(ctx, "minio-1"); err != nil {
+	if err := testStack.Drain.StartDrain(ctx, "minio-1"); err != nil {
 		t.Fatalf("StartDrain: %v", err)
 	}
 	waitDrainComplete(t, ctx, "minio-1", 30*time.Second)
 
 	assertObjectsOnBackend(t, keys, "minio-2")
-	assertProxyServesSize(t, ctx, client, keys, 50, "after drain")
+	ws.assertIntact(ctx, "after drain")
 	assertNoLocationsOnBackend(t, "minio-1")
-}
-
-// seedDrainObjects writes count uniformly-sized objects through the
-// proxy with pack routing, returning their user keys for downstream
-// assertions.
-func seedDrainObjects(t *testing.T, ctx context.Context, client *s3.Client, count, sizeBytes int, fillByte string) []string {
-	t.Helper()
-	keys := make([]string, count)
-	body := bytes.Repeat([]byte(fillByte), sizeBytes)
-	for i := range keys {
-		keys[i] = uniqueKey(t, "drain")
-		_, err := client.PutObject(ctx, &s3.PutObjectInput{
-			Bucket:        aws.String(virtualBucket),
-			Key:           aws.String(keys[i]),
-			Body:          bytes.NewReader(body),
-			ContentLength: aws.Int64(int64(sizeBytes)),
-		})
-		if err != nil {
-			t.Fatalf("PutObject[%d]: %v", i, err)
-		}
-	}
-	return keys
 }
 
 // assertObjectsOnBackend asserts every key resolves to wantBackend in
@@ -4426,7 +4198,7 @@ func waitDrainComplete(t *testing.T, ctx context.Context, backend string, timeou
 			t.Fatalf("drain of %s did not complete within %s", backend, timeout)
 		default:
 		}
-		progress, err := testManager.Drain().GetDrainProgress(ctx, backend)
+		progress, err := testStack.Drain.GetDrainProgress(ctx, backend)
 		if err != nil {
 			t.Fatalf("GetDrainProgress: %v", err)
 		}
@@ -4437,27 +4209,6 @@ func waitDrainComplete(t *testing.T, ctx context.Context, backend string, timeou
 			return
 		}
 		time.Sleep(200 * time.Millisecond)
-	}
-}
-
-// assertProxyServesSize fetches each key through the proxy and asserts
-// the body has the expected length, reporting which phase failed.
-func assertProxyServesSize(t *testing.T, ctx context.Context, client *s3.Client, keys []string, wantSize int, phase string) {
-	t.Helper()
-	for _, key := range keys {
-		resp, err := client.GetObject(ctx, &s3.GetObjectInput{
-			Bucket: aws.String(virtualBucket),
-			Key:    aws.String(key),
-		})
-		if err != nil {
-			t.Errorf("GetObject(%s) %s: %v", key, phase, err)
-			continue
-		}
-		data, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if len(data) != wantSize {
-			t.Errorf("GetObject(%s) %s body = %d bytes, want %d", key, phase, len(data), wantSize)
-		}
 	}
 }
 
@@ -4494,7 +4245,7 @@ func TestDrainBackend_WriteExclusion(t *testing.T) {
 	}
 
 	// Start drain of minio-1.
-	if err := testManager.Drain().StartDrain(ctx, "minio-1"); err != nil {
+	if err := testStack.Drain.StartDrain(ctx, "minio-1"); err != nil {
 		t.Fatalf("StartDrain: %v", err)
 	}
 
@@ -4522,7 +4273,7 @@ func TestDrainBackend_WriteExclusion(t *testing.T) {
 			t.Fatal("drain did not complete within 30s")
 		default:
 		}
-		progress, err := testManager.Drain().GetDrainProgress(ctx, "minio-1")
+		progress, err := testStack.Drain.GetDrainProgress(ctx, "minio-1")
 		if err != nil {
 			t.Fatalf("GetDrainProgress: %v", err)
 		}
@@ -4543,7 +4294,7 @@ func TestRemoveBackend(t *testing.T) {
 	// remove without affecting minio-1 (which other tests depend on).
 	for i := range 3 {
 		key := fmt.Sprintf("%s/remove-test-%d-%d", virtualBucket, i, time.Now().UnixNano())
-		if _, err := testStore.RecordObject(ctx, key, "minio-2", 100, nil); err != nil {
+		if _, _, err := testStore.RecordObject(ctx, &core.RecordObjectRequest{Key: key, Copies: []core.ObjectCopy{{Backend: "minio-2"}}, Size: 100}); err != nil {
 			t.Fatalf("RecordObject: %v", err)
 		}
 	}
@@ -4558,7 +4309,7 @@ func TestRemoveBackend(t *testing.T) {
 	}
 
 	// Remove without purge (just DB records).
-	if err := testManager.Drain().RemoveBackend(ctx, "minio-2", false, nil); err != nil {
+	if err := testStack.Drain.RemoveBackend(ctx, "minio-2", false, nil); err != nil {
 		t.Fatalf("RemoveBackend: %v", err)
 	}
 

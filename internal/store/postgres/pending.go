@@ -28,14 +28,19 @@ import (
 // PENDING OBJECT OPERATIONS
 // -------------------------------------------------------------------------
 
-// InsertPending records an in-flight PUT intent. Called before the backend
-// upload so a metadata commit failure cannot silently destroy the prior
-// copy of an overwritten key.
-func (s *Store) InsertPending(ctx context.Context, p *core.PendingObject) error {
-	if err := s.queries.InsertPendingObject(ctx, pendingInsertParams(p)); err != nil {
-		return fmt.Errorf("insert pending object: %w", err)
+// InsertPendingIfFits claims the bytes and records the intent in one statement,
+// so admission and the durable record of it cannot disagree. Reports false when
+// the backend had no room, which is the caller's cue to try the next candidate.
+//
+// Called before the backend upload, so a metadata commit failure cannot
+// silently destroy the prior copy of an overwritten key, and so the bytes are
+// occupying the backend for every instance for as long as the write runs.
+func (s *Store) InsertPendingIfFits(ctx context.Context, p *core.PendingObject) (bool, error) {
+	n, err := s.queries.InsertPendingObjectIfFits(ctx, pendingInsertParams(p))
+	if err != nil {
+		return false, fmt.Errorf("insert pending object: %w", err)
 	}
-	return nil
+	return n > 0, nil
 }
 
 // DeletePending removes a pending intent. Called by the write path on a
@@ -82,13 +87,6 @@ func (s *Store) DeletePendingByBackend(ctx context.Context, backendName string) 
 	return nil
 }
 
-// PromotePending resolves a pending intent transactionally. Delegates to
-// core.PromotePending which composes the lock, supersession check,
-// commit, and same-tx pending delete against the per-engine TxAdapter.
-func (s *Store) PromotePending(ctx context.Context, p *core.PendingObject) (core.PendingPromoteResult, []core.DeletedCopy, error) {
-	return core.PromotePending(ctx, s, p)
-}
-
 // -------------------------------------------------------------------------
 // HELPERS
 // -------------------------------------------------------------------------
@@ -96,33 +94,61 @@ func (s *Store) PromotePending(ctx context.Context, p *core.PendingObject) (core
 // pendingInsertParams maps a PendingObject onto the sqlc insert struct.
 // Pointer-typed columns stay nil when their string/int64 source is empty
 // so the database stores SQL NULL rather than the zero value.
-func pendingInsertParams(p *core.PendingObject) db.InsertPendingObjectParams {
-	return db.InsertPendingObjectParams{
-		IntentID:      p.IntentID,
-		ObjectKey:     p.ObjectKey,
-		BackendName:   p.BackendName,
-		SizeBytes:     p.SizeBytes,
-		Encrypted:     p.Encrypted,
-		EncryptionKey: p.EncryptionKey,
-		KeyID:         strPtr(p.KeyID),
-		PlaintextSize: int64Ptr(p.PlaintextSize),
-		ContentHash:   strPtr(p.ContentHash),
+func pendingInsertParams(p *core.PendingObject) db.InsertPendingObjectIfFitsParams {
+	var (
+		etag        *string
+		contentType *string
+		userMeta    []byte
+	)
+	if id := p.Identity; id != nil {
+		etag = strPtr(id.ETag)
+		contentType = strPtr(id.ContentType)
+		userMeta, _ = core.EncodeUserMetadata(id.UserMetadata)
+	}
+	return db.InsertPendingObjectIfFitsParams{
+		Etag:                     etag,
+		ContentType:              contentType,
+		UserMetadata:             userMeta,
+		IntentID:                 p.IntentID,
+		ObjectKey:                p.ObjectKey,
+		BackendName:              p.BackendName,
+		SizeBytes:                p.SizeBytes,
+		Encrypted:                p.Encrypted,
+		EncryptionKey:            p.EncryptionKey,
+		KeyID:                    strPtr(p.KeyID),
+		PlaintextSize:            int64Ptr(p.PlaintextSize),
+		ContentHash:              strPtr(p.ContentHash),
+		CompressionAlgorithm:     strPtr(p.CompressionAlgorithm),
+		CompressionLevel:         strPtr(p.CompressionLevel),
+		CompressionFormatVersion: int16Ptr(p.CompressionFormatVersion),
+		LogicalSize:              int64Ptr(p.LogicalSize),
+		Role:                     string(p.RoleOrDefault()),
 	}
 }
 
 // pendingFromRow maps a sqlc PendingObject row onto the package type,
 // dereferencing nullable columns to their zero value when SQL NULL.
 func pendingFromRow(row *db.PendingObject) core.PendingObject {
+	// A decode failure leaves the intent identity-less: the promotion then
+	// records an object a later read re-learns, which is the same state every
+	// pre-identity row is in.
+	id, _ := core.IdentityFromColumns(derefStr(row.Etag), derefStr(row.ContentType), row.UserMetadata)
 	return core.PendingObject{
-		IntentID:      row.IntentID,
-		ObjectKey:     row.ObjectKey,
-		BackendName:   row.BackendName,
-		SizeBytes:     row.SizeBytes,
-		Encrypted:     row.Encrypted,
-		EncryptionKey: row.EncryptionKey,
-		CreatedAt:     row.CreatedAt.Time,
-		KeyID:         derefStr(row.KeyID),
-		PlaintextSize: derefInt64(row.PlaintextSize),
-		ContentHash:   derefStr(row.ContentHash),
+		Identity:                 id,
+		IntentID:                 row.IntentID,
+		ObjectKey:                row.ObjectKey,
+		BackendName:              row.BackendName,
+		SizeBytes:                row.SizeBytes,
+		Encrypted:                row.Encrypted,
+		EncryptionKey:            row.EncryptionKey,
+		CreatedAt:                row.CreatedAt.Time,
+		KeyID:                    derefStr(row.KeyID),
+		PlaintextSize:            derefInt64(row.PlaintextSize),
+		ContentHash:              derefStr(row.ContentHash),
+		CompressionAlgorithm:     derefStr(row.CompressionAlgorithm),
+		CompressionLevel:         derefStr(row.CompressionLevel),
+		CompressionFormatVersion: int(derefInt16(row.CompressionFormatVersion)),
+		LogicalSize:              derefInt64(row.LogicalSize),
+		Role:                     core.PendingRole(row.Role),
 	}
 }

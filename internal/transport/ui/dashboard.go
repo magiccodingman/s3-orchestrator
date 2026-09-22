@@ -28,6 +28,10 @@ import (
 	"github.com/afreidah/s3-orchestrator/internal/transport/httputil"
 )
 
+// -------------------------------------------------------------------------
+// TYPES
+// -------------------------------------------------------------------------
+
 // dashboardPage holds all data passed to the dashboard template.
 type dashboardPage struct {
 	Version          string
@@ -72,6 +76,7 @@ type configSummary struct {
 	RebalanceStrategy         string
 	RateLimitEnabled          bool
 	EncryptionEnabled         bool
+	CompressionEnabled        bool
 	IntegrityEnabled          bool
 	IntegrityVerifyOnRead     bool
 	IntegrityScrubberInterval time.Duration
@@ -85,11 +90,15 @@ type integrityStats struct {
 	ErrorsTotal float64
 }
 
+// -------------------------------------------------------------------------
+// INTERNALS
+// -------------------------------------------------------------------------
+
 // handleDashboard renders the HTML dashboard page.
 func (h *Handler) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	setSecurityHeaders(w)
 
-	data, err := h.backendOps.GetDashboardData(r.Context())
+	data, err := h.dashboardOps.GetData(r.Context())
 	if err != nil {
 		h.log.ErrorContext(r.Context(), "failed to get dashboard data", "error", err)
 		http.Error(w, "Failed to load dashboard data", http.StatusInternalServerError)
@@ -147,6 +156,7 @@ func (h *Handler) handleDashboard(w http.ResponseWriter, r *http.Request) {
 			RebalanceStrategy:         cfg.Rebalance.Strategy,
 			RateLimitEnabled:          cfg.RateLimit.Enabled,
 			EncryptionEnabled:         cfg.Encryption.Enabled,
+			CompressionEnabled:        cfg.Compression.Enabled,
 			IntegrityEnabled:          cfg.Integrity.Enabled,
 			IntegrityVerifyOnRead:     cfg.Integrity.VerifyOnRead,
 			IntegrityScrubberInterval: cfg.Integrity.ScrubberInterval,
@@ -171,7 +181,7 @@ func (h *Handler) handleDashboard(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleAPIDashboard(w http.ResponseWriter, r *http.Request) {
 	setSecurityHeaders(w)
 
-	data, err := h.backendOps.GetDashboardData(r.Context())
+	data, err := h.dashboardOps.GetData(r.Context())
 	if err != nil {
 		h.log.ErrorContext(r.Context(), "failed to get dashboard data", "error", err)
 		httputil.WriteJSONError(w, http.StatusInternalServerError, "failed to load data")

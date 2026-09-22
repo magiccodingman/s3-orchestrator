@@ -32,12 +32,20 @@ import (
 	"github.com/afreidah/s3-orchestrator/internal/worker"
 )
 
+// -------------------------------------------------------------------------
+// CONSTRUCTOR
+// -------------------------------------------------------------------------
+
 // newAuxReplicator builds an additional Replicator that shares the
 // same testManager / testStore as the bundled testWorkers.Replicator
 // but participates as a separate worker instance.
 func newAuxReplicator() *worker.Replicator {
-	return worker.NewReplicator(testManager.Runtime(), testManager, testStore)
+	return worker.NewReplicator(worker.ReplicatorDeps{Ops: testStack.Runtime, Placement: testCoord, Store: testStore})
 }
+
+// -------------------------------------------------------------------------
+// PUBLIC API
+// -------------------------------------------------------------------------
 
 // TestInt_Replicator_ConcurrentInstancesNoDoubleCopy enqueues several
 // under-replicated objects, then races two Replicator instances on
@@ -67,6 +75,10 @@ func TestInt_Replicator_ConcurrentInstancesNoDoubleCopy(t *testing.T) {
 	}
 	assertEachAtFactor(t, keys, targetFactor)
 }
+
+// -------------------------------------------------------------------------
+// INTERNALS
+// -------------------------------------------------------------------------
 
 // seedUnderReplicatedObjects PUTs N objects via the S3 client and
 // returns their keys. Each ends up with a single copy so they're
@@ -103,12 +115,12 @@ func raceReplicators(t *testing.T, ctx context.Context, cfg config.ReplicationCo
 	var wg sync.WaitGroup
 	for _, r := range rs {
 		wg.Go(func() {
-			created, err := r.Replicate(ctx, cfg, nil)
+			sum, err := r.Replicate(ctx, cfg, nil)
 			if err != nil {
 				t.Errorf("Replicate: %v", err)
 				return
 			}
-			total.Add(int64(created))
+			total.Add(int64(sum.CopiesCreated))
 		})
 	}
 	wg.Wait()

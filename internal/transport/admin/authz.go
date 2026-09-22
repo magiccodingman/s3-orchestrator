@@ -1,0 +1,274 @@
+// -------------------------------------------------------------------------------
+// Admin API - Authentication and Authorization
+//
+// Author: Alex Freidah
+//
+// Resolves the identity behind an admin request and refuses the ones its grants
+// do not reach. The data-plane endpoints under /admin/api/objects reach the same
+// object service the S3 transport does, so they are authorized against the same
+// permission set rather than against the bearer token alone.
+//
+// Every route passes through one chokepoint here. The control-plane endpoints
+// declare a permission over a backend or over the instance, so a credential
+// granted one provider's maintenance cannot start a pass over the fleet.
+// -------------------------------------------------------------------------------
+
+package admin
+
+import (
+	"cmp"
+	"log/slog"
+	"net/http"
+	"slices"
+	"strings"
+
+	"github.com/afreidah/s3-orchestrator/internal/observe/audit"
+	"github.com/afreidah/s3-orchestrator/internal/store/core"
+	"github.com/afreidah/s3-orchestrator/internal/transport/auth"
+	"github.com/afreidah/s3-orchestrator/internal/transport/httputil"
+)
+
+// -------------------------------------------------------------------------
+// CONSTANTS
+// -------------------------------------------------------------------------
+
+// The refusal messages. A caller is told it was refused and nothing about what
+// would have been allowed, so the response cannot be used to map the grants an
+// identity holds.
+const (
+	msgUnauthorized = "unauthorized"
+	msgForbidden    = "forbidden"
+)
+
+// -------------------------------------------------------------------------
+// TYPES
+// -------------------------------------------------------------------------
+
+// principal is who an admin request authenticated as.
+//
+// Every caller is a user holding grants, the root credential included: what
+// makes root privileged is the grants it holds, not a branch here.
+type principal struct {
+	User *auth.User
+}
+
+// id names this principal in a log line.
+func (p principal) id() string {
+	if p.User == nil {
+		return "unknown"
+	}
+	return p.User.ID
+}
+
+// -------------------------------------------------------------------------
+// AUTHENTICATION
+// -------------------------------------------------------------------------
+
+// authenticate resolves the credential a request carries. Reports whether one
+// proved an identity at all.
+//
+// A SigV4-signed request is verified the way the S3 API verifies one, against
+// the same registry, so one keypair reaches both surfaces. This is the path an
+// operator should be on.
+//
+// The shared admin token is still accepted and resolves onto the root user
+// rather than onto a privileged flag, which is what lets the authorization path
+// stay single. A token minted through the provisioning API is looked up last.
+func (h *Handler) authenticate(r *http.Request) (principal, bool) {
+	// Without a registry nothing can be resolved to an identity, so nothing is
+	// authenticated. The credential model is the only way in now, which means a
+	// handler assembled without one authorizes no request rather than falling
+	// back to the token.
+	if h.registry == nil {
+		return principal{}, false
+	}
+	registry := h.registry()
+	if registry == nil {
+		return principal{}, false
+	}
+	user, _, err := registry.Authenticate(r)
+	if err != nil {
+		return principal{}, false
+	}
+	return principal{User: user}, true
+}
+
+// -------------------------------------------------------------------------
+// AUTHORIZATION
+// -------------------------------------------------------------------------
+
+// guard wraps one route with the authentication and authorization its table
+// entry declares, and is the only path a request reaches a handler by.
+func (h *Handler) guard(rt *route) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		who, ok := h.authenticate(r)
+		if !ok {
+			h.log.WarnContext(r.Context(), "unauthorized request",
+				"path", r.URL.Path, "client_addr", r.RemoteAddr)
+			httputil.WriteJSONError(w, http.StatusUnauthorized, msgUnauthorized)
+			return
+		}
+		if !h.authorize(w, r, rt, who) {
+			return
+		}
+		rt.Handler(w, r)
+	}
+}
+
+// authorize refuses a request whose grants do not carry what its route needs.
+// Reports whether it may proceed; the refusal is already written when it may not.
+//
+// Fails closed. A route declaring no permission is refused outright, and a
+// bucket route whose resource does not resolve to one bucket is refused rather
+// than allowed through unchecked, because a key this layer cannot read is one it
+// cannot authorize.
+func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, rt *route, who principal) bool {
+	// Nothing reaches a route that declared no permission. The table is tested
+	// for one, so this is unreachable by a served route and stays as the
+	// fallback that keeps the default closed.
+	if rt.Perm == 0 {
+		h.refuse(r, w, rt, who, "", "route declares no permission")
+		return false
+	}
+	if rt.kind() != core.ResourceBucket {
+		return h.authorizeAdmin(w, r, rt, who)
+	}
+
+	bucket, ok := bucketFromKey(h.resourceValue(r, rt))
+	if !ok {
+		// The value names no single bucket: the empty prefix is the whole
+		// namespace and a partial name spans every bucket it prefixes. Only a
+		// caller holding the bucket wildcard can be authorized for that, since
+		// no per-bucket grant answers for buckets it does not name.
+		if who.User.AllBuckets().Has(rt.Perm) {
+			return true
+		}
+		h.refuse(r, w, rt, who, "", "resource names no bucket")
+		return false
+	}
+	if !who.User.CanReach(bucket) {
+		h.refuse(r, w, rt, who, bucket, "no grant on the bucket")
+		return false
+	}
+	if !who.User.Can(bucket, rt.Perm) {
+		h.refuse(r, w, rt, who, bucket, "grant does not carry the permission")
+		return false
+	}
+	return true
+}
+
+// authorizeAdmin refuses a control-plane request the caller's grants do not
+// carry.
+//
+// A backend route naming no backend runs against the whole fleet, so it is
+// authorized as the wildcard: an operator granted one provider cannot start a
+// pass that spends egress on every other one. Naming a backend asks about that
+// backend, which a grant on it or the wildcard both answer.
+func (h *Handler) authorizeAdmin(w http.ResponseWriter, r *http.Request, rt *route, who principal) bool {
+	resource := core.Resource{Kind: rt.kind()}
+	if resource.Kind == core.ResourceBackend {
+		resource.Name = cmp.Or(h.resourceValue(r, rt), core.ResourceWildcard)
+	}
+	if !who.User.CanAdmin(resource, rt.Perm) {
+		h.refuseAdmin(r, w, rt, who, resource)
+		return false
+	}
+	return true
+}
+
+// -------------------------------------------------------------------------
+// INTERNALS
+// -------------------------------------------------------------------------
+
+// resourceValue reads the parameter naming the object key. A path value is
+// empty for a parameter the pattern does not declare, so one lookup covers both
+// the routes carrying the key in the path and those carrying it in the query.
+func (h *Handler) resourceValue(r *http.Request, rt *route) string {
+	return cmp.Or(r.PathValue(rt.Resource), r.URL.Query().Get(rt.Resource))
+}
+
+// backendParam reads the optional backend a pass is restricted to, and reports
+// whether the request may proceed. An empty value runs against every backend.
+//
+// An unknown name is refused rather than run: a filter matching nothing is
+// indistinguishable from a fleet with no work left, so a typo would report a
+// clean pass over a backend that was never read.
+func (h *Handler) backendParam(w http.ResponseWriter, r *http.Request) (string, bool) {
+	name := r.URL.Query().Get(paramBackend)
+	if name == "" {
+		return "", true
+	}
+	if !slices.Contains(h.backendNames(), name) {
+		httputil.WriteJSONError(w, http.StatusBadRequest, "unknown backend: "+name)
+		return "", false
+	}
+	return name, true
+}
+
+// bucketFromKey reads the bucket an admin object key names. The admin API
+// carries bucket and key as one string and a bucket name holds no slash, so the
+// first segment is the bucket.
+//
+// A value with no slash names no single bucket: the empty prefix is the whole
+// namespace, and a partial name spans every bucket it prefixes. Neither can be
+// authorized against one grant, so both report false and are refused.
+func bucketFromKey(key string) (string, bool) {
+	bucket, _, found := strings.Cut(key, "/")
+	if !found || bucket == "" {
+		return "", false
+	}
+	return bucket, true
+}
+
+// refuse writes the 403 and records what was asked for against what was held,
+// so an operator reading the audit stream can fix the grant without a second
+// lookup. Named to match the s3.ActionDenied entry the data path emits, so one
+// query finds a refusal whichever surface it happened on.
+func (h *Handler) refuse(r *http.Request, w http.ResponseWriter, rt *route, who principal, bucket, reason string) {
+	held, _ := who.User.Permissions(bucket)
+	h.log.WarnContext(r.Context(), "admin request not permitted by grant",
+		"method", r.Method,
+		"path", r.URL.Path,
+		"client_addr", r.RemoteAddr,
+		"user", who.id(),
+		"bucket", bucket,
+		"reason", reason,
+	)
+	audit.Log(r.Context(), "admin.ActionDenied",
+		slog.String("method", r.Method),
+		slog.String("path", r.URL.Path),
+		slog.String("client_addr", r.RemoteAddr),
+		slog.String("bucket", bucket),
+		slog.String("operation", rt.Summary),
+		slog.String("required", rt.Perm.String()),
+		slog.String("held", held.String()),
+		slog.String("reason", reason),
+		slog.Int("status", http.StatusForbidden),
+	)
+	httputil.WriteJSONError(w, http.StatusForbidden, msgForbidden)
+}
+
+// refuseAdmin writes the 403 a credential gets when its control-plane grants do
+// not carry the operation. Recorded separately from a denied object operation
+// so one query finds every control-plane refusal without the object traffic.
+func (h *Handler) refuseAdmin(r *http.Request, w http.ResponseWriter, rt *route, who principal, resource core.Resource) {
+	held := who.User.AdminPermissions(resource)
+	h.log.WarnContext(r.Context(), "control-plane request not permitted by grant",
+		"method", r.Method,
+		"path", r.URL.Path,
+		"client_addr", r.RemoteAddr,
+		"user", who.id(),
+		"resource", resource.String(),
+	)
+	audit.Log(r.Context(), "admin.ControlPlaneDenied",
+		slog.String("method", r.Method),
+		slog.String("path", r.URL.Path),
+		slog.String("client_addr", r.RemoteAddr),
+		slog.String("resource", resource.String()),
+		slog.String("operation", rt.Summary),
+		slog.String("required", rt.Perm.String()),
+		slog.String("held", held.String()),
+		slog.Int("status", http.StatusForbidden),
+	)
+	httputil.WriteJSONError(w, http.StatusForbidden, msgForbidden)
+}

@@ -15,6 +15,8 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -28,15 +30,18 @@ import (
 	"github.com/afreidah/s3-orchestrator/internal/notify"
 	"github.com/afreidah/s3-orchestrator/internal/observe/audit"
 	"github.com/afreidah/s3-orchestrator/internal/observe/telemetry"
-	"github.com/afreidah/s3-orchestrator/internal/proxy"
+	"github.com/afreidah/s3-orchestrator/internal/provisioning"
 	"github.com/afreidah/s3-orchestrator/internal/proxy/drain"
-	"github.com/afreidah/s3-orchestrator/internal/worker"
+	"github.com/afreidah/s3-orchestrator/internal/proxy/metrics"
+	"github.com/afreidah/s3-orchestrator/internal/proxy/usage"
 	"github.com/afreidah/s3-orchestrator/internal/store/core"
 	"github.com/afreidah/s3-orchestrator/internal/store/storetest"
 	"github.com/afreidah/s3-orchestrator/internal/transport/admin"
+	"github.com/afreidah/s3-orchestrator/internal/transport/cors"
 	"github.com/afreidah/s3-orchestrator/internal/transport/httputil"
 	"github.com/afreidah/s3-orchestrator/internal/transport/s3api"
 	"github.com/afreidah/s3-orchestrator/internal/transport/ui"
+	"github.com/afreidah/s3-orchestrator/internal/worker"
 )
 
 // -------------------------------------------------------------------------
@@ -53,18 +58,14 @@ func TestProviders_MissingConfigReturnsCleanError(t *testing.T) {
 		name string
 		call func(do.Injector) error
 	}{
-		{"LifecycleAdmin", func(i do.Injector) error { _, err := ProvideLifecycleAdmin(i); return err }},
-		{"EncryptionAdmin", func(i do.Injector) error { _, err := ProvideEncryptionAdmin(i); return err }},
-		{"NotificationOutbox", func(i do.Injector) error { _, err := ProvideNotificationOutbox(i); return err }},
 		{"DatabaseBreaker", func(i do.Injector) error { _, err := ProvideDatabaseBreaker(i); return err }},
-		{"MetadataStore", func(i do.Injector) error { _, err := ProvideMetadataStore(i); return err }},
-		{"MetricsDeps", func(i do.Injector) error { _, err := ProvideMetricsDeps(i); return err }},
+		{"MetadataStore", func(i do.Injector) error { _, err := provideMetadataStore(i); return err }},
 		{"Backends", func(i do.Injector) error { _, err := ProvideBackends(i); return err }},
 		{"Encryptor", func(i do.Injector) error { _, err := ProvideEncryptor(i); return err }},
 		{"EncryptionProvider", func(i do.Injector) error { _, err := ProvideEncryptionProvider(i); return err }},
 		{"RedisCounterBackend", func(i do.Injector) error { _, err := ProvideRedisCounterBackend(i); return err }},
 		{"ObjectCache", func(i do.Injector) error { _, err := ProvideObjectCache(i); return err }},
-		{"BackendManager", func(i do.Injector) error { _, err := ProvideBackendManager(i); return err }},
+		{"UsageService", func(i do.Injector) error { _, err := ProvideUsageService(i); return err }},
 		{"LifecycleManager", func(i do.Injector) error { _, err := ProvideLifecycleManager(i); return err }},
 		{"Rebalancer", func(i do.Injector) error { _, err := ProvideRebalancer(i); return err }},
 		{"Replicator", func(i do.Injector) error { _, err := ProvideReplicator(i); return err }},
@@ -125,6 +126,13 @@ func TestProvideBucketAuth(t *testing.T) {
 	do.ProvideValue(inj, &config.Config{
 		Buckets: []config.BucketConfig{{Name: "test"}},
 	})
+
+	// The registry is assembled from config merged with the store, so the
+	// provider reads the provisioning tables. An empty answer is the state a
+	// deployment that has provisioned nothing is in.
+	do.ProvideValue[core.ProvisioningStore](inj, emptyProvisioningStore(t))
+	do.ProvideValue(inj, provisioning.NewDeclared())
+
 	reg, err := ProvideBucketAuth(inj)
 	if err != nil {
 		t.Fatalf("ProvideBucketAuth: %v", err)
@@ -211,7 +219,7 @@ func TestProvideMetadataStore_SQLiteInMemory(t *testing.T) {
 		Backends: []config.BackendConfig{{Name: "b1", QuotaBytes: 1024}},
 	})
 	do.ProvideValue[*breaker.CircuitBreaker](inj, nil)
-	cs, err := ProvideMetadataStore(inj)
+	cs, err := provideMetadataStore(inj)
 	if err != nil {
 		t.Fatalf("ProvideMetadataStore: %v", err)
 	}
@@ -243,19 +251,27 @@ func TestOpenStore_PostgresInvalidConfig(t *testing.T) {
 	}
 }
 
-// TestProvideMetricsDeps_HappyPath verifies the metrics.Deps provider
-// resolves to the wide MetadataStore registered in the injector.
-func TestProvideMetricsDeps_HappyPath(t *testing.T) {
+// TestRegisterInfrastructure_StoreAliases verifies registerInfrastructure
+// exposes the wide metadata store under each narrow role interface, so a
+// deleted or mistyped do.MustAs is caught here rather than at boot. The real
+// store provider is overridden with a mock so no database is opened.
+func TestRegisterInfrastructure_StoreAliases(t *testing.T) {
 	t.Parallel()
 	inj := do.New()
-	do.ProvideValue[core.MetadataStore](inj, storetest.NewMockMetadataStore(gomock.NewController(t)))
+	registerInfrastructure(inj)
+	do.OverrideValue[metadataStore](inj, storetest.NewMockMetadataStore(gomock.NewController(t)))
 
-	deps, err := ProvideMetricsDeps(inj)
-	if err != nil {
-		t.Fatalf("ProvideMetricsDeps: %v", err)
+	if _, err := do.Invoke[core.LifecycleAdmin](inj); err != nil {
+		t.Errorf("LifecycleAdmin alias: %v", err)
 	}
-	if deps == nil {
-		t.Fatal("ProvideMetricsDeps returned nil")
+	if _, err := do.Invoke[core.EncryptionAdmin](inj); err != nil {
+		t.Errorf("EncryptionAdmin alias: %v", err)
+	}
+	if _, err := do.Invoke[core.NotificationOutbox](inj); err != nil {
+		t.Errorf("NotificationOutbox alias: %v", err)
+	}
+	if _, err := do.Invoke[metrics.Deps](inj); err != nil {
+		t.Errorf("metrics.Deps alias: %v", err)
 	}
 }
 
@@ -421,14 +437,15 @@ func TestNewInjector_DefaultsRegisterRequiredOnly(t *testing.T) {
 	joined := strings.Join(listServiceNames(inj), ",")
 
 	for _, want := range []string{
-		"internal/store/core.MetadataStore",
+		"internal/di.metadataStore",
 		"internal/store/core.LifecycleAdmin",
 		"internal/store/core.EncryptionAdmin",
 		"internal/store/core.NotificationOutbox",
 		"internal/breaker.CircuitBreaker",
-		"internal/proxy.BackendManager",
+		"internal/proxy/usage.Service",
 		"internal/transport/s3api.Server",
 		"internal/lifecycle.Manager",
+		"internal/transport/admin.Handler",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("required service %q not registered; got: %s", want, joined)
@@ -440,7 +457,6 @@ func TestNewInjector_DefaultsRegisterRequiredOnly(t *testing.T) {
 		"internal/counter.RedisCounterBackend",
 		"internal/transport/s3api.RateLimiter",
 		"internal/transport/ui.Handler",
-		"internal/transport/admin.Handler",
 		"internal/notify.Notifier",
 	} {
 		if strings.Contains(joined, unwanted) {
@@ -462,10 +478,10 @@ func listServiceNames(inj do.Injector) []string {
 // -------------------------------------------------------------------------
 // FULL-INJECTOR HAPPY PATH
 //
-// Drives the big composite providers (Backends, BackendManager, S3Server,
+// Drives the big composite providers (Backends, UsageService, S3Server,
 // LifecycleManager, UIHandler, AdminHandler, Notifier) end-to-end against
 // an in-memory SQLite store and a fake S3 backend endpoint. The storage
-// calls never fire during construction  -  NewS3Backend only parses config  - 
+// calls never fire during construction  -  NewS3Backend only parses config  -
 // so no live network is required.
 // -------------------------------------------------------------------------
 
@@ -513,11 +529,14 @@ func happyPathConfig(tmpDir string) *config.Config {
 			RequestsPerSec: 10,
 			Burst:          10,
 		},
+		Auth: config.AuthConfig{
+			Root: config.RootCredential{ //nolint:gosec // G101: test credential
+				AccessKeyID:     "AKIADITESTROOT",
+				SecretAccessKey: "di-test-root-secret",
+			},
+		},
 		UI: config.UIConfig{
 			Enabled:       true,
-			AdminKey:      "admin-key",
-			AdminSecret:   "admin-secret",
-			AdminToken:    "secret-token",
 			SessionSecret: "0123456789abcdef0123456789abcdef",
 		},
 	}
@@ -551,8 +570,8 @@ func TestNewInjector_HappyPathResolvesEverything(t *testing.T) {
 	if _, err := do.Invoke[*breaker.CircuitBreaker](inj); err != nil {
 		t.Errorf("CircuitBreaker: %v", err)
 	}
-	if _, err := do.Invoke[*proxy.BackendManager](inj); err != nil {
-		t.Errorf("BackendManager: %v", err)
+	if _, err := do.Invoke[*usage.Service](inj); err != nil {
+		t.Errorf("UsageService: %v", err)
 	}
 	if _, err := do.Invoke[*s3api.Server](inj); err != nil {
 		t.Errorf("S3Server: %v", err)
@@ -609,11 +628,10 @@ func TestNewInjector_WorkerModeResolvesLifecycle(t *testing.T) {
 	if _, err := do.Invoke[*drain.Manager](inj); err != nil {
 		t.Errorf("DrainManager: %v", err)
 	}
-	// PendingReaper is conditionally registered (#830). happyPathConfig
-	// leaves PendingPattern at the default (enabled), so the provider
-	// is registered and resolves cleanly.
+	// Always registered: every write claims its bytes with an intent, so a
+	// deployment without the reaper would strand rows holding headroom.
 	if !IsRegistered[*worker.PendingReaper](inj) {
-		t.Error("PendingReaper not registered with default config")
+		t.Error("PendingReaper not registered")
 	}
 	if _, err := do.Invoke[*worker.PendingReaper](inj); err != nil {
 		t.Errorf("PendingReaper: %v", err)
@@ -621,7 +639,7 @@ func TestNewInjector_WorkerModeResolvesLifecycle(t *testing.T) {
 }
 
 // TestNewInjector_RootsResolveInEveryMode builds the injector in each run
-// mode and resolves the always-registered roots. BackendManager and
+// mode and resolves the always-registered roots. usage.Service and
 // lifecycle.Manager are registered unconditionally and transitively pull
 // in the bulk of the graph, so a registered-but-unresolvable provider
 // surfaces here in CI rather than as a production startup panic after a
@@ -639,46 +657,13 @@ func TestNewInjector_RootsResolveInEveryMode(t *testing.T) {
 			inj := NewInjector(InjectorDeps{Config: cfg, Mode: mode, LogLevel: new(slog.LevelVar), LogBuffer: telemetry.NewLogBuffer()})
 			t.Cleanup(func() { _ = inj.Shutdown() })
 
-			if _, err := do.Invoke[*proxy.BackendManager](inj); err != nil {
-				t.Fatalf("BackendManager: %v", err)
+			if _, err := do.Invoke[*usage.Service](inj); err != nil {
+				t.Fatalf("UsageService: %v", err)
 			}
 			if _, err := do.Invoke[*lifecycle.Manager](inj); err != nil {
 				t.Fatalf("lifecycle.Manager: %v", err)
 			}
 		})
-	}
-}
-
-// TestNewInjector_PendingReaperDisabled covers the conditional
-// registration (#830): when the pending pattern is off in config,
-// no PendingReaper provider is registered and Optional reports
-// Disabled (not Failed), so callers can distinguish "feature off"
-// from "feature on but broken."
-func TestNewInjector_PendingReaperDisabled(t *testing.T) {
-	t.Parallel()
-	cfg := happyPathConfig(t.TempDir())
-	disabled := false
-	cfg.WritePath.PendingPattern.Enabled = &disabled
-	if err := cfg.SetDefaultsAndValidate(); err != nil {
-		t.Fatalf("config validation: %v", err)
-	}
-	inj := NewInjector(InjectorDeps{Config: cfg, Mode: "all", LogLevel: new(slog.LevelVar), LogBuffer: telemetry.NewLogBuffer()})
-	t.Cleanup(func() { _ = inj.Shutdown() })
-
-	if IsRegistered[*worker.PendingReaper](inj) {
-		t.Error("PendingReaper should NOT be registered when feature disabled")
-	}
-	res := Optional[*worker.PendingReaper](inj)
-	if !res.Disabled() {
-		t.Errorf("Optional[*worker.PendingReaper].Resolution = %s, want disabled", res.Resolution)
-	}
-	if res.Failed() {
-		t.Errorf("Optional reported Failed for a disabled feature: %v", res.Err)
-	}
-
-	// WireManager must still succeed with the feature off.
-	if err := WireManager(inj); err != nil {
-		t.Errorf("WireManager with PendingReaper disabled: %v", err)
 	}
 }
 
@@ -699,29 +684,6 @@ func TestNewInjector_NotifierResolvesWhenEndpointsConfigured(t *testing.T) {
 
 	if _, err := do.Invoke[*notify.Notifier](inj); err != nil {
 		t.Fatalf("Notifier: %v", err)
-	}
-}
-
-// TestInvokeOptional_ReturnsZeroWhenAbsent pins the contract that the
-// optional-provider helper swallows ErrServiceNotFound and returns the
-// zero value, so callers can use it for features that may not register.
-func TestInvokeOptional_ReturnsZeroWhenAbsent(t *testing.T) {
-	t.Parallel()
-	v := invokeOptional[*worker.Reconciler](do.New())
-	if v != nil {
-		t.Fatalf("expected nil for absent provider, got %v", v)
-	}
-}
-
-// TestInvokeOptional_ReturnsValueWhenRegistered covers the present-provider
-// branch: the helper returns the registered value unchanged.
-func TestInvokeOptional_ReturnsValueWhenRegistered(t *testing.T) {
-	t.Parallel()
-	inj := do.New()
-	rec := &worker.Reconciler{}
-	do.ProvideValue(inj, rec)
-	if got := invokeOptional[*worker.Reconciler](inj); got != rec {
-		t.Fatalf("expected registered value, got %v", got)
 	}
 }
 
@@ -770,17 +732,17 @@ func TestResolveAdminHandlerRequiredDeps_PartialDeps(t *testing.T) {
 	full := NewInjector(InjectorDeps{Config: cfg, Mode: "all", LogLevel: new(slog.LevelVar), LogBuffer: telemetry.NewLogBuffer()})
 	t.Cleanup(func() { _ = full.Shutdown() })
 
-	mgr, err := do.Invoke[*proxy.BackendManager](full)
+	usageSvc, err := do.Invoke[*usage.Service](full)
 	if err != nil {
-		t.Fatalf("BackendManager: %v", err)
+		t.Fatalf("UsageService: %v", err)
 	}
 	cb, err := do.Invoke[*breaker.CircuitBreaker](full)
 	if err != nil {
 		t.Fatalf("DatabaseBreaker: %v", err)
 	}
-	stores, err := do.Invoke[core.MetadataStore](full)
+	stores, err := do.Invoke[metadataStore](full)
 	if err != nil {
-		t.Fatalf("MetadataStore: %v", err)
+		t.Fatalf("metadataStore: %v", err)
 	}
 	repl, err := do.Invoke[*worker.Replicator](full)
 	if err != nil {
@@ -804,31 +766,31 @@ func TestResolveAdminHandlerRequiredDeps_PartialDeps(t *testing.T) {
 		{"only-cfg", func(i do.Injector) {
 			do.ProvideValue(i, cfg)
 		}},
-		{"+manager", func(i do.Injector) {
+		{"+usage", func(i do.Injector) {
 			do.ProvideValue(i, cfg)
-			do.ProvideValue(i, mgr)
+			do.ProvideValue(i, usageSvc)
 		}},
 		{"+cb", func(i do.Injector) {
 			do.ProvideValue(i, cfg)
-			do.ProvideValue(i, mgr)
+			do.ProvideValue(i, usageSvc)
 			do.ProvideValue(i, cb)
 		}},
 		{"+encAdmin", func(i do.Injector) {
 			do.ProvideValue(i, cfg)
-			do.ProvideValue(i, mgr)
+			do.ProvideValue(i, usageSvc)
 			do.ProvideValue(i, cb)
 			do.ProvideValue[core.EncryptionAdmin](i, stores)
 		}},
 		{"+logLevel", func(i do.Injector) {
 			do.ProvideValue(i, cfg)
-			do.ProvideValue(i, mgr)
+			do.ProvideValue(i, usageSvc)
 			do.ProvideValue(i, cb)
 			do.ProvideValue[core.EncryptionAdmin](i, stores)
 			do.ProvideValue(i, new(slog.LevelVar))
 		}},
 		{"+stores", func(i do.Injector) {
 			do.ProvideValue(i, cfg)
-			do.ProvideValue(i, mgr)
+			do.ProvideValue(i, usageSvc)
 			do.ProvideValue(i, cb)
 			do.ProvideValue[core.EncryptionAdmin](i, stores)
 			do.ProvideValue(i, new(slog.LevelVar))
@@ -836,7 +798,7 @@ func TestResolveAdminHandlerRequiredDeps_PartialDeps(t *testing.T) {
 		}},
 		{"+replicator", func(i do.Injector) {
 			do.ProvideValue(i, cfg)
-			do.ProvideValue(i, mgr)
+			do.ProvideValue(i, usageSvc)
 			do.ProvideValue(i, cb)
 			do.ProvideValue[core.EncryptionAdmin](i, stores)
 			do.ProvideValue(i, new(slog.LevelVar))
@@ -845,7 +807,7 @@ func TestResolveAdminHandlerRequiredDeps_PartialDeps(t *testing.T) {
 		}},
 		{"+overRep", func(i do.Injector) {
 			do.ProvideValue(i, cfg)
-			do.ProvideValue(i, mgr)
+			do.ProvideValue(i, usageSvc)
 			do.ProvideValue(i, cb)
 			do.ProvideValue[core.EncryptionAdmin](i, stores)
 			do.ProvideValue(i, new(slog.LevelVar))
@@ -855,7 +817,7 @@ func TestResolveAdminHandlerRequiredDeps_PartialDeps(t *testing.T) {
 		}},
 		{"+scrubber", func(i do.Injector) {
 			do.ProvideValue(i, cfg)
-			do.ProvideValue(i, mgr)
+			do.ProvideValue(i, usageSvc)
 			do.ProvideValue(i, cb)
 			do.ProvideValue[core.EncryptionAdmin](i, stores)
 			do.ProvideValue(i, new(slog.LevelVar))
@@ -885,7 +847,7 @@ func TestProvideReconciler_PartialDeps(t *testing.T) {
 	if _, err := ProvideReconciler(do.New()); err == nil {
 		t.Error("expected error with no deps")
 	}
-	// Add only config: BackendManager missing.
+	// Add only config: BackendRuntime missing.
 	step1 := do.New()
 	do.ProvideValue(step1, &config.Config{Buckets: []config.BucketConfig{{Name: "b1"}}})
 	if _, err := ProvideReconciler(step1); err == nil {
@@ -922,5 +884,97 @@ func TestProvideAdminHandler_ReconcilerFailedLogsAndContinues(t *testing.T) {
 	}
 	if h == nil {
 		t.Fatal("ProvideAdminHandler returned nil")
+	}
+}
+
+// TestProvideCodec_RejectsUnknownLevel covers the branch where a config that
+// passed validation still cannot build a codec, which is why the provider is
+// resolved strictly rather than treated as optional.
+func TestProvideCodec_RejectsUnknownLevel(t *testing.T) {
+	inj := do.New()
+	do.ProvideValue(inj, &config.Config{
+		Compression: config.CompressionConfig{Enabled: true, Level: "turbo", ChunkSize: 1 << 20},
+	})
+	if _, err := ProvideCodec(inj); err == nil {
+		t.Fatal("expected an error for an unknown compression level, got nil")
+	}
+}
+
+// TestProvideCodec_DefaultsWhenBlockOmitted checks that a config with no
+// compression block still yields a codec, since objects already stored
+// compressed have to stay readable whether or not the feature is on.
+func TestProvideCodec_DefaultsWhenBlockOmitted(t *testing.T) {
+	inj := do.New()
+	do.ProvideValue(inj, &config.Config{})
+	c, err := ProvideCodec(inj)
+	if err != nil {
+		t.Fatalf("ProvideCodec: %v", err)
+	}
+	defer c.Close()
+	if c.ChunkSize() != config.DefaultCompressionChunkSize {
+		t.Errorf("ChunkSize = %d, want the %d default", c.ChunkSize(), config.DefaultCompressionChunkSize)
+	}
+}
+
+// TestProvideCORS_CompilesStoredBucketRules pins the ordering ProvideCORS
+// depends on: assembling the credential registry is what publishes the declared
+// bucket set, so the policy has to be built after it. Compiling from an
+// unpublished set would accept a stored bucket's rules through the provisioning
+// API and silently drop them, leaving the browser refused until a restart.
+func TestProvideCORS_CompilesStoredBucketRules(t *testing.T) {
+	t.Parallel()
+	cfg := happyPathConfig(t.TempDir())
+	if err := cfg.SetDefaultsAndValidate(); err != nil {
+		t.Fatalf("config validation: %v", err)
+	}
+	inj := NewInjector(InjectorDeps{Config: cfg, Mode: "all", LogLevel: new(slog.LevelVar), LogBuffer: telemetry.NewLogBuffer()})
+	t.Cleanup(func() { _ = inj.Shutdown() })
+
+	store, err := do.Invoke[core.ProvisioningStore](inj)
+	if err != nil {
+		t.Fatalf("ProvisioningStore: %v", err)
+	}
+	err = store.CreateBucket(context.Background(), &core.Bucket{
+		Name: "browser-bucket",
+		CORS: []config.CORSRule{{
+			AllowedOrigins: []string{"https://app.example.com"},
+			AllowedMethods: []string{"GET"},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("CreateBucket: %v", err)
+	}
+
+	policy, err := do.Invoke[*cors.Policy](inj)
+	if err != nil {
+		t.Fatalf("ProvideCORS: %v", err)
+	}
+
+	r := httptest.NewRequestWithContext(context.Background(),
+		http.MethodOptions, "/browser-bucket/photo.jpg", nil)
+	r.Header.Set("Origin", "https://app.example.com")
+	r.Header.Set("Access-Control-Request-Method", "GET")
+
+	rec := httptest.NewRecorder()
+	policy.Middleware(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})).ServeHTTP(rec, r)
+
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "https://app.example.com" {
+		t.Errorf("Allow-Origin = %q, want the stored bucket's rules to be compiled in", got)
+	}
+}
+
+// TestProvideCORS_ResolvesFromTheFullGraph covers the provider through the
+// wiring the HTTP server reaches it by, which nothing else exercised.
+func TestProvideCORS_ResolvesFromTheFullGraph(t *testing.T) {
+	t.Parallel()
+	cfg := happyPathConfig(t.TempDir())
+	if err := cfg.SetDefaultsAndValidate(); err != nil {
+		t.Fatalf("config validation: %v", err)
+	}
+	inj := NewInjector(InjectorDeps{Config: cfg, Mode: "all", LogLevel: new(slog.LevelVar), LogBuffer: telemetry.NewLogBuffer()})
+	t.Cleanup(func() { _ = inj.Shutdown() })
+
+	if _, err := do.Invoke[*cors.Policy](inj); err != nil {
+		t.Fatalf("CORSPolicy: %v", err)
 	}
 }

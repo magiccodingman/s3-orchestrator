@@ -1,0 +1,173 @@
+// -------------------------------------------------------------------------------
+// Multipart Test Fleet
+//
+// Author: Alex Freidah
+//
+// Builds a multipart Manager over a live fleet - real backends holding real
+// bytes, a real write coordinator, and the usage and admission policy the
+// runtime enforces - which is what the upload lifecycle needs in order to be
+// asserted end to end.
+//
+// The manager is built from multipart.Deps directly. Nothing here needs a
+// composition root: Deps already names every collaborator the manager has, and
+// reaching through the composition root would only hide that.
+// -------------------------------------------------------------------------------
+
+package multipart
+
+import (
+	"cmp"
+	"testing"
+	"time"
+
+	"go.uber.org/mock/gomock"
+
+	"github.com/afreidah/s3-orchestrator/internal/backend"
+	objcache "github.com/afreidah/s3-orchestrator/internal/cache"
+	"github.com/afreidah/s3-orchestrator/internal/config"
+	"github.com/afreidah/s3-orchestrator/internal/counter"
+	"github.com/afreidah/s3-orchestrator/internal/encryption"
+	"github.com/afreidah/s3-orchestrator/internal/proxy/infra"
+	"github.com/afreidah/s3-orchestrator/internal/proxy/metrics"
+	"github.com/afreidah/s3-orchestrator/internal/proxy/writepath"
+	"github.com/afreidah/s3-orchestrator/internal/store/core"
+	"github.com/afreidah/s3-orchestrator/internal/store/storetest"
+	"github.com/afreidah/s3-orchestrator/internal/util/syncutil"
+)
+
+// -------------------------------------------------------------------------
+// CONSTANTS
+// -------------------------------------------------------------------------
+
+// fleetTimeout bounds a backend call in the test fleet, long enough that no
+// test trips it incidentally, and fleetDEKTTL keeps per-upload data keys alive
+// for a whole test.
+const (
+	fleetTimeout = 30 * time.Second
+	fleetDEKTTL  = time.Hour
+)
+
+// -------------------------------------------------------------------------
+// TYPES
+// -------------------------------------------------------------------------
+
+// fleetOpts tunes the test fleet beyond the defaults. The zero value gives
+// pack routing, an unlimited local usage counter, and no encryption.
+// The assembled object is encoded only when both Codec and Compression are
+// set, mirroring the production wiring. The 5 MiB non-final part floor is off
+// by default because most fixtures here upload 3-byte parts.
+type fleetOpts struct {
+	Order              []string                 // defaults to the backend map's keys
+	Encryptor          *encryption.Encryptor    // turns on at-rest encryption for the upload
+	Codec              Codec                    // with Compression below, encodes the assembled object
+	Compression        config.CompressionConfig //
+	ObjectCache        objcache.ObjectCache     // attaches a cache so completion-time invalidation runs
+	AdmissionSem       chan struct{}            // bounds concurrent backend writes, for admission tests
+	BackendTimeout     time.Duration            // overrides the per-call bound; defaults to fleetTimeout
+	EnforceMinPartSize bool                     // turns on the S3 5 MiB non-final part floor
+
+	QuotaBaselines map[string]core.BackendQuotaUsage // seeds the byte counter; unnamed backends are unlimited
+}
+
+// fleet is a multipart Manager plus the collaborators a test asserts against:
+// the runtime carries the usage counters, and the integrity config is the one
+// the manager reads at completion time.
+type fleet struct {
+	*Manager
+	Runtime   *infra.BackendRuntime
+	Integrity *syncutil.AtomicConfig[config.IntegrityConfig]
+}
+
+// SetIntegrityConfig swaps the integrity settings the manager reads when it
+// completes an upload.
+func (f *fleet) SetIntegrityConfig(cfg *config.IntegrityConfig) { f.Integrity.Store(cfg) }
+
+// -------------------------------------------------------------------------
+// CONSTRUCTOR
+// -------------------------------------------------------------------------
+
+// newFleet builds a multipart Manager over the supplied backends. store is the
+// wide metadata store; New narrows it to Stores.
+func newFleet(
+	t *testing.T, store storetest.MetadataStore, backends map[string]backend.ObjectBackend, opts *fleetOpts,
+) *fleet {
+	t.Helper()
+	if opts == nil {
+		opts = &fleetOpts{}
+	}
+
+	names := opts.Order
+	if names == nil {
+		for name := range backends {
+			names = append(names, name)
+		}
+	}
+	usage := counter.NewUsageTracker(counter.NewLocalCounterBackend(names), nil)
+	timeout := cmp.Or(opts.BackendTimeout, fleetTimeout)
+	rt := infra.New(&infra.Config{
+		Backends:        backends,
+		Order:           names,
+		BackendTimeout:  timeout,
+		Usage:           usage,
+		Quota:           newFleetQuota(names, opts.QuotaBaselines),
+		RoutingStrategy: config.RoutingPack,
+		AdmissionSem:    opts.AdmissionSem,
+	})
+	rt.SetMetricsCollector(metrics.New(metrics.CollectorDeps{
+		Store: store, Usage: usage, BackendNames: names,
+	}))
+
+	integrity := &syncutil.AtomicConfig[config.IntegrityConfig]{}
+	mp := New(&Deps{
+		Core:               rt,
+		Coord:              writepath.New(rt, store),
+		Stores:             store,
+		Encryptor:          opts.Encryptor,
+		Codec:              opts.Codec,
+		Compression:        opts.Compression,
+		ObjectCache:        opts.ObjectCache,
+		DEKCacheTTL:        fleetDEKTTL,
+		IntegrityCfg:       integrity,
+		EnforceMinPartSize: opts.EnforceMinPartSize,
+	})
+	t.Cleanup(mp.Close)
+	return &fleet{Manager: mp, Runtime: rt, Integrity: integrity}
+}
+
+// newFleetQuota builds the byte-reservation tracker with baselines already
+// primed, which production does from backend_quotas before the listener opens.
+// A backend the caller said nothing about is unlimited, so a test that is not
+// about quota never has one refuse a write.
+func newFleetQuota(names []string, baselines map[string]core.BackendQuotaUsage) *counter.QuotaTracker {
+	primed := make(map[string]core.BackendQuotaUsage, len(names))
+	for _, name := range names {
+		primed[name] = core.BackendQuotaUsage{BackendName: name}
+	}
+	for name, usage := range baselines {
+		primed[name] = usage
+	}
+	quota := counter.NewQuotaTracker(names)
+	quota.SetBaselines(primed)
+	return quota
+}
+
+// newPermissiveStore returns a union store mock answering every read with an
+// empty result, so a test states only the queries it asserts on.
+func newPermissiveStore(t *testing.T) *storetest.MockMetadataStore {
+	t.Helper()
+	m := storetest.NewMockMetadataStore(gomock.NewController(t))
+	storetest.Permissive(m)
+	return m
+}
+
+// partsOf builds a completion manifest from bare part numbers, for the tests
+// whose subject is assembly rather than manifest validation. An empty ETag
+// skips the stored-ETag comparison, so these keep exercising the path they
+// always did.
+func partsOf(numbers ...int) []core.CompletePart {
+	manifest := make([]core.CompletePart, len(numbers))
+	for i, n := range numbers {
+		manifest[i] = core.CompletePart{PartNumber: n}
+	}
+	return manifest
+}

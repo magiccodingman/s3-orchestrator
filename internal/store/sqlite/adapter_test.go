@@ -40,6 +40,81 @@ func withAdapter(t *testing.T, s *Store, fn func(*sqliteTxAdapter)) {
 }
 
 // -------------------------------------------------------------------------
+// ClearPendingForKey
+// -------------------------------------------------------------------------
+
+// TestSqlite_ClearPendingForKey_RemovesAllButTheKept verifies the write path's
+// primitive: every intent for the key goes except the ones the caller names,
+// and what it removed comes back so the caller can clean those bytes up.
+func TestSqlite_ClearPendingForKey_RemovesAllButTheKept(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	seedPendingIntent(t, s, "keep-me", "bucket/k", "backend-a", 10)
+	seedPendingIntent(t, s, "stale-a", "bucket/k", "backend-b", 20)
+	seedPendingIntent(t, s, "other-key", "bucket/other", "backend-a", 30)
+
+	withAdapter(t, s, func(a *sqliteTxAdapter) {
+		cleared, err := a.ClearPendingForKey(ctx, "bucket/k", []string{"keep-me"})
+		if err != nil {
+			t.Fatalf("ClearPendingForKey: %v", err)
+		}
+		if len(cleared) != 1 {
+			t.Fatalf("cleared = %+v, want only the stale intent", cleared)
+		}
+		want := core.SupersededIntent{IntentID: "stale-a", BackendName: "backend-b", SizeBytes: 20}
+		if cleared[0] != want {
+			t.Errorf("cleared[0] = %+v, want %+v", cleared[0], want)
+		}
+		if got := countPendingForKey(t, a, "bucket/k"); got != 1 {
+			t.Errorf("rows left for the key = %d, want 1 (the kept intent)", got)
+		}
+	})
+}
+
+// seedPendingIntent inserts one intent so the clearing tests have rows to act on.
+func seedPendingIntent(t *testing.T, s *Store, intentID, key, backendName string, size int64) {
+	t.Helper()
+	p := core.PendingObject{
+		IntentID: intentID, ObjectKey: key, BackendName: backendName, SizeBytes: size,
+	}
+	if _, err := s.InsertPendingIfFits(context.Background(), &p); err != nil {
+		t.Fatalf("InsertPendingIfFits(%s): %v", intentID, err)
+	}
+}
+
+// countPendingForKey reports how many intents survive for a key inside the
+// adapter's own transaction, which is where the delete has taken effect.
+func countPendingForKey(t *testing.T, a *sqliteTxAdapter, key string) int {
+	t.Helper()
+	var n int
+	if err := a.tx.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM pending_objects WHERE object_key = ?`, key).Scan(&n); err != nil {
+		t.Fatalf("count pending for %s: %v", key, err)
+	}
+	return n
+}
+
+// TestSqlite_ClearPendingForKey_NoIntents verifies a key with nothing pending
+// reports nothing and issues no delete, which is the common case on a write.
+func TestSqlite_ClearPendingForKey_NoIntents(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	withAdapter(t, s, func(a *sqliteTxAdapter) {
+		cleared, err := a.ClearPendingForKey(ctx, "bucket/absent", nil)
+		if err != nil {
+			t.Fatalf("ClearPendingForKey: %v", err)
+		}
+		if len(cleared) != 0 {
+			t.Errorf("cleared = %+v, want none", cleared)
+		}
+	})
+}
+
+// -------------------------------------------------------------------------
 // AcquireKeyLock
 // -------------------------------------------------------------------------
 
@@ -66,7 +141,7 @@ func TestAdapter_ClaimPending_TrueWhenInserted(t *testing.T) {
 	t.Parallel()
 	s := newTestStore(t)
 	ctx := context.Background()
-	if err := s.InsertPending(ctx, &core.PendingObject{
+	if _, err := s.InsertPendingIfFits(ctx, &core.PendingObject{
 		IntentID: "i-1", ObjectKey: "k", BackendName: "backend-a", SizeBytes: 1,
 	}); err != nil {
 		t.Fatalf("InsertPending: %v", err)
@@ -98,29 +173,28 @@ func TestAdapter_ClaimPending_FalseWhenMissing(t *testing.T) {
 	})
 }
 
-// TestAdapter_InsertPending_NullableFieldsOmitted verifies that empty
-// optional fields land as SQL NULL, not the zero value.
-func TestAdapter_InsertPending_NullableFieldsOmitted(t *testing.T) {
+// TestInsertPending_NullableFieldsOmitted verifies that empty optional fields
+// land as SQL NULL, not the zero value. A stored zero would make an
+// unencrypted intent read back as one whose plaintext is genuinely empty.
+func TestInsertPending_NullableFieldsOmitted(t *testing.T) {
 	t.Parallel()
 	s := newTestStore(t)
 	ctx := context.Background()
-	withAdapter(t, s, func(a *sqliteTxAdapter) {
-		if err := a.InsertPending(ctx, &core.PendingObject{
-			IntentID: "i-2", ObjectKey: "k", BackendName: "backend-a", SizeBytes: 5,
-		}); err != nil {
-			t.Fatalf("InsertPending: %v", err)
-		}
-		var keyID, plaintext, hash any
-		if err := a.tx.QueryRowContext(ctx,
-			`SELECT key_id, plaintext_size, content_hash FROM pending_objects WHERE intent_id = ?`,
-			"i-2",
-		).Scan(&keyID, &plaintext, &hash); err != nil {
-			t.Fatalf("query: %v", err)
-		}
-		if keyID != nil || plaintext != nil || hash != nil {
-			t.Errorf("expected SQL NULL for empty optional fields, got %v %v %v", keyID, plaintext, hash)
-		}
-	})
+	if _, err := s.InsertPendingIfFits(ctx, &core.PendingObject{
+		IntentID: "i-2", ObjectKey: "k", BackendName: "backend-a", SizeBytes: 5,
+	}); err != nil {
+		t.Fatalf("InsertPending: %v", err)
+	}
+	var keyID, plaintext, hash any
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT key_id, plaintext_size, content_hash FROM pending_objects WHERE intent_id = ?`,
+		"i-2",
+	).Scan(&keyID, &plaintext, &hash); err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if keyID != nil || plaintext != nil || hash != nil {
+		t.Errorf("expected SQL NULL for empty optional fields, got %v %v %v", keyID, plaintext, hash)
+	}
 }
 
 // TestAdapter_DeletePending_RemovesRow verifies the delete removes the
@@ -129,7 +203,7 @@ func TestAdapter_DeletePending_RemovesRow(t *testing.T) {
 	t.Parallel()
 	s := newTestStore(t)
 	ctx := context.Background()
-	if err := s.InsertPending(ctx, &core.PendingObject{
+	if _, err := s.InsertPendingIfFits(ctx, &core.PendingObject{
 		IntentID: "i-3", ObjectKey: "k", BackendName: "backend-a", SizeBytes: 1,
 	}); err != nil {
 		t.Fatalf("InsertPending: %v", err)
@@ -144,44 +218,6 @@ func TestAdapter_DeletePending_RemovesRow(t *testing.T) {
 		}
 		if got {
 			t.Error("intent still present after DeletePending")
-		}
-	})
-}
-
-// TestAdapter_DeletePendingByBackend_RemovesAllForBackend verifies the
-// scoped delete clears every intent for a backend.
-func TestAdapter_DeletePendingByBackend_RemovesAllForBackend(t *testing.T) {
-	t.Parallel()
-	s := newTestStore(t)
-	ctx := context.Background()
-	for i, backend := range []string{"backend-a", "backend-a", "backend-b"} {
-		if err := s.InsertPending(ctx, &core.PendingObject{
-			IntentID: string(rune('a' + i)), ObjectKey: "k", BackendName: backend, SizeBytes: 1,
-		}); err != nil {
-			t.Fatalf("InsertPending: %v", err)
-		}
-	}
-	withAdapter(t, s, func(a *sqliteTxAdapter) {
-		if err := a.DeletePendingByBackend(ctx, "backend-a"); err != nil {
-			t.Fatalf("DeletePendingByBackend: %v", err)
-		}
-		var n int64
-		if err := a.tx.QueryRowContext(ctx,
-			`SELECT COUNT(*) FROM pending_objects WHERE backend_name = ?`, "backend-a",
-		).Scan(&n); err != nil {
-			t.Fatalf("count: %v", err)
-		}
-		if n != 0 {
-			t.Errorf("expected 0 backend-a intents after delete, got %d", n)
-		}
-		// backend-b should be untouched.
-		if err := a.tx.QueryRowContext(ctx,
-			`SELECT COUNT(*) FROM pending_objects WHERE backend_name = ?`, "backend-b",
-		).Scan(&n); err != nil {
-			t.Fatalf("count: %v", err)
-		}
-		if n != 1 {
-			t.Errorf("expected 1 backend-b intent after delete, got %d", n)
 		}
 	})
 }
@@ -315,13 +351,13 @@ func TestAdapter_LockObjectOnBackend_ReturnsRow(t *testing.T) {
 	t.Parallel()
 	s := newTestStore(t)
 	ctx := context.Background()
-	enc := &core.EncryptionMeta{
+	form := &core.StoredForm{
 		Encrypted:     true,
 		EncryptionKey: []byte("packed"),
 		KeyID:         "kid-1",
 		PlaintextSize: 50,
 	}
-	if _, err := s.RecordObject(ctx, "bucket/k", "backend-a", 75, enc); err != nil {
+	if _, _, err := s.RecordObject(ctx, &core.RecordObjectRequest{Key: "bucket/k", Copies: []core.ObjectCopy{{Backend: "backend-a"}}, Size: 75, Form: form}); err != nil {
 		t.Fatalf("RecordObject: %v", err)
 	}
 
@@ -452,6 +488,46 @@ func TestAdapter_InsertReplicaConditional_InsertsWhenSourceExists(t *testing.T) 
 		}
 		if len(copies) != 2 {
 			t.Errorf("expected 2 copies after replica, got %d", len(copies))
+		}
+	})
+}
+
+// TestAdapter_InsertReplicaConditional_CarriesSourceCreatedAt asserts the
+// replica inherits the source row's timestamp instead of being stamped at the
+// moment it was made. It reaches clients as Last-Modified, so a per-copy stamp
+// makes an unmodified object report a different time once a read fails over.
+func TestAdapter_InsertReplicaConditional_CarriesSourceCreatedAt(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := context.Background()
+	mustRecordObject(t, s, "bucket/k", "backend-a", 100)
+
+	withAdapter(t, s, func(a *sqliteTxAdapter) {
+		before, err := a.GetExistingCopiesForUpdate(ctx, "bucket/k")
+		if err != nil {
+			t.Fatalf("GetExistingCopiesForUpdate(source): %v", err)
+		}
+		if len(before) != 1 {
+			t.Fatalf("expected 1 source copy, got %d", len(before))
+		}
+		sourceCreatedAt := before[0].CreatedAt
+
+		if _, _, err := a.InsertReplicaConditional(ctx, "bucket/k", "backend-b", "backend-a"); err != nil {
+			t.Fatalf("InsertReplicaConditional: %v", err)
+		}
+
+		after, err := a.GetExistingCopiesForUpdate(ctx, "bucket/k")
+		if err != nil {
+			t.Fatalf("GetExistingCopiesForUpdate(after): %v", err)
+		}
+		if len(after) != 2 {
+			t.Fatalf("expected 2 copies after replica, got %d", len(after))
+		}
+		for i := range after {
+			if !after[i].CreatedAt.Equal(sourceCreatedAt) {
+				t.Errorf("copy on %s has CreatedAt %v, want the source's %v",
+					after[i].BackendName, after[i].CreatedAt, sourceCreatedAt)
+			}
 		}
 	})
 }
@@ -751,93 +827,174 @@ func TestAdapter_DeleteCleanupItem_RemovesRow(t *testing.T) {
 // QUOTA TX
 // -------------------------------------------------------------------------
 
-// TestAdapter_IncrementBackendQuota_AddsBytesUsed verifies the increment
-// updates bytes_used.
-func TestAdapter_IncrementBackendQuota_AddsBytesUsed(t *testing.T) {
-	t.Parallel()
-	s := newTestStore(t)
-	ctx := context.Background()
-	withAdapter(t, s, func(a *sqliteTxAdapter) {
-		if err := a.IncrementBackendQuota(ctx, "backend-a", 500); err != nil {
-			t.Fatalf("IncrementBackendQuota: %v", err)
-		}
-		var used int64
-		if err := a.tx.QueryRowContext(ctx,
-			`SELECT bytes_used FROM backend_quotas WHERE backend_name = ?`, "backend-a",
-		).Scan(&used); err != nil {
-			t.Fatalf("query: %v", err)
-		}
-		if used != 500 {
-			t.Errorf("bytes_used=%d, want 500", used)
-		}
-	})
+// stripeBytes reads one stripe's raw value, which is the only way to observe
+// that the counter is actually split rather than summed into a single row.
+func stripeBytes(t *testing.T, a *sqliteTxAdapter, backend string, stripe int16) int64 {
+	t.Helper()
+	var used int64
+	if err := a.tx.QueryRowContext(context.Background(),
+		`SELECT COALESCE(SUM(bytes_used), 0) FROM backend_quota_stripes
+		 WHERE backend_name = ? AND stripe_id = ?`, backend, stripe,
+	).Scan(&used); err != nil {
+		t.Fatalf("read stripe %d: %v", stripe, err)
+	}
+	return used
 }
 
-// TestAdapter_IncrementBackendQuota_ReturnsErrNoSpaceWhenExceeded
-// verifies the guarded UPDATE returns ErrNoSpaceAvailable when the
-// quota ceiling would be exceeded.
-func TestAdapter_IncrementBackendQuota_ReturnsErrNoSpaceWhenExceeded(t *testing.T) {
+// TestAdapter_BackendHasRoom_CountsOrphanBytes asserts bytes awaiting physical
+// cleanup still occupy the backend.
+//
+// They are on disk until their cleanup lands, so a headroom test that ignored
+// them would admit a write the backend cannot actually hold, and the ceiling
+// would be crossed for real rather than on paper.
+func TestAdapter_BackendHasRoom_CountsOrphanBytes(t *testing.T) {
 	t.Parallel()
 	s := newTestStore(t)
 	ctx := context.Background()
-	// Set bytes_limit to a small value via direct SQL on the test store
-	// so the increment can exceed it.
 	if _, err := s.db.ExecContext(ctx,
-		`UPDATE backend_quotas SET bytes_limit = 100 WHERE backend_name = ?`, "backend-a",
-	); err != nil {
+		`UPDATE backend_quotas SET bytes_limit = 1000, orphan_bytes = 50 WHERE backend_name = ?`,
+		"backend-a"); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
+	seedBytesUsed(t, s, "backend-a", 900)
 
 	withAdapter(t, s, func(a *sqliteTxAdapter) {
-		err := a.IncrementBackendQuota(ctx, "backend-a", 200)
-		if !errors.Is(err, core.ErrNoSpaceAvailable) {
-			t.Errorf("got %v, want ErrNoSpaceAvailable", err)
+		// 900 stored + 50 orphaned leaves 50 free.
+		fits, err := a.backendHasRoom(ctx, "backend-a", 100)
+		if err != nil {
+			t.Fatalf("backendHasRoom: %v", err)
+		}
+		if fits {
+			t.Error("admitted 100 bytes into 50 of room; orphan bytes were not counted")
+		}
+		fits, err = a.backendHasRoom(ctx, "backend-a", 50)
+		if err != nil {
+			t.Fatalf("backendHasRoom: %v", err)
+		}
+		if !fits {
+			t.Error("refused 50 bytes that fit the remaining room exactly")
 		}
 	})
 }
 
-// TestAdapter_DecrementBackendQuota_SubtractsBytesUsed verifies the
-// decrement subtracts and clamps at zero.
-func TestAdapter_DecrementBackendQuota_SubtractsBytesUsed(t *testing.T) {
+// TestAdapter_BackendHasRoom_UnlimitedAlwaysFits asserts a zero bytes_limit
+// means no enforcement, which is how the schema spells unlimited.
+func TestAdapter_BackendHasRoom_UnlimitedAlwaysFits(t *testing.T) {
 	t.Parallel()
 	s := newTestStore(t)
 	ctx := context.Background()
-	mustRecordObject(t, s, "bucket/k", "backend-a", 1000)
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE backend_quotas SET bytes_limit = 0 WHERE backend_name = ?`, "backend-a"); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	seedBytesUsed(t, s, "backend-a", 1<<40)
 
 	withAdapter(t, s, func(a *sqliteTxAdapter) {
-		if err := a.DecrementBackendQuota(ctx, "backend-a", 600); err != nil {
-			t.Fatalf("DecrementBackendQuota: %v", err)
+		fits, err := a.backendHasRoom(ctx, "backend-a", 1<<30)
+		if err != nil {
+			t.Fatalf("backendHasRoom: %v", err)
 		}
-		var used int64
-		if err := a.tx.QueryRowContext(ctx,
-			`SELECT bytes_used FROM backend_quotas WHERE backend_name = ?`, "backend-a",
-		).Scan(&used); err != nil {
-			t.Fatalf("query: %v", err)
-		}
-		if used != 400 {
-			t.Errorf("bytes_used=%d, want 400", used)
+		if !fits {
+			t.Error("an unlimited backend refused a write")
 		}
 	})
 }
 
-// TestAdapter_DecrementBackendQuota_ClampsAtZero verifies the decrement
-// clamps at zero rather than going negative.
-func TestAdapter_DecrementBackendQuota_ClampsAtZero(t *testing.T) {
+// TestAdapter_AdjustQuotaStripe_MaterializesAndAccumulates asserts the first
+// adjustment creates the stripe row and later ones add to it, so nothing has to
+// seed a backend's stripes before it can be charged.
+func TestAdapter_AdjustQuotaStripe_MaterializesAndAccumulates(t *testing.T) {
 	t.Parallel()
 	s := newTestStore(t)
 	ctx := context.Background()
 	withAdapter(t, s, func(a *sqliteTxAdapter) {
-		if err := a.DecrementBackendQuota(ctx, "backend-a", 100); err != nil {
-			t.Fatalf("DecrementBackendQuota: %v", err)
+		if err := a.AdjustQuotaStripe(ctx, "backend-a", 3, 500); err != nil {
+			t.Fatalf("AdjustQuotaStripe: %v", err)
 		}
-		var used int64
-		if err := a.tx.QueryRowContext(ctx,
-			`SELECT bytes_used FROM backend_quotas WHERE backend_name = ?`, "backend-a",
-		).Scan(&used); err != nil {
-			t.Fatalf("query: %v", err)
+		if got := stripeBytes(t, a, "backend-a", 3); got != 500 {
+			t.Errorf("stripe 3 = %d, want 500 after the row was created", got)
 		}
-		if used != 0 {
-			t.Errorf("bytes_used=%d, want 0 (clamped)", used)
+		if err := a.AdjustQuotaStripe(ctx, "backend-a", 3, 250); err != nil {
+			t.Fatalf("AdjustQuotaStripe: %v", err)
+		}
+		if got := stripeBytes(t, a, "backend-a", 3); got != 750 {
+			t.Errorf("stripe 3 = %d, want 750 after a second charge", got)
+		}
+	})
+}
+
+// TestAdapter_AdjustQuotaStripe_StripesAreIndependent asserts a charge lands on
+// the named stripe only, which is what lets concurrent writers take different
+// row locks, and that the backend's total is their sum.
+func TestAdapter_AdjustQuotaStripe_StripesAreIndependent(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := context.Background()
+	withAdapter(t, s, func(a *sqliteTxAdapter) {
+		for stripe, delta := range map[int16]int64{0: 100, 5: 200, 11: 300} {
+			if err := a.AdjustQuotaStripe(ctx, "backend-a", stripe, delta); err != nil {
+				t.Fatalf("AdjustQuotaStripe(%d): %v", stripe, err)
+			}
+		}
+		if got := stripeBytes(t, a, "backend-a", 5); got != 200 {
+			t.Errorf("stripe 5 = %d, want only its own 200", got)
+		}
+		totals, err := a.AllBackendBytesUsed(ctx)
+		if err != nil {
+			t.Fatalf("AllBackendBytesUsed: %v", err)
+		}
+		if totals["backend-a"] != 600 {
+			t.Errorf("total = %d, want 600 (100+200+300)", totals["backend-a"])
+		}
+	})
+}
+
+// TestAdapter_AdjustQuotaStripe_NegativeStripeClampsOnlyTheTotal asserts a
+// stripe is allowed to go negative while the total it feeds is clamped. A
+// credit for an object recorded before the stripes existed lands on whichever
+// stripe its key hashes to, not the one holding the backfilled bytes, so
+// clamping per stripe would silently discard the debit.
+func TestAdapter_AdjustQuotaStripe_NegativeStripeClampsOnlyTheTotal(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := context.Background()
+	withAdapter(t, s, func(a *sqliteTxAdapter) {
+		if err := a.AdjustQuotaStripe(ctx, "backend-a", 0, 1000); err != nil {
+			t.Fatalf("seed stripe 0: %v", err)
+		}
+		if err := a.AdjustQuotaStripe(ctx, "backend-a", 6, -400); err != nil {
+			t.Fatalf("credit stripe 6: %v", err)
+		}
+		if got := stripeBytes(t, a, "backend-a", 6); got != -400 {
+			t.Errorf("stripe 6 = %d, want -400 held unclamped", got)
+		}
+		totals, err := a.AllBackendBytesUsed(ctx)
+		if err != nil {
+			t.Fatalf("AllBackendBytesUsed: %v", err)
+		}
+		if totals["backend-a"] != 600 {
+			t.Errorf("total = %d, want 600 (1000 - 400)", totals["backend-a"])
+		}
+	})
+}
+
+// TestAdapter_AllBackendBytesUsed_ClampsNegativeTotalAtZero asserts a total
+// driven below zero by stale sizes reads as zero, because a negative counter
+// would over-admit every later write.
+func TestAdapter_AllBackendBytesUsed_ClampsNegativeTotalAtZero(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := context.Background()
+	withAdapter(t, s, func(a *sqliteTxAdapter) {
+		if err := a.AdjustQuotaStripe(ctx, "backend-a", 2, -750); err != nil {
+			t.Fatalf("AdjustQuotaStripe: %v", err)
+		}
+		totals, err := a.AllBackendBytesUsed(ctx)
+		if err != nil {
+			t.Fatalf("AllBackendBytesUsed: %v", err)
+		}
+		if totals["backend-a"] != 0 {
+			t.Errorf("total = %d, want 0 (clamped)", totals["backend-a"])
 		}
 	})
 }
@@ -898,5 +1055,76 @@ func TestAdapter_SatisfiesCoreInterfaces(t *testing.T) {
 		var _ core.QuotaTxAdapter = a
 		var _ core.TxAdapter = a
 		_ = time.Now() // silence unused import when other helpers change
+	})
+}
+
+// TestAdapter_GetExistingCopiesForUpdate_CarriesEncryptionState verifies the
+// locked re-read reports each copy's encryption flag and whether its key
+// survived. RemoveExcessCopy decides what to delete from these two fields, so
+// an adapter that dropped them would silently re-enable destroying the only
+// readable copy of a mixed set.
+func TestAdapter_GetExistingCopiesForUpdate_CarriesEncryptionState(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := context.Background()
+	key := "bucket/mixed"
+
+	form := &core.StoredForm{
+		Encrypted:     true,
+		EncryptionKey: []byte("wrapped-dek"),
+		KeyID:         "key-1",
+		PlaintextSize: 1024,
+	}
+	if _, _, err := s.RecordObject(ctx, &core.RecordObjectRequest{Key: key, Copies: []core.ObjectCopy{{Backend: "backend-a"}}, Size: 1100, Form: form}); err != nil {
+		t.Fatalf("RecordObject encrypted: %v", err)
+	}
+	if _, _, err := s.RecordReplica(ctx, key, "backend-b", "backend-a"); err != nil {
+		t.Fatalf("RecordReplica: %v", err)
+	}
+
+	withAdapter(t, s, func(a *sqliteTxAdapter) {
+		copies, err := a.GetExistingCopiesForUpdate(ctx, key)
+		if err != nil {
+			t.Fatalf("GetExistingCopiesForUpdate: %v", err)
+		}
+		if len(copies) != 2 {
+			t.Fatalf("expected 2 copies, got %d", len(copies))
+		}
+		for _, ec := range copies {
+			if !ec.Encrypted {
+				t.Errorf("%s: Encrypted = false, want true", ec.BackendName)
+			}
+			if !ec.HasDEK {
+				t.Errorf("%s: HasDEK = false, want true (replication copies the key)", ec.BackendName)
+			}
+		}
+	})
+}
+
+// TestAdapter_GetExistingCopiesForUpdate_ReportsUnencryptedCopy verifies a
+// plain object reports neither flag, so the guard stays inert for copy sets
+// that were never encrypted.
+func TestAdapter_GetExistingCopiesForUpdate_ReportsUnencryptedCopy(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := context.Background()
+	key := "bucket/plain"
+
+	if _, _, err := s.RecordObject(ctx, &core.RecordObjectRequest{Key: key, Copies: []core.ObjectCopy{{Backend: "backend-a"}}, Size: 100}); err != nil {
+		t.Fatalf("RecordObject: %v", err)
+	}
+
+	withAdapter(t, s, func(a *sqliteTxAdapter) {
+		copies, err := a.GetExistingCopiesForUpdate(ctx, key)
+		if err != nil {
+			t.Fatalf("GetExistingCopiesForUpdate: %v", err)
+		}
+		if len(copies) != 1 {
+			t.Fatalf("expected 1 copy, got %d", len(copies))
+		}
+		if copies[0].Encrypted || copies[0].HasDEK {
+			t.Errorf("plain copy reported Encrypted=%v HasDEK=%v, want both false",
+				copies[0].Encrypted, copies[0].HasDEK)
+		}
 	})
 }

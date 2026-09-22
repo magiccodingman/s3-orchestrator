@@ -14,14 +14,17 @@
 
 package config
 
-import "time"
+import (
+	"cmp"
+	"time"
+)
 
 // RedisConfig holds optional Redis connection settings for shared usage
 // counters in multi-instance deployments. When omitted, counters are stored
 // in local memory (single-instance default).
 type RedisConfig struct {
 	Address          string        `yaml:"address"`           // Redis address (host:port)
-	Password         string        `yaml:"password"` //nolint:gosec // G117: config struct, not a hardcoded credential
+	Password         string        `yaml:"password"`          //nolint:gosec // G117: config struct, not a hardcoded credential
 	DB               int           `yaml:"db"`                // Redis database number (default: 0)
 	TLS              bool          `yaml:"tls"`               // Use TLS for Redis connection
 	KeyPrefix        string        `yaml:"key_prefix"`        // Key prefix for namespacing (default: "s3orch")
@@ -36,15 +39,9 @@ func (r *RedisConfig) setDefaultsAndValidate() []error {
 	if r.Address == "" {
 		errs = append(errs, ErrRedisAddressRequired)
 	}
-	if r.KeyPrefix == "" {
-		r.KeyPrefix = "s3orch"
-	}
-	if r.FailureThreshold == 0 {
-		r.FailureThreshold = 3
-	}
-	if r.OpenTimeout == 0 {
-		r.OpenTimeout = 15 * time.Second
-	}
+	r.KeyPrefix = cmp.Or(r.KeyPrefix, "s3orch")
+	r.FailureThreshold = cmp.Or(r.FailureThreshold, 3)
+	r.OpenTimeout = cmp.Or(r.OpenTimeout, 15*time.Second)
 
 	if r.FailureThreshold < 0 {
 		errs = append(errs, ErrRedisFailureThresholdNotPos)

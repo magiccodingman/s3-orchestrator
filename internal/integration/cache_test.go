@@ -27,9 +27,7 @@ import (
 
 	objcache "github.com/afreidah/s3-orchestrator/internal/cache"
 	"github.com/afreidah/s3-orchestrator/internal/config"
-	"github.com/afreidah/s3-orchestrator/internal/proxy"
 	"github.com/afreidah/s3-orchestrator/internal/proxy/proxytest"
-	"github.com/afreidah/s3-orchestrator/internal/transport/auth"
 	"github.com/afreidah/s3-orchestrator/internal/transport/s3api"
 )
 
@@ -57,31 +55,23 @@ func setupCacheEnv(t *testing.T) *cacheTestEnv {
 	}
 
 	stores := newStores(testStore)
-	mgr := proxytest.NewManager(t, &proxy.BackendManagerConfig{
-		Storage: proxy.StorageDeps{
-			Backends: testBackends,
-			Order:    testBackendOrder,
-		},
-		Stores: proxy.StoreDeps{
-			Metadata:  stores,
-			Dashboard: testStore,
-		},
-		Policies: proxy.PolicyConfig{
-			CacheTTL:        60 * time.Second,
+	st := proxytest.New(t, stores, &proxytest.StackOptions{
+		Runtime: proxytest.NewRuntime(&proxytest.RuntimeOptions{
+			Backends:        testBackends,
+			Order:           testBackendOrder,
 			BackendTimeout:  30 * time.Second,
 			RoutingStrategy: config.RoutingPack,
-		},
-		Features: proxy.FeatureDeps{
-			ObjectCache: mc,
-		},
-		Operations: proxy.OperationalDeps{
-			Metrics: newMetricsAdapter(testStore),
-		},
+			Metrics:         newMetricsAdapter(testStore),
+		}),
+		ObjectCache:    mc,
+		CacheTTL:       60 * time.Second,
+		BackendTimeout: 30 * time.Second,
 	})
-	_ = proxytest.BuildWorkers(mgr, stores)
+	registerStack(t, st)
+	_ = proxytest.BuildWorkers(st, stores)
 
-	srv := &s3api.Server{Manager: mgr}
-	srv.SetBucketAuth(auth.NewBucketRegistry([]config.BucketConfig{
+	srv := &s3api.Server{Objects: st.Objects, Multipart: st.Multipart}
+	srv.SetBucketAuth(mustBucketRegistry(t, []config.BucketConfig{
 		{
 			Name: virtualBucket,
 			Credentials: []config.CredentialConfig{

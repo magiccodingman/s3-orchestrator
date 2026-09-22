@@ -1,0 +1,82 @@
+// -------------------------------------------------------------------------------
+// Ops - Skip and Rejection Errors
+//
+// Author: Alex Freidah
+//
+// An operation declines work for reasons that are not failures: a subsystem is
+// turned off in config, or a worker planned no work for this pass. Both are
+// reported as a SkipError so each transport can word the outcome for its own
+// audience without the operations layer knowing what a wire status is.
+// -------------------------------------------------------------------------------
+
+package ops
+
+import "errors"
+
+// SkipError reports an operation that declined to run, and why. Transports
+// match it with errors.As and render Reason in whatever shape their protocol
+// uses.
+type SkipError struct {
+	Reason string
+}
+
+// Error reports the skip reason.
+func (e *SkipError) Error() string {
+	return "skipped: " + e.Reason
+}
+
+// Skip builds a SkipError for a reason decided at runtime, such as the skip a
+// worker reports back from a planning pass.
+func Skip(reason string) error {
+	return &SkipError{Reason: reason}
+}
+
+// Skips for subsystems that are unavailable in the running configuration.
+// Each is a *SkipError, so a transport handles a fixed and a runtime skip
+// through the same errors.As branch.
+//
+// ErrCompressionUnavailable reports no codec, which is a different state from
+// compression being disabled for writes: a codec is built either way so stored
+// objects stay readable, and only its absence stops a rewrite.
+var (
+	ErrIntegrityDisabled     = &SkipError{Reason: "integrity verification is not enabled"}
+	ErrReplicationDisabled   = &SkipError{Reason: "replication not configured or factor <= 1"}
+	ErrEncryptionDisabled    = &SkipError{Reason: "encryption not enabled"}
+	ErrRebalancerUnavailable = &SkipError{Reason: "rebalancer not available"}
+	ErrLifecycleUnavailable  = &SkipError{Reason: "lifecycle manager not available"}
+
+	ErrCompressionUnavailable = &SkipError{Reason: "compression codec not available"}
+)
+
+// Rejections an object operation raises before it reaches a backend. Each maps
+// to a client error rather than a server fault.
+var (
+	ErrKeyRequired    = errors.New("key is required")
+	ErrKeyIDRequired  = errors.New("old_key_id is required")
+	ErrPrefixRequired = errors.New("prefix is required")
+	ErrInvalidKey     = errors.New("key must start with a configured bucket name")
+	ErrNotFound       = errors.New("object not found")
+)
+
+// Rejections a provisioning operation raises. ErrConfigDeclared covers every
+// entry the config file declares: those are visible through the API and never
+// editable through it, so an operator reading that file can trust what it says.
+var (
+	ErrNameRequired       = errors.New("name is required")
+	ErrUserRequired       = errors.New("user is required")
+	ErrConfigDeclared     = errors.New("declared in the config file and not editable through the API")
+	ErrBucketExists       = errors.New("bucket already exists")
+	ErrBucketNotFound     = errors.New("bucket not found")
+	ErrBucketNotEmpty     = errors.New("bucket still holds objects")
+	ErrBucketGranted      = errors.New("bucket is still granted to a user")
+	ErrUserNotFound       = errors.New("user not found")
+	ErrUserInUse          = errors.New("user still holds credentials or grants")
+	ErrCredentialNotFound = errors.New("credential not found")
+	ErrCredentialExists   = errors.New("access key is already claimed")
+	ErrKeypairIncomplete  = errors.New(
+		"access_key_id and secret_access_key must both be supplied, or both omitted to mint one")
+	ErrInvalidCORS     = errors.New("bucket cors rules are not valid")
+	ErrNoPermissions   = errors.New("a grant must carry at least one permission")
+	ErrBackendNotFound = errors.New("backend not found")
+	ErrInvalidResource = errors.New("grant resource is not valid")
+)

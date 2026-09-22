@@ -19,10 +19,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/afreidah/s3-orchestrator/internal/observe/telemetry"
-	"github.com/afreidah/s3-orchestrator/internal/store/core"
 	dto "github.com/prometheus/client_model/go"
 	"go.uber.org/mock/gomock"
+
+	"github.com/afreidah/s3-orchestrator/internal/observe/telemetry"
+	"github.com/afreidah/s3-orchestrator/internal/store/core"
 )
 
 // TestProcessCleanupQueue_DeleteSuccess verifies the process cleanup queue delete success contract.
@@ -30,7 +31,7 @@ import (
 func TestProcessCleanupQueue_DeleteSuccess(t *testing.T) {
 	t.Parallel()
 	ctrl := gomock.NewController(t)
-	ops := NewMockCleanupOps(ctrl)
+	ops := newMockCleanupOps(ctrl)
 
 	st := core.CleanupItem{ID: 1, BackendName: "b1", ObjectKey: "orphan.txt", SizeBytes: 100}
 	ms := &mockMetadataStore{pendingCleanups: []core.CleanupItem{st}}
@@ -58,7 +59,7 @@ func TestProcessCleanupQueue_DeleteSuccess(t *testing.T) {
 func TestProcessCleanupQueue_DeleteFails_Retries(t *testing.T) {
 	t.Parallel()
 	ctrl := gomock.NewController(t)
-	ops := NewMockCleanupOps(ctrl)
+	ops := newMockCleanupOps(ctrl)
 
 	st := core.CleanupItem{ID: 2, BackendName: "b1", ObjectKey: "stuck.txt", Attempts: 3}
 	ms := &mockMetadataStore{pendingCleanups: []core.CleanupItem{st}}
@@ -85,7 +86,7 @@ func TestProcessCleanupQueue_DeleteFails_Retries(t *testing.T) {
 func TestProcessCleanupQueue_DeleteReturns404_IdempotentSuccess(t *testing.T) {
 	t.Parallel()
 	ctrl := gomock.NewController(t)
-	ops := NewMockCleanupOps(ctrl)
+	ops := newMockCleanupOps(ctrl)
 
 	// Attempts=9 puts us at the retry ceiling. Without the 404 special
 	// case this row would graduate straight to DLQ; with it the row must
@@ -127,7 +128,7 @@ func TestProcessCleanupQueue_DeleteReturns404_IdempotentSuccess(t *testing.T) {
 func TestProcessCleanupQueue_AdmissionBlocked(t *testing.T) {
 	t.Parallel()
 	ctrl := gomock.NewController(t)
-	ops := NewMockCleanupOps(ctrl)
+	ops := newMockCleanupOps(ctrl)
 
 	st := core.CleanupItem{ID: 1, BackendName: "b1", ObjectKey: "orphan.txt"}
 	ms := &mockMetadataStore{pendingCleanups: []core.CleanupItem{st}}
@@ -148,7 +149,7 @@ func TestProcessCleanupQueue_AdmissionBlocked(t *testing.T) {
 func TestProcessCleanupQueue_BackendNotFound(t *testing.T) {
 	t.Parallel()
 	ctrl := gomock.NewController(t)
-	ops := NewMockCleanupOps(ctrl)
+	ops := newMockCleanupOps(ctrl)
 
 	st := core.CleanupItem{ID: 1, BackendName: "gone", ObjectKey: "orphan.txt"}
 	ms := &mockMetadataStore{pendingCleanups: []core.CleanupItem{st}}
@@ -167,27 +168,6 @@ func TestProcessCleanupQueue_BackendNotFound(t *testing.T) {
 	}
 }
 
-// TestCleanupBackoff verifies the cleanup backoff contract.
-// Asserts that CleanupBackoff() = , want.
-func TestCleanupBackoff(t *testing.T) {
-	t.Parallel()
-	tests := []struct {
-		attempts int32
-		want     time.Duration
-	}{
-		{0, 1 * time.Minute},
-		{1, 2 * time.Minute},
-		{5, 32 * time.Minute},
-		{11, 24 * time.Hour},
-	}
-	for _, tt := range tests {
-		got := CleanupBackoff(tt.attempts)
-		if got != tt.want {
-			t.Errorf("CleanupBackoff(%d) = %v, want %v", tt.attempts, got, tt.want)
-		}
-	}
-}
-
 // TestProcessCleanupQueue_Exhausted_MovesToDLQ asserts that an item
 // that has used its full retry budget (Attempts already at
 // maxCleanupAttempts-1, so newAttempts crosses the ceiling) graduates
@@ -197,7 +177,7 @@ func TestCleanupBackoff(t *testing.T) {
 func TestProcessCleanupQueue_Exhausted_MovesToDLQ(t *testing.T) {
 	t.Parallel()
 	ctrl := gomock.NewController(t)
-	ops := NewMockCleanupOps(ctrl)
+	ops := newMockCleanupOps(ctrl)
 
 	// Attempts=9 + 1 increment crosses maxCleanupAttempts (10), so the
 	// worker takes the exhausted branch.
@@ -236,7 +216,7 @@ func TestProcessCleanupQueue_Exhausted_MovesToDLQ(t *testing.T) {
 func TestProcessCleanupQueue_Exhausted_DLQMoveFails(t *testing.T) {
 	t.Parallel()
 	ctrl := gomock.NewController(t)
-	ops := NewMockCleanupOps(ctrl)
+	ops := newMockCleanupOps(ctrl)
 
 	st := core.CleanupItem{ID: 7, BackendName: "b1", ObjectKey: "doomed2.txt", Attempts: 9}
 	ms := &mockMetadataStore{
@@ -268,7 +248,7 @@ func TestProcessCleanupQueue_Exhausted_DLQMoveFails(t *testing.T) {
 // stale-claim-recovered counter exactly once for that row's backend.
 func TestProcessCleanupQueue_ReclaimedRow_IncrementsMetric(t *testing.T) {
 	ctrl := gomock.NewController(t)
-	ops := NewMockCleanupOps(ctrl)
+	ops := newMockCleanupOps(ctrl)
 
 	const backend = "metric-backend"
 	st := core.CleanupItem{ID: 99, BackendName: backend, ObjectKey: "k", Reclaimed: true}

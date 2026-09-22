@@ -22,23 +22,34 @@ import (
 	s3be "github.com/afreidah/s3-orchestrator/internal/backend"
 	"github.com/afreidah/s3-orchestrator/internal/observe"
 	"github.com/afreidah/s3-orchestrator/internal/observe/telemetry"
+	"github.com/afreidah/s3-orchestrator/internal/proxy/writepath"
+	"github.com/afreidah/s3-orchestrator/internal/s3op"
 	"github.com/afreidah/s3-orchestrator/internal/store/core"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 )
 
+// -------------------------------------------------------------------------
+// INTERNALS
+// -------------------------------------------------------------------------
+
 // headSourceForCopy walks the source's known locations until one HEAD
 // succeeds (skipping over-limit and unknown backends), and returns its
-// metadata plus optional encryption descriptor. ok=false signals that no
+// metadata plus the stored form of its bytes. ok=false signals that no
 // copy could be reached.
+//
+// The stored form comes off the location row that answered rather than being
+// re-derived, because both copy paths move the stored bytes verbatim: the
+// destination holds an envelope or an encoded stream exactly when the source
+// did, and a row that failed to say so would describe bytes nothing can read.
 func (o *Manager) headSourceForCopy(
 	ctx context.Context,
 	sourceKey string,
 	locations []core.ObjectLocation,
-) (int64, string, map[string]string, *core.EncryptionMeta, bool) {
+) (int64, string, map[string]string, *core.StoredForm, bool) {
 	for i := range locations {
-		if !o.core.Usage().WithinLimits(locations[i].BackendName, 1, 0, 0) {
+		if !o.core.Usage().WithinLimits(locations[i].BackendName, copyObjectOp, 0, 0) {
 			continue
 		}
 		be, ok := o.core.Backends()[locations[i].BackendName]
@@ -49,20 +60,15 @@ func (o *Manager) headSourceForCopy(
 		if err != nil {
 			continue
 		}
-		var srcEnc *core.EncryptionMeta
-		if locations[i].Encrypted {
-			srcEnc = &core.EncryptionMeta{
-				Encrypted:     true,
-				EncryptionKey: locations[i].EncryptionKey,
-				KeyID:         locations[i].KeyID,
-				PlaintextSize: locations[i].PlaintextSize,
-				ContentHash:   locations[i].ContentHash,
-			}
-		}
-		return headResult.Size, headResult.ContentType, headResult.Metadata, srcEnc, true
+		return headResult.Size, headResult.ContentType, headResult.Metadata,
+			core.StoredFormFromLocation(&locations[i]), true
 	}
 	return 0, "", nil, nil, false
 }
+
+// -------------------------------------------------------------------------
+// PUBLIC API
+// -------------------------------------------------------------------------
 
 // CopyObject copies an object from sourceKey to destKey. Materializes
 // the source body into a seekable buffer  -  in-memory for small
@@ -73,15 +79,21 @@ func (o *Manager) headSourceForCopy(
 // Content-Length; S3 implementations that require Content-Length
 // (notably OCI) then reject the upload with HTTP 411. Supports
 // cross-backend copies and read failover from replicas.
-func (o *Manager) CopyObject(ctx context.Context, sourceKey, destKey string) (string, error) {
-	const operation = "CopyObject"
+func (o *Manager) CopyObject(ctx context.Context, req *CopyObjectRequest) (string, error) {
+	const operation = s3op.CopyObject
+	sourceKey, destKey := req.SourceKey, req.DestKey
 	start := time.Now()
 
-	ctx, span := telemetry.StartSpan(ctx, managerSpanPrefix+operation,
+	ctx, span := telemetry.StartSpan(ctx, managerSpanPrefix+operation.String(),
 		attribute.String("s3o.source_key", sourceKey),
 		attribute.String("s3o.dest_key", destKey),
 	)
 	defer span.End()
+
+	tags, err := o.resolveCopyTags(ctx, req)
+	if err != nil {
+		return "", err
+	}
 
 	locations, err := o.stores.GetAllObjectLocations(ctx, sourceKey)
 	if err != nil {
@@ -89,10 +101,10 @@ func (o *Manager) CopyObject(ctx context.Context, sourceKey, destKey string) (st
 			observe.MarkSpanError(span, "source object not found")
 			return "", err
 		}
-		return "", o.core.ClassifyWriteError(span, operation, err)
+		return "", o.core.ClassifyWriteError(span, operation.String(), err)
 	}
 
-	size, contentType, metadata, srcEnc, ok := o.headSourceForCopy(ctx, sourceKey, locations)
+	size, contentType, metadata, srcForm, ok := o.headSourceForCopy(ctx, sourceKey, locations)
 	if !ok {
 		err := fmt.Errorf("failed to head source object from any copy")
 		observe.RecordSpanError(span, err)
@@ -100,10 +112,23 @@ func (o *Manager) CopyObject(ctx context.Context, sourceKey, destKey string) (st
 	}
 	span.SetAttributes(telemetry.AttrObjectSize.Int64(size))
 
-	destBackendName, err := o.coord.SelectWriteTarget(ctx, span, operation, size)
+	// A copy holds the same bytes the source does, so it carries the same
+	// identity: the ETag names the object's content, and re-deriving one from
+	// the destination backend's answer would give two identical objects two
+	// different validators.
+	srcIdentity := copyIdentity(locations, contentType, metadata)
+
+	// The copy claims its destination the way a PUT does: the intent both holds
+	// the bytes against the backend while they are being written and gives a
+	// failed commit something the reaper can resolve. A native attempt falling
+	// back to the materialized one claims nothing new, because the destination
+	// was already chosen.
+	intent := writepath.NewPendingIntent(destKey, size, srcForm, srcIdentity)
+	destBackendName, err := o.coord.SelectWriteTarget(ctx, span, operation, intent)
 	if err != nil {
 		return "", err
 	}
+	intentID := intent.IntentID
 	destBackend, err := o.core.GetBackend(destBackendName)
 	if err != nil {
 		observe.RecordSpanError(span, err)
@@ -127,7 +152,10 @@ func (o *Manager) CopyObject(ctx context.Context, sourceKey, destKey string) (st
 			size:            size,
 			contentType:     contentType,
 			metadata:        metadata,
-			srcEnc:          srcEnc,
+			srcForm:         srcForm,
+			identity:        srcIdentity,
+			tags:            tags,
+			intentID:        intentID,
 			start:           start,
 		}
 		if etag, handled, nerr := o.tryNativeCopy(ctx, req); handled {
@@ -155,7 +183,43 @@ func (o *Manager) CopyObject(ctx context.Context, sourceKey, destKey string) (st
 		return "", fmt.Errorf("failed to write destination: %w", err)
 	}
 
-	return o.finalizeMaterializedCopy(ctx, span, destBackend, sourceKey, destKey, src.sourceBackend, destBackendName, size, srcEnc, start, etag)
+	return o.finalizeMaterializedCopy(ctx, &materializedCopyContext{
+		span:            span,
+		destBackend:     destBackend,
+		sourceKey:       sourceKey,
+		destKey:         destKey,
+		srcBackendName:  src.sourceBackend,
+		destBackendName: destBackendName,
+		size:            size,
+		srcForm:         srcForm,
+		identity:        srcIdentity,
+		tags:            tags,
+		intentID:        intentID,
+		start:           start,
+	}, etag)
+}
+
+// -------------------------------------------------------------------------
+// INTERNALS
+// -------------------------------------------------------------------------
+
+// copyIdentity gives the destination the source's identity when the source has
+// one. The content type and metadata are the ones the copy is written with, so
+// they hold whether or not the source row carried an ETag; without that ETag
+// there is nothing worth recording, and the destination learns its own on the
+// first read that has to ask.
+func copyIdentity(locations []core.ObjectLocation, contentType string, metadata map[string]string) *core.ObjectIdentity {
+	if len(locations) == 0 || !locations[0].Identity.Complete() {
+		return nil
+	}
+	if metadata == nil {
+		metadata = map[string]string{}
+	}
+	return &core.ObjectIdentity{
+		ETag:         locations[0].Identity.ETag,
+		ContentType:  contentType,
+		UserMetadata: metadata,
+	}
 }
 
 // sameBackendCopyEligible reports whether the source has at least one
@@ -176,6 +240,57 @@ func sameBackendCopyEligible(locations []core.ObjectLocation, destBackendName st
 // helpers share: tryNativeCopy attempts the server-side copy,
 // probeDestAfterAmbiguousCopy disambiguates lost-response failures,
 // and finalizeNativeCopy commits the destination metadata.
+// CopyObjectRequest is one CopyObject call's inputs.
+//
+// ReplaceTags carries the x-amz-tagging-directive: false is COPY, which gives
+// the destination the source's tag set, and true is REPLACE, which gives it
+// Tags instead. A REPLACE with no Tags leaves the destination untagged, which
+// is how a client strips a copy's tags.
+type CopyObjectRequest struct {
+	SourceKey   string
+	DestKey     string
+	ReplaceTags bool
+	Tags        []core.Tag
+}
+
+// resolveCopyTags settles which tag set the destination gets.
+//
+// Read before the copy starts rather than at the finalizers, so both the
+// native and the stream-through path commit the same set and neither has to
+// reach back to the source once the bytes have moved.
+func (o *Manager) resolveCopyTags(ctx context.Context, req *CopyObjectRequest) ([]core.Tag, error) {
+	if req.ReplaceTags {
+		return req.Tags, nil
+	}
+	tags, err := o.stores.GetObjectTags(ctx, req.SourceKey)
+	if err != nil {
+		return nil, fmt.Errorf("read source tags: %w", err)
+	}
+	return tags, nil
+}
+
+// -------------------------------------------------------------------------
+// TYPES
+// -------------------------------------------------------------------------
+
+// materializedCopyContext is what the stream-through copy's finalizer needs.
+// Bundled for the same reason as nativeCopyContext: the positional form had
+// reached eleven arguments with four adjacent strings among them.
+type materializedCopyContext struct {
+	span            trace.Span
+	destBackend     s3be.ObjectBackend
+	sourceKey       string
+	destKey         string
+	srcBackendName  string
+	destBackendName string
+	size            int64
+	srcForm         *core.StoredForm
+	identity        *core.ObjectIdentity
+	tags            []core.Tag
+	intentID        string
+	start           time.Time
+}
+
 type nativeCopyContext struct {
 	span            trace.Span
 	destBackend     s3be.ObjectBackend
@@ -185,38 +300,32 @@ type nativeCopyContext struct {
 	size            int64
 	contentType     string
 	metadata        map[string]string
-	srcEnc          *core.EncryptionMeta
+	srcForm         *core.StoredForm
+	identity        *core.ObjectIdentity
+	tags            []core.Tag
+	intentID        string
 	start           time.Time
 }
 
-// tryNativeCopy attempts a server-side CopyObject on req.destBackend
-// and, on success, records the destination location, updates
-// accounting, and emits the completion observability. Returns:
+// -------------------------------------------------------------------------
+// INTERNALS
+// -------------------------------------------------------------------------
+
+// tryNativeCopy attempts a server-side CopyObject on req.destBackend and, on
+// success, records the destination location, updates accounting and emits the
+// completion observability. The second return value is whether the bytes
+// reached the destination, so a caller that sees true must not fall back - that
+// would copy them a second time.
 //
-//   - (etag, true, nil):  native copy + record both succeeded (the
-//                         success may have been confirmed via the
-//                         HEAD-probe recovery path; either way the
-//                         caller treats this as a successful copy)
-//   - (_, true, err):     native copy succeeded but a post-step failed;
-//                         bytes are already on the destination, so the
-//                         caller MUST NOT fall back (that would copy
-//                         the bytes a second time)
-//   - (_, false, nil):    backend does not support native copy, or the
-//                         native call failed AND a HEAD probe confirmed
-//                         the destination is not in the expected state;
-//                         caller falls back to the materialized copy path
+// A non-capability error HEAD-probes the destination before deciding between
+// surfacing the error and falling back, because a backend can complete the copy
+// server-side and still lose the response to a timeout or dropped connection.
 //
-// Native copy accounting differs from the materialized path: one API
-// call against the destination backend with no egress and no ingress,
-// because the bytes never traverse the orchestrator's network.
-//
-// On a non-capability native-copy error, the destination is HEAD-probed
-// before the function decides whether to surface the error or fall back.
-// This guards against the ambiguous case where the backend completed the
-// copy server-side but the response was lost (timeout, dropped connection)
-// - falling back blindly would duplicate the work.
+// Accounting differs from the materialized path: one API call against the
+// destination with no egress and no ingress, since the bytes never traverse the
+// orchestrator's network.
 func (o *Manager) tryNativeCopy(ctx context.Context, req *nativeCopyContext) (string, bool, error) {
-	copier, ok := req.destBackend.(s3be.BackendCopier)
+	copier, ok := req.destBackend.(s3be.Copier)
 	if !ok {
 		return "", false, nil
 	}

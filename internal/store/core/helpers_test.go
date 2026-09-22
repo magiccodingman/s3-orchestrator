@@ -3,7 +3,7 @@
 //
 // Author: Alex Freidah
 //
-// Pure-function coverage for objectFromEnc and displacedFromExisting.
+// Pure-function coverage for objectFromStoredForm and displacedFromExisting.
 // Engine adapters lean on these helpers when translating between the
 // canonical core domain types and the engine-specific row shapes; the
 // behaviors must hold for every code path independently of the engine.
@@ -14,20 +14,21 @@ package core
 import (
 	"context"
 	"errors"
+	"slices"
 	"sync"
 	"testing"
 )
 
 // -------------------------------------------------------------------------
-// objectFromEnc
+// objectFromStoredForm
 // -------------------------------------------------------------------------
 
-// TestObjectFromEnc_NilEnc verifies a nil EncryptionMeta yields an
+// TestObjectFromStoredForm_NilForm verifies a nil StoredForm yields an
 // ObjectLocation with the zero value for every encryption-related
 // field.
-func TestObjectFromEnc_NilEnc(t *testing.T) {
+func TestObjectFromStoredForm_NilForm(t *testing.T) {
 	t.Parallel()
-	loc := objectFromEnc("k", "b1", 100, nil)
+	loc := objectFromStoredForm("k", "b1", 100, nil, nil)
 	if loc == nil {
 		t.Fatal("expected non-nil ObjectLocation")
 	}
@@ -35,22 +36,22 @@ func TestObjectFromEnc_NilEnc(t *testing.T) {
 		t.Errorf("required fields not preserved: %+v", loc)
 	}
 	if loc.Encrypted || loc.EncryptionKey != nil || loc.KeyID != "" || loc.PlaintextSize != 0 || loc.ContentHash != "" {
-		t.Errorf("encryption fields not zeroed for nil enc: %+v", loc)
+		t.Errorf("encryption fields not zeroed for nil form: %+v", loc)
 	}
 }
 
-// TestObjectFromEnc_EncryptedFields verifies an encrypted location
+// TestObjectFromStoredForm_EncryptedFields verifies an encrypted location
 // carries every encryption attribute end-to-end.
-func TestObjectFromEnc_EncryptedFields(t *testing.T) {
+func TestObjectFromStoredForm_EncryptedFields(t *testing.T) {
 	t.Parallel()
-	enc := &EncryptionMeta{
+	form := &StoredForm{
 		Encrypted:     true,
 		EncryptionKey: []byte("packed"),
 		KeyID:         "kid-1",
 		PlaintextSize: 90,
 		ContentHash:   "abc",
 	}
-	loc := objectFromEnc("k", "b1", 100, enc)
+	loc := objectFromStoredForm("k", "b1", 100, form, nil)
 	if !loc.Encrypted || loc.KeyID != "kid-1" || loc.PlaintextSize != 90 || loc.ContentHash != "abc" {
 		t.Errorf("encryption fields not preserved: %+v", loc)
 	}
@@ -59,15 +60,12 @@ func TestObjectFromEnc_EncryptedFields(t *testing.T) {
 	}
 }
 
-// TestObjectFromEnc_HashOnly verifies that an integrity-only PUT
-// (encryption disabled, content hash present) still copies the hash
-// across is a no-op stub on quotaTxStub so the type satisfies the
-// full TxAdapter interface; only the quota-touching methods carry
-// real test fixtures.
-func TestObjectFromEnc_HashOnly(t *testing.T) {
+// TestObjectFromStoredForm_HashOnly verifies that an integrity-only PUT
+// (encryption disabled, content hash present) still copies the hash across.
+func TestObjectFromStoredForm_HashOnly(t *testing.T) {
 	t.Parallel()
-	enc := &EncryptionMeta{ContentHash: "abc123"}
-	loc := objectFromEnc("k", "b1", 100, enc)
+	form := &StoredForm{ContentHash: "abc123"}
+	loc := objectFromStoredForm("k", "b1", 100, form, nil)
 	if loc.Encrypted {
 		t.Error("Encrypted = true, want false")
 	}
@@ -76,14 +74,14 @@ func TestObjectFromEnc_HashOnly(t *testing.T) {
 	}
 }
 
-// TestObjectFromEnc_PlaintextOnlyEncMetaWithoutEncryption verifies
-// that a non-nil EncryptionMeta with Encrypted=false and no hash
-// produces the same shape as a nil EncryptionMeta.
-func TestObjectFromEnc_PlaintextOnlyEncMetaWithoutEncryption(t *testing.T) {
+// TestObjectFromStoredForm_PlaintextFormWithoutEncryption verifies
+// that a non-nil StoredForm with Encrypted=false and no hash
+// produces the same shape as a nil StoredForm.
+func TestObjectFromStoredForm_PlaintextFormWithoutEncryption(t *testing.T) {
 	t.Parallel()
-	loc := objectFromEnc("k", "b1", 100, &EncryptionMeta{})
+	loc := objectFromStoredForm("k", "b1", 100, &StoredForm{}, nil)
 	if loc.Encrypted || loc.EncryptionKey != nil || loc.ContentHash != "" {
-		t.Errorf("plaintext meta did not yield zero encryption fields: %+v", loc)
+		t.Errorf("plaintext form did not yield zero encryption fields: %+v", loc)
 	}
 }
 
@@ -95,11 +93,11 @@ func TestObjectFromEnc_PlaintextOnlyEncMetaWithoutEncryption(t *testing.T) {
 // returns nil rather than an allocated zero-length slice.
 func TestDisplacedFromExisting_EmptyInput(t *testing.T) {
 	t.Parallel()
-	got := displacedFromExisting(nil, "b1")
+	got := displacedFromExisting(nil, []string{"b1"})
 	if got != nil {
 		t.Errorf("expected nil for empty input, got %+v", got)
 	}
-	got = displacedFromExisting([]ExistingCopy{}, "b1")
+	got = displacedFromExisting([]ExistingCopy{}, []string{"b1"})
 	if got != nil {
 		t.Errorf("expected nil for empty slice, got %+v", got)
 	}
@@ -113,9 +111,25 @@ func TestDisplacedFromExisting_AllOnNewBackend(t *testing.T) {
 	existing := []ExistingCopy{
 		{BackendName: "b1", SizeBytes: 100},
 	}
-	got := displacedFromExisting(existing, "b1")
+	got := displacedFromExisting(existing, []string{"b1"})
 	if got != nil {
 		t.Errorf("expected nil when every copy is on the target backend, got %+v", got)
+	}
+}
+
+// TestDisplacedFromExisting_SeveralNewBackends verifies that a write landing on
+// more than one backend excludes every one of them, so its own copies are not
+// reported as displaced by each other.
+func TestDisplacedFromExisting_SeveralNewBackends(t *testing.T) {
+	t.Parallel()
+	existing := []ExistingCopy{
+		{BackendName: "b1", SizeBytes: 100},
+		{BackendName: "b2", SizeBytes: 200},
+		{BackendName: "b3", SizeBytes: 300},
+	}
+	got := displacedFromExisting(existing, []string{"b1", "b2"})
+	if len(got) != 1 || got[0].BackendName != "b3" {
+		t.Errorf("expected only b3 displaced, got %+v", got)
 	}
 }
 
@@ -129,7 +143,7 @@ func TestDisplacedFromExisting_OtherBackends(t *testing.T) {
 		{BackendName: "b2", SizeBytes: 200}, // becomes orphan
 		{BackendName: "b3", SizeBytes: 300}, // becomes orphan
 	}
-	got := displacedFromExisting(existing, "b1")
+	got := displacedFromExisting(existing, []string{"b1"})
 	if len(got) != 2 {
 		t.Fatalf("expected 2 displaced copies, got %d", len(got))
 	}
@@ -150,9 +164,7 @@ func TestDisplacedFromExisting_OtherBackends(t *testing.T) {
 // -------------------------------------------------------------------------
 
 // TestGroupByKey_EmptySlice verifies the empty-slice case returns an
-// empty is a no-op stub on quotaTxStub so the type satisfies the
-// full TxAdapter interface; only the quota-touching methods carry
-// real test fixtures.
+// empty map, so callers can range over the result without a nil check.
 func TestGroupByKey_EmptySlice(t *testing.T) {
 	t.Parallel()
 	got := GroupByKey(nil)
@@ -161,9 +173,8 @@ func TestGroupByKey_EmptySlice(t *testing.T) {
 	}
 }
 
-// TestGroupByKey_SingleKeySingleCopy is a no-op stub on quotaTxStub so the type satisfies the
-// full TxAdapter interface; only the quota-touching methods carry
-// real test fixtures.
+// TestGroupByKey_SingleKeySingleCopy verifies one key holding one copy
+// groups into a single bucket carrying that copy.
 func TestGroupByKey_SingleKeySingleCopy(t *testing.T) {
 	t.Parallel()
 	got := GroupByKey([]ObjectLocation{{ObjectKey: "k", BackendName: "b1"}})
@@ -197,267 +208,370 @@ func TestGroupByKey_MultipleKeysAndReplicas(t *testing.T) {
 // applyQuotaDeltas - #687 deadlock regression
 // -------------------------------------------------------------------------
 
-// quotaTxStub is the minimal TxAdapter implementation needed to drive
-// applyQuotaDeltas. Every method other than Increment/DecrementBackendQuota
-// returns the zero value or nil; only the two quota mutators are
-// instrumented to record call order so tests can assert lock-acquisition
-// sequence.
+// quotaTxStub is the TxAdapter implementation the quota, tag and stored-form
+// tests drive. Everything it does not name comes from the embedded
+// noopTxAdapter; the quota mutators record call order so tests can assert the
+// lock-acquisition sequence.
 type quotaTxStub struct {
+	noopTxAdapter
+
 	mu      sync.Mutex
 	ops     []quotaOp
 	failOn  string
 	failErr error
+
+	tagsCleared    []string
+	tagKeysCleared [][]string
+	tagsInserted   []Tag
+	tagClearErr    error
+	tagInsertErr   error
+	keyLockErr     error
+	existingCopies []ExistingCopy
+	existingErr    error
+	pendingCleanup bool
+	pendingErr     error
+	importedLoc    *ObjectLocation
+
+	adjustments []quotaOp
+	adjustErr   error
+	compressed  []CompressedUpdate
+	encrypted   []markedCopy
+	decrypted   []markedCopy
+	formErr     error
+	copySize    int64
+	copySizeErr error
 }
 
-// quotaOp is a no-op stub on quotaTxStub so the type satisfies the
-// full TxAdapter interface; only the quota-touching methods carry
-// real test fixtures.
+// markedCopy is one recorded stored-form rewrite: which copy it touched and
+// the size it left behind.
+type markedCopy struct {
+	objectKey   string
+	backendName string
+	sizeBytes   int64
+}
+
+// storedCopy is the seed a tag test uses to say the object exists, since the
+// tagging operations refuse a key that holds nothing.
+func storedCopy() []ExistingCopy {
+	return []ExistingCopy{{BackendName: "b1", SizeBytes: 100}}
+}
+
+// quotaOp is one recorded quota mutation. The sign carries the caller's
+// intent rather than the SQL direction, so a test can assert the order the
+// backends were touched in without decoding which method produced each entry.
 type quotaOp struct {
 	backend string
 	delta   int64 // positive=increment, negative=decrement (mirrors caller intent)
 }
 
-// IncrementBackendQuota is a no-op stub on quotaTxStub so the type satisfies the
-// full TxAdapter interface; only the quota-touching methods carry
-// real test fixtures.
-func (t *quotaTxStub) IncrementBackendQuota(_ context.Context, backend string, delta int64) error {
+// AdjustQuotaStripe records the signed delta and honours the failure hooks. It
+// is the only instrumented quota mutator, so it feeds both views the tests read
+// from: ops carries the call order the flush's deadlock regression asserts on,
+// adjustments carries the deltas the stored-form rewrite tests assert on. The
+// stripe is deliberately not recorded - which row a charge lands on is the
+// engine's business, and pinning it here would fail the moment the hash changes.
+func (t *quotaTxStub) AdjustQuotaStripe(_ context.Context, backend string, _ int16, delta int64) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if t.adjustErr != nil {
+		return t.adjustErr
+	}
 	if backend == t.failOn {
 		return t.failErr
 	}
-	t.ops = append(t.ops, quotaOp{backend: backend, delta: delta})
+	op := quotaOp{backend: backend, delta: delta}
+	t.ops = append(t.ops, op)
+	t.adjustments = append(t.adjustments, op)
 	return nil
 }
 
-// DecrementBackendQuota is a no-op stub on quotaTxStub so the type satisfies the
-// full TxAdapter interface; only the quota-touching methods carry
-// real test fixtures.
-func (t *quotaTxStub) DecrementBackendQuota(_ context.Context, backend string, delta int64) error {
+// UpdateCompressedForm records the compressed form the rewrite wrote.
+func (t *quotaTxStub) UpdateCompressedForm(_ context.Context, u *CompressedUpdate) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if backend == t.failOn {
-		return t.failErr
+	if t.formErr != nil {
+		return t.formErr
 	}
-	t.ops = append(t.ops, quotaOp{backend: backend, delta: -delta})
+	t.compressed = append(t.compressed, *u)
 	return nil
 }
 
-// AllBackendBytesUsed is a no-op stub on quotaTxStub; usage reconciliation
-// is exercised by the dedicated stub in usage_test.go.
-func (*quotaTxStub) AllBackendBytesUsed(context.Context) (map[string]int64, error) {
-	return nil, nil
-}
-
-// SumObjectSizesByBackend is a no-op stub on quotaTxStub.
-func (*quotaTxStub) SumObjectSizesByBackend(context.Context) (map[string]int64, error) {
-	return nil, nil
-}
-
-// SetBackendBytesUsed is a no-op stub on quotaTxStub.
-func (*quotaTxStub) SetBackendBytesUsed(context.Context, string, int64) error { return nil }
-
-// The remaining TxAdapter methods are unused by applyQuotaDeltas; stubs
-// return zero values so the type satisfies the full interface.
-// AcquireKeyLock is a no-op stub on quotaTxStub so the type satisfies the
-// full TxAdapter interface; only the quota-touching methods carry
-// real test fixtures.
-// AcquireKeyLock is a no-op stub on quotaTxStub so the type satisfies the
-// full TxAdapter interface; only the quota-touching methods carry
-// real test fixtures.
-func (*quotaTxStub) AcquireKeyLock(context.Context, string) error { return nil }
-
-// ClaimPending is a no-op stub on quotaTxStub so the type satisfies the
-// full TxAdapter interface; only the quota-touching methods carry
-// real test fixtures.
-func (*quotaTxStub) ClaimPending(context.Context, string) (bool, error) { return false, nil }
-// InsertPending is a no-op stub on quotaTxStub so the type satisfies the
-// full TxAdapter interface; only the quota-touching methods carry
-// real test fixtures.
-func (*quotaTxStub) InsertPending(context.Context, *PendingObject) error { return nil }
-// DeletePending is a no-op stub on quotaTxStub so the type satisfies the
-// full TxAdapter interface; only the quota-touching methods carry
-// real test fixtures.
-func (*quotaTxStub) DeletePending(context.Context, string) error         { return nil }
-// DeletePendingByBackend is a no-op stub on quotaTxStub so the type satisfies the
-// full TxAdapter interface; only the quota-touching methods carry
-// real test fixtures.
-func (*quotaTxStub) DeletePendingByBackend(context.Context, string) error {
+// MarkCopyEncrypted records the copy the encrypt pass rewrote.
+func (t *quotaTxStub) MarkCopyEncrypted(_ context.Context, u *EncryptedUpdate) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.formErr != nil {
+		return t.formErr
+	}
+	t.encrypted = append(t.encrypted, markedCopy{u.ObjectKey, u.BackendName, u.CiphertextSize})
 	return nil
 }
 
-// GetExistingCopiesForUpdate is a no-op stub on quotaTxStub so the type satisfies the
-// full TxAdapter interface; only the quota-touching methods carry
-// real test fixtures.
-func (*quotaTxStub) GetExistingCopiesForUpdate(context.Context, string) ([]ExistingCopy, error) {
-	return nil, nil
-}
-// InsertObjectLocation is a no-op stub on quotaTxStub so the type satisfies the
-// full TxAdapter interface; only the quota-touching methods carry
-// real test fixtures.
-func (*quotaTxStub) InsertObjectLocation(context.Context, *ObjectLocation) error { return nil }
-// DeleteObjectCopies is a no-op stub on quotaTxStub so the type satisfies the
-// full TxAdapter interface; only the quota-touching methods carry
-// real test fixtures.
-func (*quotaTxStub) DeleteObjectCopies(context.Context, string) error            { return nil }
-// GetCopiesForKeysForUpdate is a no-op stub on quotaTxStub so the type satisfies the
-// full TxAdapter interface; only the quota-touching methods carry
-// real test fixtures.
-func (*quotaTxStub) GetCopiesForKeysForUpdate(context.Context, []string) ([]KeyedExistingCopy, error) {
-	return nil, nil
-}
-// DeleteObjectsByKeys is a no-op stub on quotaTxStub so the type satisfies the
-// full TxAdapter interface; only the quota-touching methods carry
-// real test fixtures.
-func (*quotaTxStub) DeleteObjectsByKeys(context.Context, []string) error { return nil }
-// CheckObjectExistsOnBackend is a no-op stub on quotaTxStub so the type satisfies the
-// full TxAdapter interface; only the quota-touching methods carry
-// real test fixtures.
-func (*quotaTxStub) CheckObjectExistsOnBackend(context.Context, string, string) (bool, error) {
-	return false, nil
-}
-// LockObjectOnBackend is a no-op stub on quotaTxStub so the type satisfies the
-// full TxAdapter interface; only the quota-touching methods carry
-// real test fixtures.
-func (*quotaTxStub) LockObjectOnBackend(context.Context, string, string) (*ObjectLocation, bool, error) {
-	return nil, false, nil
-}
-// DeleteObjectFromBackend is a no-op stub on quotaTxStub so the type satisfies the
-// full TxAdapter interface; only the quota-touching methods carry
-// real test fixtures.
-func (*quotaTxStub) DeleteObjectFromBackend(context.Context, string, string) error { return nil }
-// InsertObjectLocationIfNotExists is a no-op stub on quotaTxStub so the type satisfies the
-// full TxAdapter interface; only the quota-touching methods carry
-// real test fixtures.
-func (*quotaTxStub) InsertObjectLocationIfNotExists(context.Context, *ObjectLocation) (bool, error) {
-	return false, nil
-}
-// InsertReplicaConditional is a no-op stub on quotaTxStub so the type satisfies the
-// full TxAdapter interface; only the quota-touching methods carry
-// real test fixtures.
-func (*quotaTxStub) InsertReplicaConditional(context.Context, string, string, string) (int64, bool, error) {
-	return 0, false, nil
+// MarkCopyDecrypted records the copy the decrypt pass rewrote.
+func (t *quotaTxStub) MarkCopyDecrypted(_ context.Context, u *DecryptedUpdate) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.formErr != nil {
+		return t.formErr
+	}
+	t.decrypted = append(t.decrypted, markedCopy{u.ObjectKey, u.BackendName, u.PlaintextSize})
+	return nil
 }
 
-// SumAndDeleteCleanupQueueRows is a no-op stub on quotaTxStub so the type satisfies the
-// full TxAdapter interface; only the quota-touching methods carry
-// real test fixtures.
-func (*quotaTxStub) SumAndDeleteCleanupQueueRows(context.Context, string, string) (int64, int64, error) {
-	return 0, 0, nil
+// GetCopySizeBytes returns the size the decrypt pass reads before it
+// overwrites the row.
+func (t *quotaTxStub) GetCopySizeBytes(context.Context, string, string) (int64, error) {
+	return t.copySize, t.copySizeErr
 }
+
+// InsertObjectTag records the tag so replace-semantics tests can assert what
+// was written after the preceding clear.
+func (t *quotaTxStub) InsertObjectTag(_ context.Context, _, tagKey, tagValue string) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.tagInsertErr != nil {
+		return t.tagInsertErr
+	}
+	t.tagsInserted = append(t.tagsInserted, Tag{Key: tagKey, Value: tagValue})
+	return nil
+}
+
+// DeleteObjectTags records which keys had their tags cleared, which is what
+// the cascade tests assert on.
+func (t *quotaTxStub) DeleteObjectTags(_ context.Context, objectKey string) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.tagClearErr != nil {
+		return t.tagClearErr
+	}
+	t.tagsCleared = append(t.tagsCleared, objectKey)
+	return nil
+}
+
+// DeleteObjectTagsForKeys records the batch clear as one call so a test can
+// tell it apart from a loop of single clears.
+func (t *quotaTxStub) DeleteObjectTagsForKeys(_ context.Context, objectKeys []string) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.tagClearErr != nil {
+		return t.tagClearErr
+	}
+	t.tagKeysCleared = append(t.tagKeysCleared, slices.Clone(objectKeys))
+	return nil
+}
+
+// AcquireKeyLock reports the seeded lock error; the tag paths take the lock
+// before they write, and one test makes that fail.
+func (t *quotaTxStub) AcquireKeyLock(context.Context, string) error { return t.keyLockErr }
+
+// GetExistingCopiesForUpdate returns the seeded copy set, which is how a test
+// says whether the key holds anything.
+func (t *quotaTxStub) GetExistingCopiesForUpdate(context.Context, string) ([]ExistingCopy, error) {
+	return t.existingCopies, t.existingErr
+}
+
 // GetCleanupQueueRow is a no-op stub on quotaTxStub so the type satisfies the
 // full TxAdapter interface; only the quota-touching methods carry
 // real test fixtures.
 func (*quotaTxStub) GetCleanupQueueRow(context.Context, int64) (CleanupQueueRow, error) {
 	return CleanupQueueRow{}, nil
 }
+
 // InsertCleanupDLQ is a no-op stub on quotaTxStub so the type satisfies the
 // full TxAdapter interface; only the quota-touching methods carry
 // real test fixtures.
 func (*quotaTxStub) InsertCleanupDLQ(context.Context, *CleanupQueueRow) error { return nil }
+
 // DeleteCleanupItem is a no-op stub on quotaTxStub so the type satisfies the
 // full TxAdapter interface; only the quota-touching methods carry
 // real test fixtures.
-func (*quotaTxStub) DeleteCleanupItem(context.Context, int64) error           { return nil }
+func (*quotaTxStub) DeleteCleanupItem(context.Context, int64) error { return nil }
+
+// HasPendingCleanup reports whatever the fixture was primed with, so an import
+// can be driven down the ordinary path, the suppressed path, or the error path.
+func (s *quotaTxStub) HasPendingCleanup(context.Context, string, string) (bool, error) {
+	return s.pendingCleanup, s.pendingErr
+}
+
+// InsertObjectLocationIfNotExists records the row an import built so a test can
+// assert on the timestamp it carried, and reports it as newly inserted.
+func (s *quotaTxStub) InsertObjectLocationIfNotExists(_ context.Context, loc *ObjectLocation) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	captured := *loc
+	s.importedLoc = &captured
+	return true, nil
+}
+
 // DecrementOrphanBytes is a no-op stub on quotaTxStub so the type satisfies the
 // full TxAdapter interface; only the quota-touching methods carry
 // real test fixtures.
 func (*quotaTxStub) DecrementOrphanBytes(context.Context, string, int64) error { return nil }
 
-// TestApplyQuotaDeltas_StableOrderAcrossInputs runs applyQuotaDeltas
-// against the same backend set with two different map insertion orders
-// (Go map iteration is non-deterministic) and asserts both calls
-// produce the same sorted-by-backend-name SQL sequence. This is the
-// invariant that prevents the #687 deadlock: any two transactions that
-// touch the same backend set request locks in identical order.
-func TestApplyQuotaDeltas_StableOrderAcrossInputs(t *testing.T) {
+// TestChargeStripes_StableOrderAcrossInputs charges the same backend set with
+// two different map insertion orders (Go map iteration is non-deterministic)
+// and asserts both produce the same sorted-by-backend-name sequence. This is
+// the invariant that prevents the #687 deadlock: any two transactions touching
+// the same backend set request the rows in identical order.
+func TestChargeStripes_StableOrderAcrossInputs(t *testing.T) {
 	t.Parallel()
-	deltasA := map[string]int64{"minio-3": -100, "minio-1": -50, "minio-2": -75}
-	deltasB := map[string]int64{"minio-2": -75, "minio-3": -100, "minio-1": -50}
+	deltasA := QuotaDeltas{"minio-3": -100, "minio-1": -50, "minio-2": -75}
+	deltasB := QuotaDeltas{"minio-2": -75, "minio-3": -100, "minio-1": -50}
 
 	txA := &quotaTxStub{}
 	txB := &quotaTxStub{}
-	if err := applyQuotaDeltas(context.Background(), txA, deltasA); err != nil {
-		t.Fatalf("applyQuotaDeltas A: %v", err)
+	if err := chargeStripes(context.Background(), txA, "bucket/key", deltasA); err != nil {
+		t.Fatalf("chargeStripes A: %v", err)
 	}
-	if err := applyQuotaDeltas(context.Background(), txB, deltasB); err != nil {
-		t.Fatalf("applyQuotaDeltas B: %v", err)
+	if err := chargeStripes(context.Background(), txB, "bucket/key", deltasB); err != nil {
+		t.Fatalf("chargeStripes B: %v", err)
 	}
-	if len(txA.ops) != 3 || len(txB.ops) != 3 {
-		t.Fatalf("expected 3 ops each, got A=%d B=%d", len(txA.ops), len(txB.ops))
+	if len(txA.adjustments) != 3 || len(txB.adjustments) != 3 {
+		t.Fatalf("expected 3 ops each, got A=%d B=%d", len(txA.adjustments), len(txB.adjustments))
 	}
-	for i := range txA.ops {
-		if txA.ops[i] != txB.ops[i] {
-			t.Errorf("op %d diverged: A=%+v B=%+v", i, txA.ops[i], txB.ops[i])
+	for i := range txA.adjustments {
+		if txA.adjustments[i] != txB.adjustments[i] {
+			t.Errorf("op %d diverged: A=%+v B=%+v", i, txA.adjustments[i], txB.adjustments[i])
 		}
 	}
 	want := []string{"minio-1", "minio-2", "minio-3"}
 	for i, w := range want {
-		if txA.ops[i].backend != w {
-			t.Errorf("op[%d].backend = %q, want %q (sorted backend_name)", i, txA.ops[i].backend, w)
+		if txA.adjustments[i].backend != w {
+			t.Errorf("op[%d].backend = %q, want %q (sorted backend_name)", i, txA.adjustments[i].backend, w)
 		}
 	}
 }
 
-// TestApplyQuotaDeltas_PositiveAndNegative verifies signed deltas route
-// correctly: positive -> Increment, negative -> Decrement, zero ->
-// skipped (so net-zero same-backend overwrites produce no SQL call).
-func TestApplyQuotaDeltas_PositiveAndNegative(t *testing.T) {
+// TestChargeStripes_SignedAndZero verifies the deltas reach the store with
+// their sign intact and that a zero delta produces no statement, so a backend
+// whose credits and debits cancelled out costs no row lock.
+func TestChargeStripes_SignedAndZero(t *testing.T) {
 	t.Parallel()
 	tx := &quotaTxStub{}
-	deltas := map[string]int64{
+	deltas := QuotaDeltas{
 		"a": -100,
 		"b": 200,
 		"c": 0,
 		"d": -50,
 	}
-	if err := applyQuotaDeltas(context.Background(), tx, deltas); err != nil {
-		t.Fatalf("applyQuotaDeltas: %v", err)
+	if err := chargeStripes(context.Background(), tx, "bucket/key", deltas); err != nil {
+		t.Fatalf("chargeStripes: %v", err)
 	}
 	want := []quotaOp{
 		{backend: "a", delta: -100},
 		{backend: "b", delta: 200},
 		{backend: "d", delta: -50},
 	}
-	if len(tx.ops) != len(want) {
-		t.Fatalf("ops = %d, want %d (zero delta should be skipped)", len(tx.ops), len(want))
+	if len(tx.adjustments) != len(want) {
+		t.Fatalf("ops = %d, want %d (zero delta should be skipped)", len(tx.adjustments), len(want))
 	}
 	for i, w := range want {
-		if tx.ops[i] != w {
-			t.Errorf("op[%d] = %+v, want %+v", i, tx.ops[i], w)
+		if tx.adjustments[i] != w {
+			t.Errorf("op[%d] = %+v, want %+v", i, tx.adjustments[i], w)
 		}
 	}
 }
 
-// TestApplyQuotaDeltas_PropagatesError verifies the helper short-circuits
-// on the first SQL error and surfaces it to the caller.
-func TestApplyQuotaDeltas_PropagatesError(t *testing.T) {
+// TestChargeStripes_PropagatesError verifies the charge short-circuits on the
+// first SQL error and surfaces it, which is what rolls the whole transaction
+// back rather than committing the rows without the bytes.
+func TestChargeStripes_PropagatesError(t *testing.T) {
 	t.Parallel()
 	want := errors.New("simulated DB error")
 	tx := &quotaTxStub{failOn: "b", failErr: want}
-	deltas := map[string]int64{"a": 10, "b": 20, "c": 30}
-	err := applyQuotaDeltas(context.Background(), tx, deltas)
+	deltas := QuotaDeltas{"a": 10, "b": 20, "c": 30}
+	err := chargeStripes(context.Background(), tx, "bucket/key", deltas)
 	if !errors.Is(err, want) {
 		t.Errorf("err = %v, want wrap of %v", err, want)
 	}
-	if len(tx.ops) != 1 || tx.ops[0].backend != "a" {
-		t.Errorf("expected single op on 'a' before failure, got %+v", tx.ops)
+	if len(tx.adjustments) != 1 || tx.adjustments[0].backend != "a" {
+		t.Errorf("expected single op on 'a' before failure, got %+v", tx.adjustments)
 	}
 }
 
-// TestApplyQuotaDeltas_EmptyMap verifies the no-op path: an empty map
-// (and a nil map) both produce zero SQL calls and no error.
-func TestApplyQuotaDeltas_EmptyMap(t *testing.T) {
+// TestChargeStripes_EmptyMap verifies the no-op path: an empty map and a nil
+// map both issue no statement, so a mutation that moved no bytes costs nothing.
+func TestChargeStripes_EmptyMap(t *testing.T) {
 	t.Parallel()
 	tx := &quotaTxStub{}
-	if err := applyQuotaDeltas(context.Background(), tx, nil); err != nil {
+	if err := chargeStripes(context.Background(), tx, "bucket/key", nil); err != nil {
 		t.Errorf("nil map err = %v, want nil", err)
 	}
-	if err := applyQuotaDeltas(context.Background(), tx, map[string]int64{}); err != nil {
+	if err := chargeStripes(context.Background(), tx, "bucket/key", QuotaDeltas{}); err != nil {
 		t.Errorf("empty map err = %v, want nil", err)
 	}
-	if len(tx.ops) != 0 {
-		t.Errorf("expected no ops, got %+v", tx.ops)
+	if len(tx.adjustments) != 0 {
+		t.Errorf("expected no ops, got %+v", tx.adjustments)
 	}
 }
 
+// TestChargeStripes_KeySelectsTheStripe asserts every backend in one mutation
+// is charged on the same stripe - the one the key selects - and that a
+// different key selects a different row. Charges for one object meeting on one
+// row is what lets its later credit cancel them exactly.
+func TestChargeStripes_KeySelectsTheStripe(t *testing.T) {
+	t.Parallel()
+	tx := &stripeRecordingTxStub{}
+	deltas := QuotaDeltas{"a": 100, "b": 100}
+	if err := chargeStripes(context.Background(), tx, "bucket/one", deltas); err != nil {
+		t.Fatalf("chargeStripes: %v", err)
+	}
+	if len(tx.stripes) != 2 || tx.stripes[0] != tx.stripes[1] {
+		t.Errorf("stripes = %v, want both backends on the key's single stripe", tx.stripes)
+	}
+	if want := StripeFor("bucket/one"); tx.stripes[0] != want {
+		t.Errorf("stripe = %d, want %d from the key", tx.stripes[0], want)
+	}
+}
+
+// stripeRecordingTxStub captures which stripe each charge landed on, which the
+// shared quotaTxStub deliberately discards.
+type stripeRecordingTxStub struct {
+	noopTxAdapter
+	stripes []int16
+}
+
+func (s *stripeRecordingTxStub) AdjustQuotaStripe(_ context.Context, _ string, stripe int16, _ int64) error {
+	s.stripes = append(s.stripes, stripe)
+	return nil
+}
+
+// TestValidateEncryptionMetadata covers every self-consistency rule the read
+// path relies on, in both directions: a row that describes bytes it cannot
+// actually produce is rejected, a coherent row of either kind is accepted.
+func TestValidateEncryptionMetadata(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		loc     *ObjectLocation
+		wantErr bool
+	}{
+		{"nil location is unmanaged, not contradictory", nil, false},
+		{"plain row with no key", &ObjectLocation{SizeBytes: 10}, false},
+		{"plain row still carrying a key", &ObjectLocation{SizeBytes: 10, EncryptionKey: []byte("k")}, true},
+		{"encrypted row with key and plaintext size",
+			&ObjectLocation{SizeBytes: 100, Encrypted: true, EncryptionKey: []byte("k"), PlaintextSize: 25}, false},
+		{"encrypted row with no key",
+			&ObjectLocation{SizeBytes: 100, Encrypted: true, PlaintextSize: 25}, true},
+		{"encrypted row with no plaintext size",
+			&ObjectLocation{SizeBytes: 100, Encrypted: true, EncryptionKey: []byte("k")}, true},
+		{"encrypted empty object stores a bare header and no plaintext",
+			&ObjectLocation{Encrypted: true, EncryptionKey: []byte("k"), SizeBytes: 32}, false},
+		{"encrypted row with chunks but no plaintext size lost it",
+			&ObjectLocation{Encrypted: true, EncryptionKey: []byte("k"), SizeBytes: 4096}, true},
+		{"encrypted row with a negative plaintext size",
+			&ObjectLocation{Encrypted: true, EncryptionKey: []byte("k"), SizeBytes: 4096, PlaintextSize: -1}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			err := ValidateEncryptionMetadata(tt.loc)
+			if tt.wantErr && !errors.Is(err, ErrEncryptionFlagMismatch) {
+				t.Errorf("expected ErrEncryptionFlagMismatch, got %v", err)
+			}
+			if !tt.wantErr && err != nil {
+				t.Errorf("expected no error, got %v", err)
+			}
+		})
+	}
+}

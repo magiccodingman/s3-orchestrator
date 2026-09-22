@@ -17,6 +17,31 @@ import (
 	"testing"
 )
 
+// -------------------------------------------------------------------------
+// INTERNALS
+// -------------------------------------------------------------------------
+
+// parseSigV4Fields is the differential oracle for parseSigV4FieldsDirect: an
+// independent, map-building implementation of the same grammar. Production uses
+// only the direct parser; this one exists so the fuzz below can assert the two
+// agree on arbitrary input. Keep it deliberately naive - its value is being
+// written differently from the code under test.
+func parseSigV4Fields(s string) map[string]string {
+	fields := make(map[string]string)
+	for part := range strings.SplitSeq(s, ",") {
+		part = strings.TrimSpace(part)
+		idx := strings.IndexByte(part, '=')
+		if idx > 0 {
+			fields[part[:idx]] = part[idx+1:]
+		}
+	}
+	return fields
+}
+
+// -------------------------------------------------------------------------
+// PUBLIC API
+// -------------------------------------------------------------------------
+
 // FuzzParseSigV4Fields fuzzes the parse sig v4 fields contract.
 // Asserts that Credential mismatch: direct= map=.
 func FuzzParseSigV4Fields(f *testing.F) {
@@ -135,6 +160,10 @@ func FuzzBuildPresignedCanonicalRequest(f *testing.F) {
 		assertNoSignatureInCanonicalQuery(t, result)
 	})
 }
+
+// -------------------------------------------------------------------------
+// INTERNALS
+// -------------------------------------------------------------------------
 
 // parseSignedHeaderList splits a semicolon-separated SignedHeaders fuzz
 // input into its constituent header names, dropping empty entries.

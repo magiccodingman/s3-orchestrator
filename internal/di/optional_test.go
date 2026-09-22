@@ -20,6 +20,10 @@ import (
 	"github.com/samber/do/v2"
 )
 
+// -------------------------------------------------------------------------
+// TYPES
+// -------------------------------------------------------------------------
+
 // optionalProbe is a simple service type used only in these tests; it
 // keeps the test independent of the rest of the package's wiring.
 type optionalProbe struct {
@@ -35,12 +39,16 @@ type optionalDep struct{}
 // identity.
 var errBoom = errors.New("boom")
 
+// -------------------------------------------------------------------------
+// PUBLIC API
+// -------------------------------------------------------------------------
+
 // TestOptional_Disabled confirms that with no provider registered for T,
 // Optional[T] reports Disabled, a zero value, and no error.
 func TestOptional_Disabled(t *testing.T) {
 	inj := do.New()
 	res := Optional[*optionalProbe](inj)
-	if !res.Disabled() {
+	if res.Resolution != ResolutionDisabled {
 		t.Fatalf("expected Disabled, got %s", res.Resolution)
 	}
 	if res.Value != nil {
@@ -59,7 +67,7 @@ func TestOptional_Applied(t *testing.T) {
 		return &optionalProbe{name: "ok"}, nil
 	})
 	res := Optional[*optionalProbe](inj)
-	if !res.Applied() {
+	if res.Resolution != ResolutionApplied {
 		t.Fatalf("expected Applied, got %s (err=%v)", res.Resolution, res.Err)
 	}
 	if res.Value == nil || res.Value.name != "ok" {
@@ -113,7 +121,7 @@ func TestOptional_FailedTransitiveDep(t *testing.T) {
 // nil injector in reduced run modes.
 func TestOptional_NilInjector(t *testing.T) {
 	res := Optional[*optionalProbe](nil)
-	if !res.Disabled() {
+	if res.Resolution != ResolutionDisabled {
 		t.Fatalf("expected Disabled, got %s", res.Resolution)
 	}
 }

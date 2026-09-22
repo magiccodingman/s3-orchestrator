@@ -22,10 +22,19 @@ CREATE TABLE IF NOT EXISTS schema_version (
 -- Track quota usage per backend.
 CREATE TABLE IF NOT EXISTS backend_quotas (
     backend_name TEXT PRIMARY KEY,
-    bytes_used   INTEGER NOT NULL DEFAULT 0,
     bytes_limit  INTEGER NOT NULL,
     orphan_bytes INTEGER NOT NULL DEFAULT 0,
     updated_at   TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+-- A backend's stored byte total, split across stripe rows so concurrent writers
+-- take different row locks. The total is the sum; an individual stripe is
+-- signed and carries no meaning on its own.
+CREATE TABLE IF NOT EXISTS backend_quota_stripes (
+    backend_name TEXT    NOT NULL REFERENCES backend_quotas(backend_name) ON DELETE CASCADE,
+    stripe_id    INTEGER NOT NULL,
+    bytes_used   INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (backend_name, stripe_id)
 );
 
 -- Track which backend stores which object (composite PK supports replication).
@@ -38,6 +47,28 @@ CREATE TABLE IF NOT EXISTS object_locations (
     key_id         TEXT,
     plaintext_size INTEGER,
     content_hash   TEXT,
+    managed        INTEGER NOT NULL DEFAULT 1,
+    -- NULL means never verified; the scrub queue falls back to created_at.
+    last_scrubbed_at TEXT,
+    -- NULL algorithm means the bytes are stored verbatim. logical_size is the
+    -- size the client wrote, which differs from plaintext_size once the stored
+    -- bytes are ciphertext of compressed data.
+    compression_algorithm      TEXT,
+    compression_level          TEXT,
+    compression_format_version INTEGER,
+    logical_size               INTEGER,
+    -- What the encoder produced for a copy it declined to store compressed, and
+    -- the level it produced it at. NULL means never probed. The uncompressed
+    -- listing judges these against the current settings so a copy already known
+    -- not to shrink enough is not downloaded and encoded again to find out.
+    compression_probe_size     INTEGER,
+    compression_probe_level    TEXT,
+    -- What a HEAD answers with, held here so every copy reports the same
+    -- validator and the backend round trip can be skipped. NULL means unknown,
+    -- which is distinct from a known-empty content type or metadata set.
+    etag           TEXT,
+    content_type   TEXT,
+    user_metadata  TEXT,
     created_at     TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     PRIMARY KEY (object_key, backend_name)
 );
@@ -51,8 +82,16 @@ CREATE INDEX IF NOT EXISTS idx_object_locations_key_pattern
 CREATE INDEX IF NOT EXISTS idx_object_locations_created
     ON object_locations(created_at);
 
+-- Backs the scrub queue: least recently touched first, so a freshly written
+-- copy sorts behind an old one that has gone unverified.
+CREATE INDEX IF NOT EXISTS idx_object_locations_scrub_queue
+    ON object_locations(COALESCE(last_scrubbed_at, created_at), object_key);
+
 CREATE INDEX IF NOT EXISTS idx_object_locations_key_created
     ON object_locations(object_key, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_object_locations_managed
+    ON object_locations(backend_name) WHERE managed;
 
 -- Track in-progress multipart uploads.
 CREATE TABLE IF NOT EXISTS multipart_uploads (
@@ -63,6 +102,7 @@ CREATE TABLE IF NOT EXISTS multipart_uploads (
     metadata       TEXT,
     encryption_key BLOB,
     key_id         TEXT,
+    tagging        TEXT,
     created_at     TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
@@ -85,6 +125,10 @@ CREATE TABLE IF NOT EXISTS multipart_parts (
     encryption_key BLOB,
     key_id         TEXT,
     plaintext_size INTEGER,
+    -- MD5 of the bytes the client sent for this part, which etag is not once
+    -- the stored part is ciphertext. The AWS multipart ETag is the MD5 of the
+    -- concatenated part digests, so it can only be built from these.
+    plaintext_etag TEXT,
     created_at     TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     PRIMARY KEY (upload_id, part_number)
 );
@@ -99,6 +143,21 @@ CREATE TABLE IF NOT EXISTS backend_usage (
     updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     PRIMARY KEY (backend_name, period)
 );
+
+-- Per-pool request counts, keyed by the pool names config declares. Additive
+-- with each other rather than a decomposition of backend_usage.api_requests:
+-- an operation charges every pool that contains it.
+CREATE TABLE IF NOT EXISTS backend_request_usage (
+    backend_name TEXT NOT NULL REFERENCES backend_quotas(backend_name),
+    period       TEXT NOT NULL,
+    pool         TEXT NOT NULL,
+    requests     INTEGER NOT NULL DEFAULT 0,
+    updated_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    PRIMARY KEY (backend_name, period, pool)
+);
+
+CREATE INDEX IF NOT EXISTS idx_backend_request_usage_period
+    ON backend_request_usage(period);
 
 -- Queue for retrying failed backend object deletions (orphan cleanup).
 CREATE TABLE IF NOT EXISTS cleanup_queue (
@@ -170,7 +229,19 @@ CREATE TABLE IF NOT EXISTS pending_objects (
     key_id         TEXT,
     plaintext_size INTEGER,
     content_hash   TEXT,
-    created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    compression_algorithm      TEXT,
+    compression_level          TEXT,
+    compression_format_version INTEGER,
+    logical_size               INTEGER,
+    -- Carried so a reaper-promoted intent keeps the identity the write knew.
+    etag           TEXT,
+    content_type   TEXT,
+    user_metadata  TEXT,
+    created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    -- A primary intent's promotion clears the key's other copies; a companion's
+    -- adds to them. Postgres carries a CHECK constraint on the allowed values;
+    -- SQLite cannot add one to an existing table, so the store enforces it.
+    role           TEXT NOT NULL DEFAULT 'primary'
 );
 
 CREATE INDEX IF NOT EXISTS idx_pending_objects_created
@@ -179,5 +250,69 @@ CREATE INDEX IF NOT EXISTS idx_pending_objects_created
 CREATE INDEX IF NOT EXISTS idx_pending_objects_backend
     ON pending_objects(backend_name);
 
+CREATE INDEX IF NOT EXISTS idx_pending_objects_key
+    ON pending_objects(object_key);
+
+-- S3 object tags, keyed by object rather than by copy so replicas of a key
+-- cannot disagree about the set. Rows rather than a JSON column because
+-- lifecycle expiry by tag filters on (tag_key, tag_value) and needs an index.
+-- No foreign key: nothing is keyed on object_key alone, so core clears these
+-- rows at every path that puts a new object at a key or removes its last copy.
+-- See migrations/0009_object_tags.sql for the full design notes.
+CREATE TABLE IF NOT EXISTS object_tags (
+    object_key TEXT NOT NULL,
+    tag_key    TEXT NOT NULL,
+    tag_value  TEXT NOT NULL,
+    PRIMARY KEY (object_key, tag_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_object_tags_lookup
+    ON object_tags(tag_key, tag_value);
+
+-- A database-backed set of buckets and the users that reach them, merged with
+-- what the config file declares when the bucket registry is assembled.
+-- Resolution runs the chain: an access key names a credential, a credential
+-- belongs to a user, and a user holds a grant per bucket it may reach. A grant
+-- carries no permission column, and its absence means full access.
+-- See migrations/0015_bucket_provisioning.sql for the full design notes.
+CREATE TABLE IF NOT EXISTS buckets (
+    name                  TEXT PRIMARY KEY,
+    max_multipart_uploads INTEGER NOT NULL DEFAULT 0,
+    cors                  TEXT,
+    created_at            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE TABLE IF NOT EXISTS users (
+    id         TEXT PRIMARY KEY,
+    name       TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE TABLE IF NOT EXISTS credentials (
+    access_key_id TEXT PRIMARY KEY,
+    user_id       TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+    secret        TEXT NOT NULL,
+    label         TEXT,
+    disabled      INTEGER NOT NULL DEFAULT 0,
+    created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    last_used_at  TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_credentials_user
+    ON credentials(user_id);
+
+-- A grant names a resource: a kind and a name. The kinds are bucket, backend and
+-- fleet, and fleet carries the empty name because there is only one of it. The
+-- kind is in the key so one user can hold a grant on a bucket and on a backend
+-- that happen to share a name.
+CREATE TABLE IF NOT EXISTS grants (
+    user_id       TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+    resource_kind TEXT NOT NULL DEFAULT 'bucket',
+    resource_name TEXT NOT NULL,
+    permissions   TEXT NOT NULL DEFAULT '',
+    created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    PRIMARY KEY (user_id, resource_kind, resource_name)
+);
+
 -- Stamp the schema version after all tables and indexes are created.
-INSERT INTO schema_version (version) VALUES (2);
+INSERT INTO schema_version (version) VALUES (18);

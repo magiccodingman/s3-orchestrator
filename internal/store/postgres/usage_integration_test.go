@@ -1,4 +1,4 @@
-// -----------------------------------------------------------------------------
+// -------------------------------------------------------------------------------
 // ReconcileUsage Quota Integration Test
 //
 // Author: Alex Freidah
@@ -7,7 +7,7 @@
 // SUM(object_locations.size_bytes) per backend. The counter is otherwise
 // incrementally maintained and drifts permanently if any mutation path misses
 // an adjustment; this is the operator-facing repair for that drift.
-// -----------------------------------------------------------------------------
+// -------------------------------------------------------------------------------
 
 //go:build integration
 
@@ -16,6 +16,8 @@ package postgres
 import (
 	"context"
 	"testing"
+
+	"github.com/afreidah/s3-orchestrator/internal/store/core"
 )
 
 // TestStoreInt_ReconcileUsage_CorrectsDrift records two objects so the ledger
@@ -26,10 +28,10 @@ func TestStoreInt_ReconcileUsage_CorrectsDrift(t *testing.T) {
 	s := adapterPgStore(t)
 	ctx := context.Background()
 
-	if _, err := s.RecordObject(ctx, uniqueKey(t, "recon-1"), "backend-a", 100, nil); err != nil {
+	if _, _, err := s.RecordObject(ctx, &core.RecordObjectRequest{Key: uniqueKey(t, "recon-1"), Copies: []core.ObjectCopy{{Backend: "backend-a"}}, Size: 100}); err != nil {
 		t.Fatalf("RecordObject: %v", err)
 	}
-	if _, err := s.RecordObject(ctx, uniqueKey(t, "recon-2"), "backend-a", 250, nil); err != nil {
+	if _, _, err := s.RecordObject(ctx, &core.RecordObjectRequest{Key: uniqueKey(t, "recon-2"), Copies: []core.ObjectCopy{{Backend: "backend-a"}}, Size: 250}); err != nil {
 		t.Fatalf("RecordObject: %v", err)
 	}
 
@@ -43,10 +45,17 @@ func TestStoreInt_ReconcileUsage_CorrectsDrift(t *testing.T) {
 	}
 
 	// Corrupt the counter to simulate the drift a degraded-backend cycle leaves
-	// behind, then reconcile back to truth.
+	// behind, then reconcile back to truth. The stripes are cleared first so
+	// the corrupted figure is the whole of what the counter reports, not the
+	// whole plus whatever earlier tests in the shared container left behind.
 	corrupted := truth + 99999
 	if _, err := s.pool.Exec(ctx,
-		`UPDATE backend_quotas SET bytes_used = $1 WHERE backend_name = 'backend-a'`, corrupted); err != nil {
+		`DELETE FROM backend_quota_stripes WHERE backend_name = 'backend-a'`); err != nil {
+		t.Fatalf("clear stripes: %v", err)
+	}
+	if _, err := s.pool.Exec(ctx,
+		`INSERT INTO backend_quota_stripes (backend_name, stripe_id, bytes_used) VALUES ('backend-a', 0, $1)`,
+		corrupted); err != nil {
 		t.Fatalf("corrupt bytes_used: %v", err)
 	}
 

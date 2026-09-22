@@ -1,5 +1,6 @@
 ---
 title: "Browsing Objects with the TUI"
+description: "Explore the object namespace from the terminal UI: see which backends hold each copy and check replication state without leaving the shell."
 weight: 8
 ---
 
@@ -12,50 +13,63 @@ A persistent left navigation bar switches between sections; the content area to 
 
 - **Files** - a hierarchical listing of the object namespace, one prefix at a time (directories collapse into common prefixes, just like `aws s3 ls`). Large prefixes page in as you scroll. Opening an object swaps the content area for the **Inspector**, which lists every backend copy of that object with its size, age, encryption status, key id, and content-hash prefix - the replica-placement view that makes multi-backend storage legible.
 - **Backends** - one row per configured backend with its circuit-breaker health, drain state, quota usage, object count, and per-period request and transfer counters.
+- **Replication** - the configured replication factor and the current under- and over-replicated object counts, refreshing on its own while the section is active.
+- **Workers** - each background service's last-tick health: last success, last failure, consecutive failure count, and last error. A service that runs but fails every tick is invisible in `/health`; this is where it shows up.
+- **Cleanup** - the cleanup queue and its dead-letter table, with the depth of each. The one write action here is requeueing a backend's dead-lettered rows.
+- **Cache** - the object data cache's entry count, bytes held against its maximum, and lifetime hit rate.
 - **Logs** - recent structured log entries from the instance's in-memory log buffer (the same source the web dashboard's logs pane reads): time, level, component, and a human-readable message with its attributes appended as `key=value` pairs.
+- **Ops** - the menu of instance-wide admin actions (rebalance, scrub, backfill, reconcile, cache flush), each behind a `y/N` confirmation.
 
 The pane that currently has keyboard focus renders with a bright title bar while the other is muted, so it is always clear whether keys drive the sidebar or the content.
 
-Everything is read-only. The TUI issues `GET` requests to the admin API (`/admin/api/objects` for the listing, `/admin/api/object-locations` for the inspector, `/admin/api/status` for backends) and never mutates state.
+Browsing is read-only: the listing, inspector, and every status pane issue `GET` requests to the admin API and never mutate state. The Ops menu and the Cleanup pane's requeue are the exceptions, and both ask before they act.
 
 ![The Files section listing a prefix of objects and sub-directories, with the navigation sidebar](/docs/images/tui-files.png?classes=lightbox)
 
 ## Prerequisites
 
-- A running orchestrator instance with the admin API enabled (`ui.admin_token`, or `ui.admin_key` as a fallback - see the [configuration walkthrough](../../docs/configuration.md)).
-- The admin token, resolved the same way as the [`admin` subcommand](../../docs/cli.md): flag, then environment, then config file.
+- A running orchestrator instance.
+- A keypair holding the control-plane permissions you want to use - the `auth.root` one, or a narrower credential the store has issued. See the [configuration walkthrough](../../docs/configuration/).
 
 ## Step 1: Point the TUI at your instance
 
-The TUI resolves the server address and admin token with the precedence **flag &rarr; environment &rarr; config file**. For a local instance the bundled `config.yaml` already carries both, so this is enough:
+The TUI signs every request, so it needs a keypair; it comes from the flags or the environment and never from the server's config file. The address resolves **flag &rarr; environment &rarr; config file**. For a local instance the bundled `config.yaml` carries the address, so only the credential has to be supplied:
 
 ```bash
+export S3O_ACCESS_KEY_ID="$(your-secret-tool get access-key)"
+export S3O_SECRET_ACCESS_KEY="$(your-secret-tool get secret-key)"
 s3-orchestrator tui
 ```
 
-To target a remote instance without a local config, set the environment variables:
+To target a remote instance without a local config, name the address too:
 
 ```bash
 export S3O_ADMIN_ADDR="https://s3.example.com"
-export S3O_ADMIN_TOKEN="$(your-secret-tool get admin-token)"
 s3-orchestrator tui
 ```
 
-Or pass them as flags:
+Or pass all three as flags:
 
 ```bash
-s3-orchestrator tui -addr https://s3.example.com -token "$ADMIN_TOKEN"
+s3-orchestrator tui -addr https://s3.example.com \
+  -access-key "$ACCESS_KEY" -secret-key "$SECRET_KEY"
 ```
 
 ## Step 2: Navigate the object namespace
 
-The TUI opens on the Files section at the root prefix. Move the selection with the arrow keys; open the highlighted row with `enter`. `tab` moves focus to the sidebar (arrow keys then move the highlight, `enter` opens a section), and `f` / `b` / `l` jump straight to Files, Backends, or Logs.
+The TUI opens on the Files section at the root prefix. Move the selection with the arrow keys; open the highlighted row with `enter`. `tab` moves focus to the sidebar (arrow keys then move the highlight, `enter` opens a section), and a letter jumps straight to a section.
 
 | Key | Action |
 |-----|--------|
 | `tab` | Move focus between the sidebar and the content area |
 | `f` | Jump to the Files section |
 | `b` | Jump to the Backends section |
+| `p` | Jump to the Replication section |
+| `w` | Jump to the Workers section |
+| `u` | Jump to the Cleanup section |
+| `c` | Jump to the Cache section |
+| `l` | Jump to the Logs section |
+| `o` | Jump to the Ops section |
 | `up` / `down` | Move the selection (or the sidebar highlight when it has focus) |
 | `enter` / `right` / `l` | Open: a sidebar section, a prefix, or the inspector on an object |
 | `backspace` / `left` / `h` | Go up one prefix; from the inspector or Backends, return to where you were |
@@ -75,9 +89,10 @@ Highlight an object (not a directory) and press `enter` to open the inspector. E
 
 ```
 inspect   photos/2024/img_01.jpg   (2 copies)
-BACKEND    SIZE      CREATED    ENC   KEY ID      HASH
-minio-a    2.4 MiB   2h ago     yes   config-0    9f3a2b1c4d~
-minio-c    2.4 MiB   2h ago     yes   config-0    9f3a2b1c4d~
+tags: (none)
+BACKEND    SIZE      LOGICAL   COMP   CREATED   ENC   KEY ID       HASH          VERIFIED
+minio-a    1.9 MiB   2.4 MiB   zstd   2h ago    yes   vault:tra~   9f3a2b1c4d~   1h ago
+minio-c    1.9 MiB   2.4 MiB   zstd   2h ago    yes   vault:tra~   9f3a2b1c4d~   1h ago
 ```
 
 ![The inspector showing an object's two backend copies](/docs/images/tui-file-details.png?classes=lightbox)
@@ -86,10 +101,13 @@ Reading the columns:
 
 - **BACKEND** - the backend the copy lives on.
 - **SIZE** - stored size in binary units (ciphertext size when the copy is encrypted).
+- **LOGICAL** - the object's size before compression, or `-` when the copy is stored as written.
+- **COMP** - the codec the copy is compressed with, or `-` when it is not compressed.
 - **CREATED** - how long ago the copy was recorded.
 - **ENC** - whether the copy is envelope-encrypted.
 - **KEY ID** - the master key that wrapped this copy's data-encryption key.
 - **HASH** - a prefix of the plaintext SHA-256, once a hash has been computed.
+- **VERIFIED** - how long ago the copy's bytes were last read back and checked against that hash, or `never` while nothing has checked it.
 
 Two copies with matching sizes and hashes is a healthy replicated object. A single row means the object is under-replicated (or replication is disabled); a mismatch in size or hash across copies is worth investigating.
 
@@ -102,12 +120,17 @@ The inspector shows encryption *metadata* only. The wrapped data-encryption key 
 Press `b` (or select **Backends** in the sidebar) to switch to the status view. Each row is one configured backend:
 
 ```
-backends   3 configured   db: healthy   usage period: 2026-07
-BACKEND    HEALTH     DRAIN     USED       LIMIT      OBJECTS   API      INGRESS    EGRESS
-minio-a    healthy    -         2.4 GiB    10.0 GiB   1284      9021     4.7 GiB    2.8 GiB
-minio-b    healthy    draining  8.9 GiB    10.0 GiB   4102      512      1.0 GiB    3.1 GiB
-minio-c    unhealthy  -         0 B        -          0         0        0 B        0 B
+backends   3 configured   usage period: 2026-09
+db: healthy   total: 11.3 GiB / 20.0 GiB (56%)   verified: oldest 9h   compression saved: 3.4 GiB
+BACKEND    HEALTH     DRAIN     USED      LIMIT      USE%   OBJECTS   API    INGRESS   EGRESS    SAVED
+minio-a    healthy    -         2.4 GiB   10.0 GiB   24%    1284      9021   4.7 GiB   2.8 GiB   612.0 MiB
+minio-b    healthy    draining  8.9 GiB   10.0 GiB   89%    4102      512    1.0 GiB   3.1 GiB   2.8 GiB
+minio-c    unhealthy  -         0 B       -          -      0         0      0 B       0 B       0 B
 ```
+
+The second line carries fleet-wide state. `verified:` is how far behind
+integrity checking is: an age when every copy has been checked at least once,
+or a count of never-checked copies while the first sweep is still running.
 
 ![The Backends section listing per-backend health and usage](/docs/images/tui-backends.png?classes=lightbox)
 
@@ -115,9 +138,10 @@ Reading the columns:
 
 - **HEALTH** - the backend's circuit-breaker state; `unhealthy` means the breaker has tripped and the backend is being skipped.
 - **DRAIN** - `draining` while a drain is evacuating the backend, otherwise `-`.
-- **USED** / **LIMIT** - quota bytes used against the configured limit (`-` when no limit is set).
+- **USED** / **LIMIT** / **USE%** - quota bytes used against the configured limit (`-` when no limit is set), and the fill percentage that follows from them.
 - **OBJECTS** - object copies the backend holds.
 - **API** / **INGRESS** / **EGRESS** - request count and bytes transferred for the current usage period, shown in the title bar.
+- **SAVED** - bytes compression kept off this backend, summed across its copies.
 
 The title bar also reports the metadata database health and the usage period the counters cover. Press `r` to refresh the snapshot. This is the interactive equivalent of `s3-orchestrator admin status`.
 
@@ -127,6 +151,22 @@ Press `l` (or select **Logs** in the sidebar) to switch to the logs view - recen
 
 ![The Logs section showing recent structured log entries](/docs/images/tui-logs.png?classes=lightbox)
 
+## Step 6: Check the background services
+
+Press `w` (or select **Workers**) for each registered background service's last-tick health: last success, last failure, consecutive failure count, and last error. A service that runs every tick and fails every tick is indistinguishable from a healthy one in `/health`, so this is where that difference surfaces; the title bar counts the services currently failing.
+
+![The Workers section listing each background service's last-tick health](/docs/images/tui-workers.png?classes=lightbox)
+
+The neighbouring status sections read the same way: `p` for the replication factor and the under- and over-replicated counts, `u` for the cleanup queue and its dead-letter table, and `c` for the object cache's entry count, size, and hit rate.
+
+## Step 7: Run an admin action
+
+Press `o` (or select **Ops**) for the instance-wide actions, grouped into the maintenance passes, cache control, and the encryption transitions. Every entry confirms with `y/N` before it runs, and an entry ending in `...` prompts for a value first.
+
+![The Ops menu listing the instance-wide admin actions](/docs/images/tui-ops.png?classes=lightbox)
+
+Accepting an action switches to a scrolling output pane immediately, so a pass that takes minutes reports what it is doing rather than leaving the menu live until it finishes. Actions that target a single row live on the pane that shows the row instead: drain and reconcile on Backends, requeue on Cleanup.
+
 ## Where it fits
 
-The TUI is the interactive equivalent of `s3-orchestrator admin object-locations -key <key>`. Reach for it when you want to browse rather than look up a single key - for example to confirm replica placement before or after a [drain](../../docs/operations.md), or to spot-check that a newly enabled [replication factor](../replication-guide/) has caught up across backends.
+The TUI is the interactive equivalent of `s3-orchestrator admin object-locations -key <key>`. Reach for it when you want to browse rather than look up a single key - for example to confirm replica placement before or after a [drain](../../docs/operations/), or to spot-check that a newly enabled [replication factor](../replication-guide/) has caught up across backends.

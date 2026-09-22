@@ -22,9 +22,6 @@
 //	    func(ctx context.Context) (string, error) { ... })
 // -------------------------------------------------------------------------------
 
-// Package observe provides cross-cutting observability helpers (spans,
-// metrics, status) that wrap individual operations without leaking the
-// boilerplate into every method body.
 package observe
 
 import (
@@ -56,11 +53,6 @@ type Op struct {
 // Client returns an Op for an outbound call (e.g., backend S3 request).
 func Client(name string, attrs []attribute.KeyValue, recorder Recorder) Op {
 	return Op{Name: name, Kind: trace.SpanKindClient, Attrs: attrs, Recorder: recorder}
-}
-
-// Server returns an Op for an inbound request (HTTP handler entry point).
-func Server(name string, attrs []attribute.KeyValue, recorder Recorder) Op {
-	return Op{Name: name, Kind: trace.SpanKindServer, Attrs: attrs, Recorder: recorder}
 }
 
 // Internal returns an Op for in-process work (worker passes, internal helpers).
@@ -104,6 +96,17 @@ func RunErr(ctx context.Context, op Op, fn func(context.Context) error) error {
 		return struct{}{}, fn(ctx)
 	})
 	return err
+}
+
+// RunValue is the variant for work that reports a result but cannot fail -
+// the background passes that tally their own outcomes and return a summary
+// rather than an error. The span always reports success, because the work has
+// no failure to report; anything that went wrong inside is in the summary.
+func RunValue[R any](ctx context.Context, op Op, fn func(context.Context) R) R {
+	result, _ := Run(ctx, op, func(ctx context.Context) (R, error) {
+		return fn(ctx), nil
+	})
+	return result
 }
 
 // RecordSpanError marks the span as failed with err and records the error

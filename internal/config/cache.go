@@ -10,23 +10,31 @@
 package config
 
 import (
+	"cmp"
 	"fmt"
 	"math"
 	"strconv"
 	"time"
 )
 
+// -------------------------------------------------------------------------
+// TYPES
+// -------------------------------------------------------------------------
+
 // CacheConfig holds settings for the object data cache.
 type CacheConfig struct {
-	Enabled       bool          `yaml:"enabled"`          // Enable the object data cache (default: false)
-	MaxSize       string        `yaml:"max_size"`         // Maximum total cache size (e.g., "256MB", "1GB")
-	MaxObjectSize string        `yaml:"max_object_size"`  // Maximum cacheable object size (e.g., "10MB"); 0 = no limit
-	TTL           time.Duration `yaml:"ttl"`              // Time before a cached entry expires (default: 5m)
+	Enabled       bool          `yaml:"enabled"`         // Enable the object data cache (default: false)
+	MaxSize       string        `yaml:"max_size"`        // Maximum total cache size (e.g., "256MB", "1GB")
+	MaxObjectSize string        `yaml:"max_object_size"` // Maximum cacheable object size (e.g., "10MB"); 0 = no limit
+	TTL           time.Duration `yaml:"ttl"`             // Time before a cached entry expires (default: 5m)
 
-	// Parsed values (not from YAML)
-	MaxSizeBytes       int64 `yaml:"-"`
-	MaxObjectSizeBytes int64 `yaml:"-"`
+	MaxSizeBytes       int64 `yaml:"-"` // parsed from MaxSize
+	MaxObjectSizeBytes int64 `yaml:"-"` // parsed from MaxObjectSize
 }
+
+// -------------------------------------------------------------------------
+// INTERNALS
+// -------------------------------------------------------------------------
 
 // setDefaultsAndValidate sets defaults and validate.
 func (cc *CacheConfig) setDefaultsAndValidate() []error {
@@ -42,9 +50,7 @@ func (cc *CacheConfig) setDefaultsAndValidate() []error {
 	}
 
 	// Parse max_size
-	if cc.MaxSize == "" {
-		cc.MaxSize = "256MB"
-	}
+	cc.MaxSize = cmp.Or(cc.MaxSize, "256MB")
 	maxSize, err := parseByteSize(cc.MaxSize)
 	switch {
 	case err != nil:
@@ -56,9 +62,7 @@ func (cc *CacheConfig) setDefaultsAndValidate() []error {
 	}
 
 	// Parse max_object_size
-	if cc.MaxObjectSize == "" {
-		cc.MaxObjectSize = "10MB"
-	}
+	cc.MaxObjectSize = cmp.Or(cc.MaxObjectSize, "10MB")
 	maxObj, err := parseByteSize(cc.MaxObjectSize)
 	switch {
 	case err != nil:

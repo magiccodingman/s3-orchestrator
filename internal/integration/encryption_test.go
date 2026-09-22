@@ -32,7 +32,7 @@ import (
 
 	"github.com/afreidah/s3-orchestrator/internal/config"
 	"github.com/afreidah/s3-orchestrator/internal/encryption"
-	"github.com/afreidah/s3-orchestrator/internal/proxy"
+	"github.com/afreidah/s3-orchestrator/internal/ops"
 	"github.com/afreidah/s3-orchestrator/internal/proxy/proxytest"
 	"github.com/afreidah/s3-orchestrator/internal/store/postgres"
 	"github.com/afreidah/s3-orchestrator/internal/transport/admin"
@@ -43,20 +43,16 @@ import (
 // testMasterKey is a 256-bit AES key used for integration test encryption.
 var testMasterKey = base64.StdEncoding.EncodeToString(bytes.Repeat([]byte("K"), 32))
 
-// adminToken is the admin auth token used by encryption-flow
-// integration tests against the real test instance.
-const adminToken = "test-admin-token"
-
 // encryptionTestEnv holds the components needed for encryption integration tests.
 type encryptionTestEnv struct {
 	proxyClient *s3.Client
 	adminAddr   string
 	encryptor   *encryption.Encryptor
 	rawStore    *postgres.Store
-	manager     *proxy.BackendManager
+	stack       *proxytest.Stack
 }
 
-// setupEncryptionEnv creates a fresh BackendManager with encryption enabled,
+// setupEncryptionEnv creates a fresh proxy stack with encryption enabled,
 // an admin API server, and a proxy server. Returns the environment and a
 // cleanup function.
 func setupEncryptionEnv(t *testing.T) *encryptionTestEnv {
@@ -77,32 +73,24 @@ func setupEncryptionEnv(t *testing.T) *encryptionTestEnv {
 
 	// Build a manager with encryption enabled using the same backends/store
 	stores := newStores(testStore)
-	mgr := proxytest.NewManager(t, &proxy.BackendManagerConfig{
-		Storage: proxy.StorageDeps{
-			Backends: testBackends,
-			Order:    testBackendOrder,
-		},
-		Stores: proxy.StoreDeps{
-			Metadata:  stores,
-			Dashboard: testStore,
-		},
-		Policies: proxy.PolicyConfig{
-			CacheTTL:        60 * time.Second,
+	st := proxytest.New(t, stores, &proxytest.StackOptions{
+		Runtime: proxytest.NewRuntime(&proxytest.RuntimeOptions{
+			Backends:        testBackends,
+			Order:           testBackendOrder,
 			BackendTimeout:  30 * time.Second,
 			RoutingStrategy: config.RoutingPack,
-		},
-		Features: proxy.FeatureDeps{
-			Encryptor: enc,
-		},
-		Operations: proxy.OperationalDeps{
-			Metrics: newMetricsAdapter(testStore),
-		},
+			Metrics:         newMetricsAdapter(testStore),
+		}),
+		Encryptor:      enc,
+		CacheTTL:       60 * time.Second,
+		BackendTimeout: 30 * time.Second,
 	})
-	workers := proxytest.BuildWorkers(mgr, stores)
+	registerStack(t, st)
+	workers := proxytest.BuildWorkers(st, stores)
 
 	// Start proxy server
-	srv := &s3api.Server{Manager: mgr}
-	srv.SetBucketAuth(auth.NewBucketRegistry([]config.BucketConfig{
+	srv := &s3api.Server{Objects: st.Objects, Multipart: st.Multipart}
+	srv.SetBucketAuth(mustBucketRegistry(t, []config.BucketConfig{
 		{
 			Name: virtualBucket,
 			Credentials: []config.CredentialConfig{
@@ -122,21 +110,38 @@ func setupEncryptionEnv(t *testing.T) *encryptionTestEnv {
 	// Start admin server
 	var lv slog.LevelVar
 	lv.Set(slog.LevelInfo)
+	opsSvc := ops.New(&ops.Deps{
+		Objects:      st.Objects,
+		Store:        testStore,
+		Encryptor:    enc,
+		EncStore:     testStore,
+		Runtime:      st.Runtime,
+		Usage:        st.Runtime.Usage(),
+		IntegrityCfg: st.IntegrityCfg,
+		Replicator:   workers.Replicator,
+		OverRep:      workers.OverReplicationCleaner,
+		Rebalancer:   workers.Rebalancer,
+		Scrubber:     workers.Scrubber,
+		Provisioning: testStore,
+		Declared:     declaredForConfig([]config.BucketConfig{{Name: virtualBucket}}),
+		Cfg:          &config.Config{Buckets: []config.BucketConfig{{Name: virtualBucket}}},
+	})
 	adminHandler := admin.New(&admin.Deps{
-		BackendOps: mgr,
-		RuntimeOps: mgr.Runtime(),
-		Replicator: workers.Replicator,
-		OverRep:    workers.OverReplicationCleaner,
-		Drain:      mgr.Drain(),
-		Scrubber:   workers.Scrubber,
-		Lifecycle:  testStore,
-		DBHealthy:  testDatabaseCB.IsHealthy,
-		Encryption: testStore,
-		Objects:    testStore,
-		Cleanup:    testStore,
-		Encryptor:  enc,
-		Token:      adminToken,
-		LogLevel:   &lv,
+		BackendOps:   st.Usage,
+		Objects:      opsSvc.Objects,
+		Integrity:    opsSvc.Integrity,
+		Replication:  opsSvc.Replication,
+		Rebalance:    opsSvc.Rebalance,
+		Encryption:   opsSvc.Encryption,
+		Compression:  opsSvc.Compression,
+		Provision:    opsSvc.Provision,
+		Drain:        st.Drain,
+		Lifecycle:    testStore,
+		DBHealthy:    testDatabaseCB.IsHealthy,
+		Cleanup:      testStore,
+		Registry:     func() *auth.BucketRegistry { return srv.GetBucketAuth() },
+		BackendNames: func() []string { return []string{"backend-a", "backend-b"} },
+		LogLevel:     &lv,
 	})
 	adminMux := http.NewServeMux()
 	adminHandler.Register(adminMux)
@@ -161,7 +166,7 @@ func setupEncryptionEnv(t *testing.T) *encryptionTestEnv {
 		adminAddr:   adminListener.Addr().String(),
 		encryptor:   enc,
 		rawStore:    testStore,
-		manager:     mgr,
+		stack:       st,
 	}
 }
 
@@ -172,7 +177,7 @@ func (env *encryptionTestEnv) callAdmin(t *testing.T, path string) map[string]an
 	if err != nil {
 		t.Fatalf("NewRequest: %v", err)
 	}
-	req.Header.Set("X-Admin-Token", adminToken)
+	signAdmin(t, req)
 
 	resp, err := http.DefaultClient.Do(req) //nolint:gosec // G704: test server URL
 	if err != nil {
@@ -483,7 +488,7 @@ func TestDecryptExisting_BackendNotFound(t *testing.T) {
 	// rewrite the object's backend_name to point at it. The manager doesn't
 	// know about this backend, so GetBackend will fail.
 	_, err = testDB.ExecContext(ctx,
-		"INSERT INTO backend_quotas (backend_name, bytes_used, bytes_limit, updated_at) VALUES ('ghost-backend', 0, 0, NOW()) ON CONFLICT DO NOTHING")
+		"INSERT INTO backend_quotas (backend_name, bytes_limit, updated_at) VALUES ('ghost-backend', 0, NOW()) ON CONFLICT DO NOTHING")
 	if err != nil {
 		t.Fatalf("insert ghost backend: %v", err)
 	}
@@ -718,7 +723,7 @@ func TestEncryptExisting_BackendNotFound(t *testing.T) {
 	// Create a fake backend in the quotas table to satisfy the FK, then
 	// rewrite the object's backend_name to point at it.
 	_, err = testDB.ExecContext(ctx,
-		"INSERT INTO backend_quotas (backend_name, bytes_used, bytes_limit, updated_at) VALUES ('ghost-backend', 0, 0, NOW()) ON CONFLICT DO NOTHING")
+		"INSERT INTO backend_quotas (backend_name, bytes_limit, updated_at) VALUES ('ghost-backend', 0, NOW()) ON CONFLICT DO NOTHING")
 	if err != nil {
 		t.Fatalf("insert ghost backend: %v", err)
 	}
@@ -797,5 +802,141 @@ func TestEncryptDecryptExisting_DirectBackendVerification(t *testing.T) {
 	decResult.Body.Close()
 	if !bytes.Equal(decBytes, body) {
 		t.Fatalf("raw backend bytes should be plaintext after decrypt: got %d bytes, want %d", len(decBytes), len(body))
+	}
+}
+
+// -------------------------------------------------------------------------
+// ENCRYPTED WRITE PATH
+// -------------------------------------------------------------------------
+
+// encryptionChunkSize is the chunk size setupEncryptionEnv builds its
+// encryptor with. Sizes around this boundary are where chunked encryption
+// framing is most likely to go wrong.
+const encryptionChunkSize = 65536
+
+// TestEncryptedWritePath_RoundTrip writes through the encryption-enabled proxy
+// and reads back through it.
+//
+// The rest of this file converts plaintext objects with the admin
+// encrypt-existing endpoint, which exercises the rewrite path rather than the
+// write path. This covers what a real deployment actually does on every
+// request: client PUT, encrypt, store, client GET, decrypt.
+//
+// Sizes bracket the chunk boundary because that is where framing errors hide:
+// an off-by-one in chunk accounting can round trip a 1 KiB object correctly
+// and still corrupt one of exactly a chunk or a chunk plus a byte.
+func TestEncryptedWritePath_RoundTrip(t *testing.T) {
+	env := setupEncryptionEnv(t)
+	ctx := context.Background()
+
+	// The fleet's normal quotas are a few kilobytes, which cannot hold an
+	// object a chunk or more in size.
+	if err := testStore.SyncQuotaLimits(ctx, []config.BackendConfig{
+		{Name: "minio-1", QuotaBytes: 8 << 20},
+		{Name: "minio-2", QuotaBytes: 8 << 20},
+	}); err != nil {
+		t.Fatalf("raising quota limits: %v", err)
+	}
+	refreshQuota(t)
+	defer resyncQuotaLimits(t, ctx)
+
+	cases := []struct {
+		name string
+		size int
+	}{
+		{"empty", 0},
+		{"single byte", 1},
+		{"sub chunk", 1024},
+		{"exactly one chunk", encryptionChunkSize},
+		{"one chunk plus one", encryptionChunkSize + 1},
+		{"multi chunk", encryptionChunkSize*3 + 17},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			key := uniqueKey(t, "enc-write")
+			body := make([]byte, tc.size)
+			for i := range body {
+				body[i] = byte(i % 251)
+			}
+
+			if _, err := env.proxyClient.PutObject(ctx, &s3.PutObjectInput{
+				Bucket:        aws.String(virtualBucket),
+				Key:           aws.String(key),
+				Body:          bytes.NewReader(body),
+				ContentLength: aws.Int64(int64(tc.size)),
+			}); err != nil {
+				t.Fatalf("PutObject through encrypting proxy: %v", err)
+			}
+
+			assertStoredAsEnvelope(t, ctx, key, body)
+
+			resp, err := env.proxyClient.GetObject(ctx, &s3.GetObjectInput{
+				Bucket: aws.String(virtualBucket),
+				Key:    aws.String(key),
+			})
+			if err != nil {
+				t.Fatalf("GetObject through encrypting proxy: %v", err)
+			}
+			got, readErr := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			if readErr != nil {
+				t.Fatalf("reading decrypted body: %v", readErr)
+			}
+			if !bytes.Equal(got, body) {
+				t.Errorf("round trip returned %d bytes, want %d (contents differ)", len(got), len(body))
+			}
+		})
+	}
+}
+
+// assertStoredAsEnvelope requires the bytes actually on the backend to be an
+// encryption envelope rather than the client's plaintext, and the ledger to
+// describe them as such.
+func assertStoredAsEnvelope(t *testing.T, ctx context.Context, key string, plaintext []byte) {
+	t.Helper()
+
+	backendName := queryObjectBackend(t, key)
+	be, ok := allBackends[backendName]
+	if !ok {
+		t.Fatalf("ledger names backend %q, which is not configured", backendName)
+	}
+
+	result, err := be.GetObject(ctx, internalKey(key), "")
+	if err != nil {
+		t.Fatalf("direct backend read: %v", err)
+	}
+	stored, readErr := io.ReadAll(result.Body)
+	_ = result.Body.Close()
+	if readErr != nil {
+		t.Fatalf("reading stored bytes: %v", readErr)
+	}
+
+	if !encryption.HasEnvelopeMagic(stored) {
+		t.Fatalf("stored bytes for %q are not an encryption envelope", key)
+	}
+	if len(plaintext) > 0 && bytes.Equal(stored, plaintext) {
+		t.Fatalf("stored bytes for %q are the client's plaintext", key)
+	}
+	if len(stored) <= len(plaintext) {
+		t.Errorf("stored %d bytes for a %d byte object, expected envelope overhead",
+			len(stored), len(plaintext))
+	}
+
+	encrypted, sizeBytes, plaintextSize := queryEncryptionState(t, internalKey(key))
+	if !encrypted {
+		t.Errorf("ledger records %q as plaintext", key)
+	}
+	if sizeBytes != int64(len(stored)) {
+		t.Errorf("ledger size_bytes = %d, want %d (the stored envelope)", sizeBytes, len(stored))
+	}
+	// plaintext_size is stored as NULL rather than 0 for an empty object, so
+	// a nil pointer and a stored zero mean the same thing.
+	gotPlaintextSize := int64(0)
+	if plaintextSize != nil {
+		gotPlaintextSize = *plaintextSize
+	}
+	if gotPlaintextSize != int64(len(plaintext)) {
+		t.Errorf("ledger plaintext_size = %d, want %d", gotPlaintextSize, len(plaintext))
 	}
 }

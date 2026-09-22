@@ -30,12 +30,17 @@ import (
 	"github.com/afreidah/s3-orchestrator/internal/util/syncutil"
 )
 
+// -------------------------------------------------------------------------
+// PUBLIC API
+// -------------------------------------------------------------------------
+
 // TestDampening_SuppressesRepeatedCapacityWarning verifies that the TTL-based
 // dampener suppresses duplicate threshold events within the dampening window
 // and allows them after the TTL expires.
 // Not parallel: NewNotifier writes the process-global event.Emit hook.
 func TestDampening_SuppressesRepeatedCapacityWarning(t *testing.T) {
 	n := NewNotifier(&config.NotificationConfig{}, &mockOutboxStore{})
+	t.Cleanup(n.Close)
 
 	dampenKey := event.BackendCapacityWarning + ":oci"
 
@@ -56,7 +61,7 @@ func TestDampening_SuppressesRepeatedCapacityWarning(t *testing.T) {
 // Not parallel: NewNotifier writes the process-global event.Emit hook.
 func TestDampening_TTLCacheEvicts(t *testing.T) {
 	n := NewNotifier(&config.NotificationConfig{}, &mockOutboxStore{})
-	defer n.dampener.Close()
+	defer n.Close()
 
 	// The cache exists and is functional.
 	n.dampener.Set("key", struct{}{})
@@ -296,23 +301,34 @@ func TestDeliver_HMACSignature(t *testing.T) {
 	}
 }
 
-// TestNewNotifier_SetsEmitHook verifies the new notifier sets emit hook behaviour described by the test name.
-// Not parallel: mutates the process-global event.Emit hook.
-func TestNewNotifier_SetsEmitHook(t *testing.T) {
-	// Reset the global hook before test
-	event.Emit = nil
+// TestNewNotifier_RegistersAndDeregisters asserts a constructed notifier
+// receives what any package publishes, and stops receiving once it is closed.
+// Asserted through the outbox rather than by reading the hook: registration is
+// only worth anything if an event actually lands somewhere.
+//
+// Not parallel: registration is process-global.
+func TestNewNotifier_RegistersAndDeregisters(t *testing.T) {
+	event.SetEmitter(nil)
+	t.Cleanup(func() { event.SetEmitter(nil) })
 
 	cfg := &config.NotificationConfig{
-		Endpoints: []config.NotificationEndpoint{{URL: "https://example.com"}},
+		Endpoints: []config.NotificationEndpoint{{URL: "https://example.com", Events: []string{"*"}}},
 	}
 	ms := &mockOutboxStore{}
-	_ = NewNotifier(cfg, ms)
+	n := NewNotifier(cfg, ms)
 
-	if event.Emit == nil {
-		t.Error("NewNotifier should set event.Emit hook")
+	event.Publish(event.ServiceStarted, "", nil)
+	if got := ms.inserts(); got != 1 {
+		t.Fatalf("outbox rows after publish = %d, want 1; the notifier did not register", got)
 	}
-	// Clean up
-	event.Emit = nil
+
+	// Close deregisters. An event published after shutdown has no notifier to
+	// take it, and must not reach one whose dampener has already stopped.
+	n.Close()
+	event.Publish(event.ServiceStopping, "", nil)
+	if got := ms.inserts(); got != 1 {
+		t.Errorf("outbox rows after close = %d, want no further inserts", got)
+	}
 }
 
 // mockOutboxStore is a minimal stub for notify tests. The notifier's
@@ -370,6 +386,10 @@ func (m *mockOutboxStore) WithAdvisoryLock(_ context.Context, _ int64, fn func(c
 	return true, fn(context.Background())
 }
 
+// -------------------------------------------------------------------------
+// INTERNALS
+// -------------------------------------------------------------------------
+
 // inserts returns the current insert count under the lock. Tests use
 // this instead of reading m.insertCount directly so a notifier
 // delivery goroutine's concurrent InsertNotification cannot race with
@@ -401,6 +421,10 @@ func (m *mockOutboxStore) retried() []int64 {
 	defer m.mu.Unlock()
 	return append([]int64(nil), m.retriedIDs...)
 }
+
+// -------------------------------------------------------------------------
+// PUBLIC API
+// -------------------------------------------------------------------------
 
 // TestEmit_PrefixFiltering verifies the emit prefix filtering contract.
 // Asserts that expected 1 insert for matching prefix, got.
@@ -583,7 +607,7 @@ func TestDrainOnce_UnknownEndpointCompleted(t *testing.T) {
 		},
 	}
 	n := &Notifier{
-		log: slog.Default(),
+		log:       slog.Default(),
 		endpoints: []config.NotificationEndpoint{},
 		store:     ms,
 		client:    &http.Client{Timeout: 5 * time.Second},

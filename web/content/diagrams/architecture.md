@@ -1,4 +1,5 @@
 ---
+description: "Interactive high-level diagram of the request path, storage layer, background services, and observability, with implementation notes."
 title: "System Architecture"
 linkTitle: "Architecture"
 weight: -1
@@ -62,7 +63,8 @@ High-level architecture of the S3 Orchestrator showing the request path, storage
     '    ROUTE -->|/ui/| WEBUI[Web<br>Dashboard]:::handler',
     '',
     '    OBJMGR --> DCACHE[Object Data<br>Cache]:::storage',
-    '    DCACHE -->|miss| ENC{Encryption}:::storage',
+    '    DCACHE -->|miss| COMP{Compression}:::storage',
+    '    COMP --> ENC{Encryption}:::storage',
     '    MPMGR --> ENC',
     '    ENC -->|enabled| VAULT[Key Provider<br>Vault / KMS]:::data',
     '    ENC --> SELECT[Backend Selection<br>& Failover]:::storage',
@@ -115,8 +117,27 @@ High-level architecture of the S3 Orchestrator showing the request path, storage
 
   mermaid.initialize({
     startOnLoad: false,
-    theme: 'dark',
-    flowchart: { nodeSpacing: 14, rankSpacing: 22, curve: 'basis', padding: 5, diagramPadding: 8, useMaxWidth: true }
+    theme: 'base',
+    themeVariables: {
+      darkMode: true,
+      background: '#191c23',
+      fontFamily: 'Inter, ui-sans-serif, system-ui, sans-serif',
+      fontSize: '15px',
+      primaryColor: '#26332f',
+      primaryTextColor: '#f8fafc',
+      primaryBorderColor: '#2a9d73',
+      secondaryColor: '#3a2e20',
+      secondaryTextColor: '#e8dfd0',
+      secondaryBorderColor: '#c4a35a',
+      tertiaryColor: '#20262d',
+      tertiaryTextColor: '#e8dfd0',
+      tertiaryBorderColor: '#4aaa8a',
+      lineColor: '#7f8b86',
+      edgeLabelBackground: '#191c23',
+      clusterBkg: '#1d2229',
+      clusterBorder: '#39443f'
+    },
+    flowchart: { nodeSpacing: 32, rankSpacing: 46, curve: 'linear', padding: 12, diagramPadding: 16, useMaxWidth: true, htmlLabels: true }
   });
 
   mermaid.render('arch-mermaid-svg', diagramSrc).then(function(result) {
@@ -141,9 +162,9 @@ High-level architecture of the S3 Orchestrator showing the request path, storage
       body: '<p><b>Admission Control:</b> Channel-based semaphore limiting concurrent in-flight requests. Global pool or separate read/write pools. Probabilistic load shedding ramps rejection from <code>shed_threshold</code> to capacity. Optional brief wait before hard rejection.</p><p><b>Rate Limiter:</b> Per-IP token bucket using <code>golang.org/x/time/rate</code>. Extracts real client IP via X-Forwarded-For with trusted proxy CIDR validation.</p><p><a href="../admission-control/" style="color:#34b882">See detailed admission control flow diagram &rarr;</a></p>'
     },
     AUTH: {
-      title: 'SigV4 / Presigned / Token Authentication',
+      title: 'SigV4 / Presigned Authentication',
       badge: 'middleware', badgeText: 'authentication',
-      body: '<p>Verifies AWS Signature Version 4 from either the <code>Authorization</code> header or presigned URL query parameters. Reconstructs canonical request, derives signing key via HMAC-SHA256 chain, compares with <code>crypto/subtle.ConstantTimeCompare</code>.</p><p>The signing key is derived per request rather than cached so timing remains constant for known and unknown access keys alike. Presigned URLs validated via <code>X-Amz-Expires</code> (max 7 days). Also supports legacy <code>X-Proxy-Token</code> header.</p><p>Streaming-payload PUTs are validated end-to-end: the seed signature authenticates the request envelope, and a chunk-validating reader verifies each chained per-chunk signature (or the trailer signature for the unsigned-trailer variant) before any byte reaches storage.</p><p><code>BucketRegistry</code> maps access keys to virtual buckets for multi-tenant credential isolation.</p>'
+      body: '<p>Verifies AWS Signature Version 4 from either the <code>Authorization</code> header or presigned URL query parameters. Reconstructs canonical request, derives signing key via HMAC-SHA256 chain, compares with <code>crypto/subtle.ConstantTimeCompare</code>.</p><p>The signing key is derived per request rather than cached so timing remains constant for known and unknown access keys alike. Presigned URLs validated via <code>X-Amz-Expires</code> (max 7 days).</p><p>Streaming-payload PUTs are validated end-to-end: the seed signature authenticates the request envelope, and a chunk-validating reader verifies each chained per-chunk signature (or the trailer signature for the unsigned-trailer variant) before any byte reaches storage.</p><p><code>BucketRegistry</code> resolves an access key to the user behind it, and that user answers whether it holds a grant on the bucket in the URL path. The registry is assembled from both sources a deployment declares credentials in - the config file and the store - and swapped whole behind an atomic pointer, so a credential issued or revoked through the provisioning API takes effect on the next request rather than the next restart.</p>'
     },
     ROUTE: {
       title: 'Request Router',
@@ -168,7 +189,7 @@ High-level architecture of the S3 Orchestrator showing the request path, storage
     ADMIN: {
       title: 'Admin API',
       badge: 'handler', badgeText: 'handler',
-      body: '<p>Operational control endpoints at <code>/admin/api/*</code>. Protected by <code>X-Admin-Token</code> header.</p><p><b>Triggers:</b> flush-usage, rebalance, replicate, cleanup-queue, encrypt-existing.<br><b>Monitoring:</b> health, config, dashboard stats, object listing, worker health (<code>/admin/api/workers</code>).<br><b>Drain:</b> start/check/cancel backend decommissioning (moves all objects to other backends).</p>'
+      body: '<p>Operational control endpoints at <code>/admin/api/*</code>. Takes the same SigV4-signed credential the S3 surface does, and each route declares the permission a caller\'s grant has to carry.</p><p><b>Triggers:</b> flush-usage, rebalance, replicate, cleanup-queue, encrypt-existing.<br><b>Monitoring:</b> health, config, dashboard stats, object listing, worker health (<code>/admin/api/workers</code>).<br><b>Drain:</b> start/check/cancel backend decommissioning (moves all objects to other backends).</p>'
     },
     WEBUI: {
       title: 'Web Dashboard',
@@ -180,10 +201,15 @@ High-level architecture of the S3 Orchestrator showing the request path, storage
       badge: 'storage', badgeText: 'optional',
       body: '<p>Optional in-memory LRU cache for object data. When enabled (<code>cache.enabled: true</code>), full GET responses are cached to avoid repeated backend fetches.</p><p>On <b>cache hit</b>: returns the cached body immediately &mdash; no backend API call, no egress, no decryption overhead.</p><p>On <b>cache miss</b>: proceeds through the normal path, then stores the response for future reads. Range requests always bypass the cache.</p><p>Automatically invalidated on PutObject, DeleteObject, CopyObject, and CompleteMultipartUpload.</p><p class="ac-metric">Config: cache.max_size, cache.max_object_size, cache.ttl</p>'
     },
+    COMP: {
+      title: 'Compression Layer',
+      badge: 'storage', badgeText: 'optional',
+      body: '<p>At-rest compression when <code>compression.enabled: true</code>, storing objects as chunked zstd in the Zstandard seekable format: one independently decodable frame per <code>chunk_size</code> of input, seek table in a trailing skippable frame.</p><p>Sits inside encryption, because ciphertext does not compress. Write order is compress then encrypt; read order is decrypt, decompress, slice.</p><p>The chunking is what keeps a partial read cheap. A single-frame object has one entry point, byte zero, so any range read would fetch the whole stored object and discard the prefix, at a cost proportional to object size rather than to the bytes asked for.</p><p>Objects below <code>min_size</code>, and objects that do not encode to at least <code>min_ratio</code> of their original size, are stored verbatim. A stored object is a valid Zstandard stream, so <code>zstd -d</code> decodes it without knowing about the seek table.</p><p><a href="../compression/">Compression flow diagram &rarr;</a> &middot; <a href="../../docs/compression/">Compression reference &rarr;</a></p>'
+    },
     ENC: {
       title: 'Encryption Layer',
       badge: 'storage', badgeText: 'optional',
-      body: '<p>Transparent envelope encryption when <code>encryption.enabled: true</code>.</p><p><b>Write:</b> generate random 256-bit DEK &rarr; wrap with master key &rarr; AES-256-GCM stream encrypt (1MB chunks) &rarr; store ciphertext + wrapped DEK in DB.</p><p><b>Read:</b> unwrap DEK &rarr; stream decrypt. <b>Range reads:</b> calculate affected chunks, fetch and decrypt only those.</p><p>ETag is MD5 of plaintext for S3 client compatibility.</p><p><a href="../encryption/">Encryption flow diagram &rarr;</a></p>'
+      body: '<p>Transparent envelope encryption when <code>encryption.enabled: true</code>.</p><p><b>Write:</b> generate random 256-bit DEK &rarr; wrap with master key &rarr; AES-256-GCM stream encrypt (64 KiB chunks) &rarr; store ciphertext + wrapped DEK in DB.</p><p><b>Read:</b> unwrap DEK &rarr; stream decrypt. <b>Range reads:</b> calculate affected chunks, fetch and decrypt only those.</p><p>ETag is MD5 of plaintext for S3 client compatibility.</p><p><a href="../encryption/">Encryption flow diagram &rarr;</a></p>'
     },
     VAULT: {
       title: 'Key Provider (Vault / KMS)',
@@ -228,7 +254,7 @@ High-level architecture of the S3 Orchestrator showing the request path, storage
     PG: {
       title: 'PostgreSQL',
       badge: 'data', badgeText: 'metadata store',
-      body: '<p>Stores all object metadata, locations, multipart state, quotas, usage counters, cleanup queue, and replication state.</p><p>Tables: <code>object_locations</code>, <code>multipart_uploads</code>, <code>multipart_parts</code>, <code>backend_quotas</code>, <code>backend_usage</code>, <code>cleanup_queue</code>, <code>cleanup_dlq</code>, <code>pending_objects</code>, <code>notification_outbox</code>.</p><p>Uses advisory locks for distributed worker coordination. Connection pool: pgx with configurable <code>max_conns</code>, <code>min_conns</code>, <code>max_conn_lifetime</code>. Migrations applied automatically on startup.</p>'
+      body: '<p>Stores all object metadata, locations, multipart state, quotas, usage counters, cleanup queue, and replication state.</p><p>Tables: <code>object_locations</code>, <code>object_tags</code>, <code>multipart_uploads</code>, <code>multipart_parts</code>, <code>backend_quotas</code>, <code>backend_usage</code>, <code>backend_request_usage</code>, <code>cleanup_queue</code>, <code>cleanup_dlq</code>, <code>pending_objects</code>, <code>notification_outbox</code>.</p><p>Uses advisory locks for distributed worker coordination. Connection pool: pgx with configurable <code>max_conns</code>, <code>min_conns</code>, <code>max_conn_lifetime</code>. Migrations applied automatically on startup.</p>'
     },
     BROADCAST: {
       title: 'Broadcast Reads',
@@ -238,7 +264,7 @@ High-level architecture of the S3 Orchestrator showing the request path, storage
     USAGE: {
       title: 'Usage Tracker & Quota Enforcement',
       badge: 'background', badgeText: 'quota',
-      body: '<p>Tracks per-backend monthly counters: API requests, egress bytes, ingress bytes. Effective usage = DB baseline + unflushed in-memory deltas.</p><p><code>BackendsWithinLimits()</code> filters backends exceeding their configured limits before every write. Flushes deltas to DB every 30s (adaptive: 10s when near limit).</p><p>With Redis: shared counters across instances, advisory lock prevents destructive concurrent flushes.</p>'
+      body: '<p>Tracks per-backend monthly counters: API requests, egress bytes, ingress bytes, and one count per configured request pool. Effective usage = DB baseline + unflushed in-memory deltas.</p><p>Requests are budgeted per pool because providers meter operation classes separately: an upload and a read draw on different allowances, and some operations are not billed at all. Every call is still counted against the request total, whether or not a budget charges it.</p><p><code>BackendsWithinLimits()</code> filters backends exceeding their configured limits before every write. Flushes deltas to DB every 30s (adaptive: 10s when near limit).</p><p>With Redis: shared counters across instances, advisory lock prevents destructive concurrent flushes.</p>'
     },
     COUNTER: {
       title: 'Counter Backend',
@@ -309,9 +335,22 @@ High-level architecture of the S3 Orchestrator showing the request path, storage
 
   function positionTooltip() {
     var pad = 12;
-    var x = mouseX + pad, y = mouseY + pad;
-    if (x + tooltip.offsetWidth > window.innerWidth - pad) x = mouseX - tooltip.offsetWidth - pad;
-    if (y + tooltip.offsetHeight > window.innerHeight - pad) y = mouseY - tooltip.offsetHeight - pad;
+    var w = tooltip.offsetWidth, h = tooltip.offsetHeight;
+    var vw = window.innerWidth, vh = window.innerHeight;
+
+    var x = mouseX + pad;
+    if (x + w > vw - pad) x = mouseX - w - pad;
+    x = Math.max(pad, Math.min(x, vw - w - pad));
+
+    // Prefer below the cursor, and flip above only when above genuinely has
+    // more room. Clamping afterwards is what keeps a tall panel on screen: an
+    // unclamped flip puts its top edge above the viewport, and a panel taller
+    // than the viewport pins to the top and scrolls instead.
+    var below = vh - mouseY - pad * 2;
+    var above = mouseY - pad * 2;
+    var y = (h <= below || below >= above) ? mouseY + pad : mouseY - h - pad;
+    y = Math.max(pad, Math.min(y, vh - h - pad));
+
     tooltip.style.left = x + 'px';
     tooltip.style.top = y + 'px';
   }

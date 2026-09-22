@@ -14,6 +14,7 @@
 package config
 
 import (
+	"cmp"
 	"encoding/base64"
 	"fmt"
 	"os"
@@ -29,12 +30,12 @@ import (
 // AES-256-GCM before being stored on backends. Exactly one key source
 // (master_key, master_key_file, or vault) must be configured.
 type EncryptionConfig struct {
-	Enabled       bool              `yaml:"enabled"`
-	ChunkSize     int               `yaml:"chunk_size"`      // Plaintext bytes per chunk (default: 65536, range: 4KB-1MB, must be power of 2)
-	MasterKey     string            `yaml:"master_key"`      // Base64-encoded 256-bit key (inline or via env var)
-	MasterKeyFile string            `yaml:"master_key_file"` // Path to file containing raw 32-byte key
-	Vault         *VaultTransitConfig `yaml:"vault"`          // Vault Transit key management
-	PreviousKeys  []string          `yaml:"previous_keys"`   // Base64-encoded previous master keys for rotation (unwrap only)
+	Enabled       bool                `yaml:"enabled"`
+	ChunkSize     int                 `yaml:"chunk_size"`      // Plaintext bytes per chunk (default: 65536, range: 4KB-1MB, must be power of 2)
+	MasterKey     string              `yaml:"master_key"`      // Base64-encoded 256-bit key (inline or via env var)
+	MasterKeyFile string              `yaml:"master_key_file"` // Path to file containing raw 32-byte key
+	Vault         *VaultTransitConfig `yaml:"vault"`           // Vault Transit key management
+	PreviousKeys  []string            `yaml:"previous_keys"`   // Base64-encoded previous master keys for rotation (unwrap only)
 }
 
 // VaultTransitConfig holds settings for HashiCorp Vault Transit key management.
@@ -72,9 +73,7 @@ func (e *EncryptionConfig) setDefaultsAndValidate() []error {
 // validateChunkSize applies the ChunkSize default and enforces the
 // 4KB-1MB-power-of-two constraints.
 func (e *EncryptionConfig) validateChunkSize() []error {
-	if e.ChunkSize == 0 {
-		e.ChunkSize = 65536
-	}
+	e.ChunkSize = cmp.Or(e.ChunkSize, 65536)
 	cs := e.ChunkSize
 	if cs < 4096 || cs > 1048576 {
 		return []error{ErrInvalidChunkSize}
@@ -116,7 +115,7 @@ func validateMasterKey(masterKey string) []error {
 	}
 	keyBytes, err := base64.StdEncoding.DecodeString(masterKey)
 	if err != nil {
-		return []error{fmt.Errorf("encryption.master_key: %w: %v", ErrInvalidBase64Key, err)}
+		return []error{fmt.Errorf("encryption.master_key: %w: %w", ErrInvalidBase64Key, err)}
 	}
 	if len(keyBytes) != 32 {
 		return []error{fmt.Errorf("encryption.master_key: %w: got %d bytes", ErrInvalidKeyLength, len(keyBytes))}
@@ -132,7 +131,7 @@ func validateMasterKeyFile(path string) []error {
 	}
 	info, err := os.Stat(path)
 	if err != nil {
-		return []error{fmt.Errorf("%w: %v", ErrInvalidKeyFile, err)}
+		return []error{fmt.Errorf("%w: %w", ErrInvalidKeyFile, err)}
 	}
 	if info.Size() != 32 {
 		return []error{fmt.Errorf("encryption.master_key_file: %w: got %d bytes", ErrInvalidKeyLength, info.Size())}
@@ -148,7 +147,7 @@ func validatePreviousKeys(keys []string) []error {
 	for i, pk := range keys {
 		keyBytes, err := base64.StdEncoding.DecodeString(pk)
 		if err != nil {
-			errs = append(errs, fmt.Errorf("encryption.previous_keys[%d]: %w: %v", i, ErrPreviousKeyInvalid, err))
+			errs = append(errs, fmt.Errorf("encryption.previous_keys[%d]: %w: %w", i, ErrPreviousKeyInvalid, err))
 			continue
 		}
 		if len(keyBytes) != 32 {
@@ -174,12 +173,8 @@ func (v *VaultTransitConfig) setDefaultsAndValidate() []error {
 	if v.KeyName == "" {
 		errs = append(errs, ErrVaultKeyNameRequired)
 	}
-	if v.MountPath == "" {
-		v.MountPath = "transit"
-	}
-	if v.RenewInterval == 0 {
-		v.RenewInterval = 5 * time.Minute
-	}
+	v.MountPath = cmp.Or(v.MountPath, "transit")
+	v.RenewInterval = cmp.Or(v.RenewInterval, 5*time.Minute)
 
 	return errs
 }

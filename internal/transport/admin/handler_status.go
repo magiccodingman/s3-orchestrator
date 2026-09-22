@@ -13,18 +13,31 @@
 package admin
 
 import (
+	"errors"
 	"log/slog"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/afreidah/s3-orchestrator/internal/config"
 	"github.com/afreidah/s3-orchestrator/internal/observe/audit"
+	"github.com/afreidah/s3-orchestrator/internal/ops"
 	"github.com/afreidah/s3-orchestrator/internal/proxy/dashboard"
 	"github.com/afreidah/s3-orchestrator/internal/store/core"
 	"github.com/afreidah/s3-orchestrator/internal/transport/admin/adminapi"
 	"github.com/afreidah/s3-orchestrator/internal/transport/httputil"
 )
+
+// -------------------------------------------------------------------------
+// CONSTANTS
+// -------------------------------------------------------------------------
+
+// reloadNotYetStatus is the reload-status placeholder reported before the
+// first SIGHUP of the process.
+const reloadNotYetStatus = "no_reload_yet"
+
+// -------------------------------------------------------------------------
+// INTERNALS
+// -------------------------------------------------------------------------
 
 // handleReloadStatus returns the most recent reload result captured by
 // the reload coordinator. Returns a "no_reload_yet" placeholder when
@@ -32,12 +45,12 @@ import (
 // wired the provider.
 func (h *Handler) handleReloadStatus(w http.ResponseWriter, _ *http.Request) {
 	if h.reloadStatus == nil {
-		httputil.WriteJSON(w, http.StatusOK, map[string]string{"status": "no_reload_yet"})
+		httputil.WriteJSON(w, http.StatusOK, adminapi.ReloadStatusResponse{Status: reloadNotYetStatus})
 		return
 	}
 	result := h.reloadStatus()
 	if result == nil {
-		httputil.WriteJSON(w, http.StatusOK, map[string]string{"status": "no_reload_yet"})
+		httputil.WriteJSON(w, http.StatusOK, adminapi.ReloadStatusResponse{Status: reloadNotYetStatus})
 		return
 	}
 	httputil.WriteJSON(w, http.StatusOK, result)
@@ -45,7 +58,7 @@ func (h *Handler) handleReloadStatus(w http.ResponseWriter, _ *http.Request) {
 
 // handleStatus returns backend health and circuit breaker state.
 func (h *Handler) handleStatus(w http.ResponseWriter, r *http.Request) {
-	data, err := h.backendOps.GetDashboardData(r.Context())
+	data, err := h.dashboardOps.GetData(r.Context())
 	if err != nil {
 		h.internalError(r.Context(), w, "failed to fetch status", err)
 		return
@@ -55,6 +68,12 @@ func (h *Handler) handleStatus(w http.ResponseWriter, r *http.Request) {
 		DBHealthy:   h.dbHealthy(),
 		UsagePeriod: data.UsagePeriod,
 		Backends:    backendStatuses(data),
+		Integrity: adminapi.IntegrityStatus{
+			OldestUnverifiedSeconds: int64(data.OldestUnverifiedAge.Seconds()),
+			NeverVerifiedCopies:     data.NeverVerifiedCopies,
+			DeferredCopies:          data.DeferredCopies,
+			PlaintextCopies:         data.PlaintextCopies,
+		},
 	})
 }
 
@@ -82,6 +101,7 @@ func backendStatuses(data *dashboard.Data) []adminapi.BackendStatus {
 			bs.EgressBytes = us.EgressBytes
 			bs.IngressBytes = us.IngressBytes
 		}
+		bs.CompressionSavedBytes = data.CompressionSaved(name)
 		backends = append(backends, bs)
 	}
 	return backends
@@ -90,12 +110,12 @@ func backendStatuses(data *dashboard.Data) []adminapi.BackendStatus {
 // handleObjectLocations returns all copies of an object across backends.
 func (h *Handler) handleObjectLocations(w http.ResponseWriter, r *http.Request) {
 	key := r.URL.Query().Get("key")
-	if key == "" {
+
+	locations, err := h.objects.Locations(r.Context(), key)
+	if errors.Is(err, ops.ErrKeyRequired) {
 		httputil.WriteJSONError(w, http.StatusBadRequest, "key parameter is required")
 		return
 	}
-
-	locations, err := h.objects.GetAllObjectLocations(r.Context(), key)
 	if err != nil {
 		h.internalError(r.Context(), w, "failed to fetch locations", err, slog.String("key", key))
 		return
@@ -111,13 +131,17 @@ func objectLocationsResponse(key string, locations []core.ObjectLocation) admina
 	resp := adminapi.ObjectLocationsResponse{Key: key}
 	for i := range locations {
 		resp.Locations = append(resp.Locations, adminapi.ObjectLocation{
-			Backend:       locations[i].BackendName,
-			SizeBytes:     locations[i].SizeBytes,
-			CreatedAt:     locations[i].CreatedAt,
-			Encrypted:     locations[i].Encrypted,
-			KeyID:         locations[i].KeyID,
-			PlaintextSize: locations[i].PlaintextSize,
-			ContentHash:   locations[i].ContentHash,
+			Backend:        locations[i].BackendName,
+			SizeBytes:      locations[i].SizeBytes,
+			CreatedAt:      locations[i].CreatedAt,
+			Encrypted:      locations[i].Encrypted,
+			KeyID:          locations[i].KeyID,
+			PlaintextSize:  locations[i].PlaintextSize,
+			ContentHash:    locations[i].ContentHash,
+			LastScrubbedAt: locations[i].LastScrubbedAt,
+
+			CompressionAlgorithm: locations[i].CompressionAlgorithm,
+			LogicalSize:          locations[i].LogicalSize,
 		})
 	}
 	return resp
@@ -137,7 +161,32 @@ func (h *Handler) handleCleanupQueue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	httputil.WriteJSON(w, http.StatusOK, map[string]any{"depth": depth, "items": items})
+	httputil.WriteJSON(w, http.StatusOK, adminapi.CleanupQueueResponse{
+		Depth: depth,
+		Items: cleanupQueueItems(items),
+	})
+}
+
+// cleanupQueueItems maps the store rows onto the shared wire type. The claim
+// pointers flatten to omitted fields so an unclaimed row does not emit nulls.
+func cleanupQueueItems(items []core.CleanupItem) []adminapi.CleanupQueueItem {
+	out := make([]adminapi.CleanupQueueItem, 0, len(items))
+	for i := range items {
+		item := adminapi.CleanupQueueItem{
+			ID:        items[i].ID,
+			Backend:   items[i].BackendName,
+			ObjectKey: items[i].ObjectKey,
+			Reason:    items[i].Reason,
+			SizeBytes: items[i].SizeBytes,
+			Attempts:  items[i].Attempts,
+			ClaimedAt: items[i].ClaimedAt,
+		}
+		if items[i].ClaimedBy != nil {
+			item.ClaimedBy = *items[i].ClaimedBy
+		}
+		out = append(out, item)
+	}
+	return out
 }
 
 // handleUsageFlush forces a flush of usage counters to the database.
@@ -147,7 +196,7 @@ func (h *Handler) handleUsageFlush(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	httputil.WriteJSON(w, http.StatusOK, map[string]string{"status": "flushed"})
+	httputil.WriteJSON(w, http.StatusOK, adminapi.UsageFlushResponse{Status: "flushed"})
 }
 
 // handleReconcileUsage recomputes each backend's bytes_used from the object
@@ -161,42 +210,29 @@ func (h *Handler) handleReconcileUsage(w http.ResponseWriter, r *http.Request) {
 
 	audit.Log(r.Context(), "usage.reconcile",
 		slog.Int("backends_corrected", len(adjustments)))
-	httputil.WriteJSON(w, http.StatusOK, map[string]any{
-		"status":      "reconciled",
-		"adjustments": adjustments,
+	httputil.WriteJSON(w, http.StatusOK, adminapi.UsageReconcileResponse{
+		Status:      "reconciled",
+		Adjustments: adjustments,
 	})
 }
 
 // handleLogLevel gets or sets the runtime log level.
 func (h *Handler) handleLogLevel(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
-		httputil.WriteJSON(w, http.StatusOK, map[string]string{"level": strings.ToLower(h.logLevel.Level().String())})
+		httputil.WriteJSON(w, http.StatusOK, adminapi.LogLevelResponse{
+			Level: strings.ToLower(h.logLevel.Level().String()),
+		})
 		return
 	}
 
-	var req struct {
-		Level string `json:"level"`
-	}
+	var req adminapi.SetLogLevelRequest
 	if !httputil.DecodeJSONBody(w, r, &req, 1<<20) {
 		return
 	}
 	parsed := config.ParseLogLevel(req.Level)
 	h.logLevel.Set(parsed)
 	h.log.InfoContext(r.Context(), "log level changed via admin API", "level", req.Level)
-	httputil.WriteJSON(w, http.StatusOK, map[string]string{"level": strings.ToLower(parsed.String())})
-}
-
-// WorkerHealth is the JSON shape returned by /admin/api/workers. Mirrors
-// lifecycle.WorkerHealth but lives here so the admin transport package
-// owns its own response contract and does not import the lifecycle
-// package directly. Field tags must stay in lockstep with the source
-// type or the wire format silently diverges.
-type WorkerHealth struct {
-	Name                string    `json:"name"`
-	LastSuccess         time.Time `json:"last_success"`
-	LastFailure         time.Time `json:"last_failure"`
-	LastError           string    `json:"last_error,omitempty"`
-	ConsecutiveFailures int       `json:"consecutive_failures"`
+	httputil.WriteJSON(w, http.StatusOK, adminapi.LogLevelResponse{Level: strings.ToLower(parsed.String())})
 }
 
 // handleWorkers returns a snapshot of every registered background
@@ -210,7 +246,5 @@ func (h *Handler) handleWorkers(w http.ResponseWriter, _ *http.Request) {
 		httputil.WriteJSONError(w, http.StatusServiceUnavailable, "worker health not available")
 		return
 	}
-	httputil.WriteJSON(w, http.StatusOK, map[string]any{
-		"workers": h.workerHealth(),
-	})
+	httputil.WriteJSON(w, http.StatusOK, adminapi.WorkersResponse{Workers: h.workerHealth()})
 }

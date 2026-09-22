@@ -1,5 +1,6 @@
 ---
 title: "Maximizing Free Tiers"
+description: "Combine the free tiers of several S3-compatible providers into one endpoint: account setup, per-backend quotas, replication across them, and a Cloudflare edge proxy that stops alliance providers billing egress at all."
 weight: 3
 ---
 
@@ -50,9 +51,9 @@ backends:
     access_key_id: "{{ .Data.data.oci_s3_access_key }}"
     secret_access_key: "{{ .Data.data.oci_s3_secret_key }}"
     force_path_style: true
-    quota_bytes: 10737418240
-    api_request_limit: 50000
-    egress_byte_limit: 10737418240
+    quota_bytes: 18000000000          # 20 GB free tier, kept under the cap
+    api_request_limit: 50000          # OCI does not split requests by class
+    egress_byte_limit: 1000000000000  # 1 TB of the tenancy-wide 10 TB
 
   - name: "r2"
     endpoint: "{{ .Data.data.r2_s3_endpoint }}"
@@ -61,8 +62,15 @@ backends:
     access_key_id: "{{ .Data.data.r2_s3_access_key }}"
     secret_access_key: "{{ .Data.data.r2_s3_secret_key }}"
     force_path_style: true
-    quota_bytes: 10737418240
-    api_request_limit: 1000000
+    quota_bytes: 10000000000
+    unmetered: [DeleteObject, DeleteObjects, AbortMultipartUpload]
+    request_limits:
+      - name: class_a
+        operations: [PutObject, CopyObject, ListObjects, ListObjectsV2, CreateMultipartUpload, UploadPart, CompleteMultipartUpload, GetParts]
+        limit: 1000000
+      - name: class_b
+        operations: [GetObject, HeadObject]
+        limit: 10000000
 
   - name: "b2"
     endpoint: "{{ .Data.data.b2_s3_endpoint }}"
@@ -71,9 +79,11 @@ backends:
     access_key_id: "{{ .Data.data.b2_s3_access_key }}"
     secret_access_key: "{{ .Data.data.b2_s3_secret_key }}"
     force_path_style: true
-    quota_bytes: 10737418240
-    egress_byte_limit: 32212254720
-    api_request_limit: 75000
+    # Class A, B and C transactions are free, so this backend carries no
+    # request budget. The egress allowance is 3x the average monthly stored
+    # bytes, so it tracks the quota rather than a fixed monthly figure.
+    quota_bytes: 10000000000
+    egress_byte_limit: 30000000000
 
   - name: "e2"
     endpoint: "{{ .Data.data.e2_s3_endpoint }}"
@@ -83,9 +93,8 @@ backends:
     secret_access_key: "{{ .Data.data.e2_s3_secret_key }}"
     force_path_style: true
     disable_checksum: true
-    quota_bytes: 10737418240
-    egress_byte_limit: 32212254720
-    ingress_byte_limit: 10737418240
+    quota_bytes: 10000000000
+    egress_byte_limit: 30000000000  # 3x active stored bytes
 
   - name: "ibm"
     endpoint: "{{ .Data.data.ibm_s3_endpoint }}"
@@ -94,9 +103,17 @@ backends:
     access_key_id: "{{ .Data.data.ibm_s3_access_key }}"
     secret_access_key: "{{ .Data.data.ibm_s3_secret_key }}"
     force_path_style: true
-    quota_bytes: 5368709120
-    egress_byte_limit: 5368709120
-    ingress_byte_limit: 5368709120
+    # IBM's Class B is "GET and all others", so deletes and aborts charge
+    # there rather than being free as they are on R2 and GCS.
+    quota_bytes: 5000000000
+    egress_byte_limit: 5000000000
+    request_limits:
+      - name: class_a
+        operations: [PutObject, CopyObject, ListObjects, ListObjectsV2, CreateMultipartUpload, UploadPart, CompleteMultipartUpload]
+        limit: 2000
+      - name: class_b
+        operations: [GetObject, HeadObject, GetParts, DeleteObject, DeleteObjects, AbortMultipartUpload]
+        limit: 20000
 
   # GCS requires three extra settings to work with SigV4 signing.
   # See the note below for details.
@@ -110,10 +127,20 @@ backends:
     disable_checksum: true
     unsigned_payload: true
     strip_sdk_headers: true
-    quota_bytes: 5368709120
-    egress_byte_limit: 1073741824
-    ingress_byte_limit: 5368709120
-    api_request_limit: 5000
+    # GCS bills uploads and listings from the Class A allowance, reads from a
+    # far larger Class B one, and does not bill deletes at all. A single
+    # api_request_limit charges all three against the smallest of them, which
+    # takes the backend out of service with its read allowance untouched.
+    quota_bytes: 5000000000
+    egress_byte_limit: 100000000000  # 100 GB from North America
+    unmetered: [DeleteObject, DeleteObjects, AbortMultipartUpload]
+    request_limits:
+      - name: class_a
+        operations: [PutObject, CopyObject, CreateMultipartUpload, UploadPart, CompleteMultipartUpload, ListObjects, ListObjectsV2]
+        limit: 5000
+      - name: class_b
+        operations: [GetObject, HeadObject, GetParts]
+        limit: 50000
 
   - name: "g3"
     endpoint: "{{ .Data.data.g3_s3_endpoint }}"
@@ -134,6 +161,22 @@ backend_circuit_breaker:
   failure_threshold: 3
   open_timeout: 15s
 
+replication:
+  factor: 2
+
+# The write places both copies itself, so the replicator never reads an object
+# back to make one - no GET and no source egress per replica.
+write_path:
+  parallel_copies:
+    enabled: true
+
+# Compressed bytes are what count against quota_bytes and both byte limits.
+compression:
+  enabled: true
+  level: "default"
+  min_size: 4096
+  min_ratio: 0.95
+
 encryption:
   enabled: true
   vault:
@@ -153,10 +196,13 @@ rate_limit:
     - "192.168.0.0/16"
     - "127.0.0.1/32"
 
+auth:
+  root:
+    access_key_id: "{{ .Data.data.root_access_key_id }}"
+    secret_access_key: "{{ .Data.data.root_secret_access_key }}"
+
 ui:
   enabled: true
-  admin_key: "{{ .Data.data.ui_admin_key }}"
-  admin_secret: "{{ .Data.data.ui_admin_secret }}"
   session_secret: "{{ .Data.data.ui_session_secret }}"
   force_secure_cookies: true   # unconditionally sets Secure on session cookies; alternative is to let the orchestrator detect TLS via X-Forwarded-Proto from a trusted_proxies CIDR — see docs/security-hardening.md
 
@@ -195,19 +241,32 @@ See the [Admin Guide](../../docs/backends/) for more details.
 
 ## Step 1: Identify Your Free-Tier Allowances
 
-Check each provider's free-tier limits. Common examples:
+Check each provider's free-tier limits. The allowances below were checked in September 2026:
 
-| Provider | Free Storage | Free API Requests | Free Egress |
-|----------|-------------|-------------------|-------------|
-| Oracle Cloud (OCI) | 10 GB | 50,000/mo | 10 GB/mo |
-| Cloudflare R2 | 10 GB | 1,000,000/mo | Unlimited |
-| Backblaze B2 | 10 GB | 75,000/mo | 30 GB/mo |
-| iDrive e2 | 10 GB | Unlimited | 30 GB/mo |
-| IBM Cloud | 5 GB | Unlimited | 5 GB/mo |
-| Google Cloud (GCS) | 5 GB | 5,000/mo | 1 GB/mo |
-| [g3](https://g3.munchbox.cc) (Gmail + Drive) | 15 GB | 12,000/min (Drive) | Unlimited |
+| Provider | Free storage | Free requests | Free egress |
+|----------|-------------|---------------|-------------|
+| [Cloudflare R2](https://developers.cloudflare.com/r2/pricing/) | 10 GB | 1,000,000 Class A, 10,000,000 Class B; deletes and aborts unbilled | Unlimited |
+| [Oracle Cloud (OCI)](https://docs.oracle.com/en-us/iaas/Content/FreeTier/freetier_topic-Always_Free_Resources.htm) | 20 GB across all storage tiers | 50,000, not split by class | 10 TB/mo, shared by the whole tenancy |
+| [Backblaze B2](https://www.backblaze.com/cloud-storage/pricing) | 10 GB | Class A, B and C transactions are all free | 3x average monthly stored bytes |
+| [IDrive e2](https://e2help.idrive.com/hc/en-us/articles/10910766716573-IDrive-e2-pricing-policies) | 10 GB | No request charges | 3x active stored bytes |
+| [Synology C2](https://c2.synology.com/en-global/pricing/onestorage) | 15 GB | No request charges | 15 GB/mo |
+| [Tigris](https://www.tigrisdata.com/pricing/) | 5 GB | 10,000 Class A, 100,000 Class B; deletes free | Unlimited |
+| [Google Cloud (GCS)](https://docs.cloud.google.com/free/docs/free-cloud-features) | 5 GB, us-east1/us-west1/us-central1 only | 5,000 Class A, 50,000 Class B; deletes free | 100 GB/mo from North America |
+| [IBM Cloud](https://cloud.ibm.com/docs/cloud-object-storage?topic=cloud-object-storage-faq-provision) | 5 GB Smart Tier | 2,000 Class A, 20,000 Class B | 5 GB/mo public egress |
+| [Supabase](https://supabase.com/pricing) | 1 GB | No request charges | 5 GB/mo, shared across the organization |
+| [g3](https://g3.munchbox.cc) (Gmail + Drive) | 15 GB per Google account | Drive API per-minute quotas only | No monthly cap |
 
-With all seven providers you get 65 GB of combined storage behind a single S3 endpoint.
+Together those come to 96 GB of combined storage behind a single S3 endpoint.
+
+That is the raw figure, and it is only what you can store if every object exists once. **Replication divides it.** At a factor of 2 the same 96 GB holds 48 GB of distinct objects, since every one is written twice; at 3 it holds 32 GB. Decide the factor before sizing the pool, because it is the difference between a 96 GB answer and a 32 GB one. Compression pushes back the other way — see Step 4 — but by an amount that depends entirely on what you store, so plan on the raw division and treat compression as headroom you earn rather than capacity you can count on.
+
+Three things in that table decide how the backend is configured:
+
+**Requests are metered by class, not in total.** GCS bills uploads and listings from the Class A allowance and reads from a Class B one twenty times larger, and does not bill deletes at all. IBM charges deletes to Class B, because its Class B is "GET and all others". B2 charges nothing for any of them. A single `api_request_limit` charges every operation against one number, so it has to be set to the strictest class, which takes the whole backend out of service while the looser allowances sit unused. Declare the grouping with `request_limits` and `unmetered` instead; see [backends.md](../../docs/backends/) for the syntax and the operation vocabulary.
+
+**Two of the egress allowances scale with what is stored.** B2 and IDrive e2 give away a multiple of the bytes actually held, so a fixed `egress_byte_limit` is only safe at the storage level it was computed for. A backend holding 2 GB on B2 has a 6 GB allowance, not the 30 GB a full 10 GB backend would earn.
+
+**Some allowances are narrower than the provider's headline.** The GCS free tier applies only to the three US regions listed; a bucket anywhere else bills from the first operation. The OCI egress allowance covers the entire tenancy, so compute instances draw from the same 10 TB. The g3 storage is a Google account quota shared with Gmail and Photos.
 
 {{% notice tip %}}
 **[g3](https://github.com/afreidah/g3)** is an S3-compatible gateway that uses Google Drive for object data and Gmail for metadata. Each free Google account provides 15 GB of storage. g3 runs as a service in your infrastructure and presents a standard S3 API that S3 Orchestrator connects to like any other backend. See the [g3 project website](https://g3.munchbox.cc) for setup instructions.
@@ -293,9 +352,9 @@ backends:
     access_key_id: "${OCI_ACCESS_KEY}"
     secret_access_key: "${OCI_SECRET_KEY}"
     force_path_style: true
-    quota_bytes: 10737418240
-    api_request_limit: 50000
-    egress_byte_limit: 10737418240
+    quota_bytes: 18000000000          # 20 GB free tier, kept under the cap
+    api_request_limit: 50000          # OCI does not split requests by class
+    egress_byte_limit: 1000000000000  # 1 TB of the tenancy-wide 10 TB
 
   - name: "r2"
     endpoint: "https://<account-id>.r2.cloudflarestorage.com"
@@ -304,8 +363,15 @@ backends:
     access_key_id: "${R2_ACCESS_KEY}"
     secret_access_key: "${R2_SECRET_KEY}"
     force_path_style: true
-    quota_bytes: 10737418240
-    api_request_limit: 1000000
+    quota_bytes: 10000000000
+    unmetered: [DeleteObject, DeleteObjects, AbortMultipartUpload]
+    request_limits:
+      - name: class_a
+        operations: [PutObject, CopyObject, ListObjects, ListObjectsV2, CreateMultipartUpload, UploadPart, CompleteMultipartUpload, GetParts]
+        limit: 1000000
+      - name: class_b
+        operations: [GetObject, HeadObject]
+        limit: 10000000
 
   - name: "b2"
     endpoint: "https://s3.<region>.backblazeb2.com"
@@ -314,9 +380,11 @@ backends:
     access_key_id: "${B2_ACCESS_KEY}"
     secret_access_key: "${B2_SECRET_KEY}"
     force_path_style: true
-    quota_bytes: 10737418240
-    egress_byte_limit: 32212254720
-    api_request_limit: 75000
+    # Class A, B and C transactions are free, so this backend carries no
+    # request budget. The egress allowance is 3x the average monthly stored
+    # bytes, so it tracks the quota rather than a fixed monthly figure.
+    quota_bytes: 10000000000
+    egress_byte_limit: 30000000000
 
   - name: "e2"
     endpoint: "https://<endpoint>.e2.cloudstorage.com"
@@ -326,9 +394,8 @@ backends:
     secret_access_key: "${E2_SECRET_KEY}"
     force_path_style: true
     disable_checksum: true
-    quota_bytes: 10737418240
-    egress_byte_limit: 32212254720
-    ingress_byte_limit: 10737418240
+    quota_bytes: 10000000000
+    egress_byte_limit: 30000000000  # 3x active stored bytes
 
   - name: "ibm"
     endpoint: "https://s3.<region>.cloud-object-storage.appdomain.cloud"
@@ -337,9 +404,17 @@ backends:
     access_key_id: "${IBM_ACCESS_KEY}"
     secret_access_key: "${IBM_SECRET_KEY}"
     force_path_style: true
-    quota_bytes: 5368709120
-    egress_byte_limit: 5368709120
-    ingress_byte_limit: 5368709120
+    # IBM's Class B is "GET and all others", so deletes and aborts charge
+    # there rather than being free as they are on R2 and GCS.
+    quota_bytes: 5000000000
+    egress_byte_limit: 5000000000
+    request_limits:
+      - name: class_a
+        operations: [PutObject, CopyObject, ListObjects, ListObjectsV2, CreateMultipartUpload, UploadPart, CompleteMultipartUpload]
+        limit: 2000
+      - name: class_b
+        operations: [GetObject, HeadObject, GetParts, DeleteObject, DeleteObjects, AbortMultipartUpload]
+        limit: 20000
 
   - name: "gcp"
     endpoint: "https://storage.googleapis.com"
@@ -351,10 +426,20 @@ backends:
     disable_checksum: true
     unsigned_payload: true
     strip_sdk_headers: true
-    quota_bytes: 5368709120
-    egress_byte_limit: 1073741824
-    ingress_byte_limit: 5368709120
-    api_request_limit: 5000
+    quota_bytes: 5000000000
+    egress_byte_limit: 100000000000  # 100 GB from North America
+    # GCS bills uploads and listings from the Class A allowance, reads from a
+    # far larger Class B one, and does not bill deletes at all. A single
+    # api_request_limit charges all three against the smallest of them, which
+    # takes the backend out of service with its read allowance untouched.
+    unmetered: [DeleteObject, DeleteObjects, AbortMultipartUpload]
+    request_limits:
+      - name: class_a
+        operations: [PutObject, CopyObject, CreateMultipartUpload, UploadPart, CompleteMultipartUpload, ListObjects, ListObjectsV2]
+        limit: 5000
+      - name: class_b
+        operations: [GetObject, HeadObject, GetParts]
+        limit: 50000
 
   # g3 uses Google Drive + Gmail as storage via an S3-compatible proxy.
   # See https://github.com/afreidah/g3 for setup.
@@ -373,6 +458,93 @@ When a backend hits a usage limit, reads fail over to replicas on other backends
 {{% notice tip %}}
 Set limits slightly below the actual free-tier cap to give yourself a safety margin. The orchestrator's adaptive flushing shortens the tracking interval as limits approach, but a small buffer avoids edge cases.
 {{% /notice %}}
+
+## Step 4: Spend Less of Every Allowance
+
+Quotas and usage limits stop you exceeding an allowance. Two further settings reduce what you consume of it in the first place, and on free tiers both are worth more than they are on paid storage.
+
+### Compression: fewer bytes stored and moved
+
+```yaml
+compression:
+  enabled: true
+  level: "default"
+  min_size: 4096
+  min_ratio: 0.95
+```
+
+Objects are stored as chunked zstd, so a backend holds the compressed size and that is what counts against `quota_bytes`. The same reduction applies to every byte crossing the wire, so `ingress_byte_limit` on the write and `egress_byte_limit` on every later read shrink with it. Three allowances for one setting.
+
+How much depends entirely on your data: text, JSON, logs and most documents compress several times over, while media files and anything already compressed do not move at all. Objects below `min_size` are stored verbatim because a seek table costs more than a small object saves, and anything that fails to shrink past `min_ratio` is stored verbatim too — so incompressible data costs you the attempt and nothing else. Range reads stay proportional to the bytes requested rather than the object size, because each chunk is an independently decodable frame.
+
+### Write-placed copies: no read to make a replica
+
+```yaml
+replication:
+  factor: 2
+
+write_path:
+  parallel_copies:
+    enabled: true
+```
+
+With replication on, a second copy has to come from somewhere. By default the replicator makes it by reading the object back off the backend that holds it and writing it to another — which charges the source a **GET and its egress**, then the target a PUT. On a free tier that is exactly the wrong shape: reads are what the small Class A/Class B allowances and the egress caps meter.
+
+`parallel_copies` has the write upload to both backends itself, from bytes it already has in hand. The PUT on the target is unavoidable either way, but the GET and the source egress disappear entirely. For a factor of 2 that removes one read per object from your API budget, and the bytes of every replica from an egress allowance — on IBM's 5 GB/month egress or GCS's 5,000 Class A calls, that is the difference between a working backend and one that goes read-only halfway through the month.
+
+The cost is that both copies are uploaded during the write rather than spread over replicator cycles, so peak write bandwidth roughly doubles. For free-tier setups, where the constraint is a monthly allowance rather than throughput, that is usually the right trade.
+
+{{% notice tip %}}
+Both settings compound: compression shrinks the object, and the write then places the compressed copies without reading anything back. Together they cut what replication costs you on every metered dimension a provider bills.
+{{% /notice %}}
+
+### Cloudflare Bandwidth Alliance: egress the provider stops billing
+
+The two settings above reduce how many bytes you move. This one changes who pays for them.
+
+Backblaze B2, IBM Cloud Object Storage and Oracle Cloud are members of the [Cloudflare Bandwidth Alliance](https://www.cloudflare.com/bandwidth-alliance/), along with Wasabi, DigitalOcean Spaces, Linode, Vultr, Scaleway, Alibaba Cloud OSS and Tencent Cloud COS. Members waive the transfer fee on traffic leaving to Cloudflare. Put a Cloudflare Worker in front of the bucket and every read egresses to Cloudflare rather than to the caller, so the provider bills nothing for it — which turns a metered backend into an unmetered one without changing how the orchestrator addresses it.
+
+On one deployment, routing B2 through a worker moved 1,679 MB out of the backend in a day, of which Backblaze counted 42 MB against the account's egress cap. Without it that single day would have exceeded the free tier's 1 GB/day allowance.
+
+This does nothing for a provider outside the alliance, and nothing for Cloudflare R2, whose egress is already free. It is worth doing on exactly the backends whose egress allowance is the thing that runs out first.
+
+#### Why a CNAME is not enough
+
+Pointing a proxied DNS record at an object store does not work. Cloudflare forwards the caller's `Host`, so the origin sees the proxy hostname instead of its own endpoint — which breaks bucket routing, and because `host` is a signed header under SigV4, invalidates the signature with it. Every request comes back `SignatureDoesNotMatch`.
+
+The worker in [`deploy/cloudflare-worker/`](https://github.com/afreidah/s3-orchestrator/tree/main/deploy/cloudflare-worker) terminates the request instead: it verifies the caller's signature, rewrites `Host` to the native endpoint, and re-signs with the account credential before forwarding.
+
+That means two keypairs, deliberately distinct. The orchestrator holds a **proxy** credential and presents it to the worker. The worker holds the **account** credential and it never leaves the edge. So the orchestrator never stores the real backend keys, and anyone who obtains the proxy credential still cannot reach the bucket directly.
+
+#### Configuring a proxied backend
+
+The backend entry points at the worker hostname and carries the proxy keypair:
+
+```yaml
+backends:
+  - name: "b2"
+    endpoint: "https://b2-proxy.example.com"
+    region: "us-west-004"
+    bucket: "example-bucket"
+    access_key_id: "<PROXY_ACCESS_KEY_ID>"
+    secret_access_key: "<PROXY_SECRET_ACCESS_KEY>"
+    force_path_style: true
+    unsigned_payload: true
+    strip_sdk_headers: true
+
+    quota_bytes: 10737418240
+    api_request_limit: 2500
+```
+
+`strip_sdk_headers: true` is required rather than optional. The Go SDK signs `accept-encoding`, Cloudflare rewrites it in transit, and the worker verifies against what actually arrived — without this every request fails `SignatureDoesNotMatch`.
+
+`unsigned_payload: true` matters for the same class of reason. A client using chunked payload signatures embeds per-chunk signatures derived from its own key, which cannot be re-signed without buffering the whole body, so the worker answers those with `501 Not Implemented` rather than forwarding something the origin will reject. Presigned URLs carry their signature in the query string and take a different verification path; the worker rejects those explicitly too.
+
+{{% notice tip %}}
+Relax the egress budget on a proxied backend, not the request budget. The alliance waives egress and only egress — every GET still counts as a Class B transaction against whatever request allowance the provider gives you. `egress_byte_limit` can come up or come off; `api_request_limit` stays exactly where it was.
+{{% /notice %}}
+
+One worker fronts one backend, so a pool spanning three alliance providers deploys the same script three times under distinct names and routes. Cloudflare's free and Pro plans cap the request body at 100 MB, so keep multipart part size below that.
 
 ## Step 5: Create a Virtual Bucket and Client Credentials
 
@@ -454,18 +626,21 @@ Alternatively, `pack` fills one backend before moving to the next, which can be 
 
 Use the web dashboard or Prometheus metrics to track how close each backend is to its limits:
 
-- **Storage quota**: `s3o_backend_used_bytes` vs `s3o_backend_quota_bytes`
-- **API requests**: `s3o_backend_api_requests_total`
-- **Egress/Ingress**: `s3o_backend_egress_bytes_total` / `s3o_backend_ingress_bytes_total`
+- **Storage quota**: `s3o_quota_bytes_used{backend}` against `s3o_quota_bytes_limit{backend}`, with `s3o_quota_bytes_available{backend}` as the headroom directly
+- **API requests**: `s3o_usage_api_requests{backend}` for the month's total, and `s3o_usage_pool_requests{backend,pool}` against `s3o_usage_pool_limit{backend,pool}` for each request class you declared with `request_limits`
+- **Egress / ingress**: `s3o_usage_egress_bytes{backend}` and `s3o_usage_ingress_bytes{backend}`
+- **Hitting a cap**: `s3o_usage_limit_rejections_total{operation,direction}` counts operations turned away because a backend was out of allowance, and `s3o_quota_claims_declined_total{backend}` counts writes a backend refused for want of space
 
 The dashboard shows per-backend quota bars and monthly usage charts so you can see at a glance how much headroom remains.
+
+The per-class metrics are the ones to watch on providers that meter by class. A backend can be nowhere near its overall request count while its Class A allowance is exhausted — which on GCS, at 5,000 uploads a month against 50,000 reads, is the failure mode you will meet first.
 
 ## Adding More Providers
 
 To expand your pool, add another backend with its own quota and usage limits. No existing configuration needs to change. The orchestrator picks up new backends on configuration reload.
 
 {{% notice tip %}}
-Enable [replication](../../docs/user-guide.md) with a factor of 2 or more so that objects are copied across providers. This gives you redundancy and allows reads to fail over when one backend's usage limits are reached.
+Enable [replication](../../docs/replication/) with a factor of 2 or more so that objects are copied across providers. This gives you redundancy and allows reads to fail over when one backend's usage limits are reached. Remember that it also halves your usable capacity - see the note under Step 1.
 {{% /notice %}}
 
 ## Reduce API Calls with the Object Data Cache

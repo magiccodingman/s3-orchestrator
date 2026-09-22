@@ -10,10 +10,6 @@
 // Range requests.
 // -------------------------------------------------------------------------------
 
-// Package encryption provides envelope encryption for object payloads.
-// It frames plaintext into chunked AES-GCM segments addressable by byte
-// range and supports pluggable key providers (config-embedded, file,
-// and Vault transit).
 package encryption
 
 import (
@@ -47,33 +43,18 @@ type Encryptor struct {
 
 // EncryptResult holds the output of an encryption operation, including the
 // ciphertext stream and metadata to store in the database.
+// BaseNonce is carried out of the header so a later range read can decrypt
+// without fetching the header from the backend first. The plaintext DEK is not
+// among the fields: a caller that needs one across several calls asks for it
+// through GenerateAndWrapDEK and holds it itself, which keeps the key off a
+// struct that flows through the write path.
 type EncryptResult struct {
-	// Body is the ciphertext stream (header + encrypted chunks).
-	Body io.Reader
-
-	// CiphertextSize is the total size of the ciphertext output.
+	Body           io.Reader // ciphertext stream: header plus encrypted chunks
 	CiphertextSize int64
-
-	// WrappedDEK is the encrypted DEK to store in the database.
-	WrappedDEK []byte
-
-	// KeyID identifies which master key wrapped the DEK.
-	KeyID string
-
-	// BaseNonce is the 12-byte nonce embedded in the header, needed for
-	// range-based decryption without fetching the header from the backend.
-	BaseNonce []byte
-
-	// rawDEK is the plaintext DEK used for encryption. Reachable only via
-	// the RawDEK accessor so it does not surface in struct printers,
-	// marshalers, or log lines that walk exported fields.
-	rawDEK []byte
+	WrappedDEK     []byte // the encrypted DEK to store on the row
+	KeyID          string // which master key wrapped it
+	BaseNonce      []byte // the 12-byte nonce embedded in the header
 }
-
-// RawDEK returns the plaintext DEK so the caller can reuse it on retry via
-// EncryptWithDEK, avoiding an extra KeyProvider round-trip. Callers must
-// not persist or log the returned bytes.
-func (r *EncryptResult) RawDEK() []byte { return r.rawDEK }
 
 // -------------------------------------------------------------------------
 // CONSTRUCTOR
@@ -109,9 +90,9 @@ func (e *Encryptor) Provider() KeyProvider { return e.provider }
 // -------------------------------------------------------------------------
 
 // Encrypt generates a random DEK, wraps it with the KeyProvider, and returns
-// a streaming ciphertext reader along with encryption metadata. The plaintext
-// is read from body and its MD5 digest is computed on the fly for ETag
-// generation.
+// a streaming ciphertext reader along with encryption metadata. The object's
+// ETag is not computed here: the write path digests the plaintext during the
+// pass that buffers it, before this layer sees the bytes.
 func (e *Encryptor) Encrypt(ctx context.Context, body io.Reader, plaintextSize int64) (*EncryptResult, error) {
 	// Generate random DEK
 	dek := make([]byte, 32)
@@ -173,7 +154,6 @@ func (e *Encryptor) assembleEncryptResult(body io.Reader, plaintextSize int64, d
 		WrappedDEK:     wrappedDEK,
 		KeyID:          keyID,
 		BaseNonce:      encReader.baseNonce,
-		rawDEK:         dek,
 	}, nil
 }
 

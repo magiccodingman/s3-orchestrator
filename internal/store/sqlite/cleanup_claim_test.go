@@ -1,4 +1,4 @@
-// -----------------------------------------------------------------------------
+// -------------------------------------------------------------------------------
 // SQLite Cleanup Queue Claim Pattern Tests
 //
 // Author: Alex Freidah
@@ -9,7 +9,7 @@
 // of the contract  -  reclaim after grace, atomic complete with orphan_bytes
 // decrement and idempotent re-complete, retry clears claim  -  applies
 // identically and is exercised here.
-// -----------------------------------------------------------------------------
+// -------------------------------------------------------------------------------
 
 package sqlite
 
@@ -192,7 +192,10 @@ func TestSqlite_RetryCleanupItem_ClearsClaim(t *testing.T) {
 	}
 	id := claimed[0].ID
 
-	if err := s.RetryCleanupItem(ctx, id, time.Microsecond, "transient"); err != nil {
+	// A backoff already in the past makes the row unambiguously due, so the
+	// assertion below is about the claim being cleared rather than about
+	// whether SQLite's NOW() advanced past a sub-millisecond retry stamp.
+	if err := s.RetryCleanupItem(ctx, id, -time.Second, "transient"); err != nil {
 		t.Fatalf("RetryCleanupItem: %v", err)
 	}
 

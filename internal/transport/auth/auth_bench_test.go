@@ -14,15 +14,19 @@
 package auth
 
 import (
+	"context"
 	"encoding/hex"
 	"fmt"
-	"context"
 	"net/http"
 	"testing"
 	"time"
 
 	"github.com/afreidah/s3-orchestrator/internal/config"
 )
+
+// -------------------------------------------------------------------------
+// INTERNALS
+// -------------------------------------------------------------------------
 
 // benchSignedRequest constructs a valid SigV4-signed request for benchmarking.
 func benchSignedRequest(accessKey, secret string) *http.Request {
@@ -48,6 +52,10 @@ func benchSignedRequest(accessKey, secret string) *http.Request {
 
 	return r
 }
+
+// -------------------------------------------------------------------------
+// PUBLIC API
+// -------------------------------------------------------------------------
 
 // BenchmarkVerifySigV4 measures the verify sig v4 behaviour described by the test name.
 func BenchmarkVerifySigV4(b *testing.B) {
@@ -98,15 +106,14 @@ func BenchmarkAuthenticateAndResolveBucket(b *testing.B) {
 			{AccessKeyID: accessKey, SecretAccessKey: secret},
 		}},
 	}
-	br := NewBucketRegistry(buckets)
+	br := mustBucketRegistry(b, buckets)
 	r := benchSignedRequest(accessKey, secret)
 
 	b.ResetTimer()
 	for b.Loop() {
-		_, _, _ = br.AuthenticateAndResolveBucket(r)
+		_, _, _ = br.Authenticate(r)
 	}
 }
-
 
 // BenchmarkVerifySigV4_WithQueryParams measures the verify sig v4 with query params path by exercising q.Set, fmt.Sprintf, q.Encode.
 func BenchmarkVerifySigV4_WithQueryParams(b *testing.B) {
@@ -168,6 +175,10 @@ func BenchmarkBuildCanonicalRequest(b *testing.B) {
 	}
 }
 
+// -------------------------------------------------------------------------
+// INTERNALS
+// -------------------------------------------------------------------------
+
 // benchPresignedRequest constructs a valid presigned URL request for benchmarking.
 func benchPresignedRequest(accessKey, secret string) *http.Request {
 	amzDate := time.Now().UTC().Format("20060102T150405Z")
@@ -196,6 +207,10 @@ func benchPresignedRequest(accessKey, secret string) *http.Request {
 	return r
 }
 
+// -------------------------------------------------------------------------
+// PUBLIC API
+// -------------------------------------------------------------------------
+
 // BenchmarkVerifyPresignedSigV4 measures the verify presigned sig v4 path by exercising br.AuthenticateAndResolveBucket.
 func BenchmarkVerifyPresignedSigV4(b *testing.B) {
 	accessKey := "AKIDEXAMPLE"
@@ -206,47 +221,47 @@ func BenchmarkVerifyPresignedSigV4(b *testing.B) {
 			{AccessKeyID: accessKey, SecretAccessKey: secret},
 		}},
 	}
-	br := NewBucketRegistry(buckets)
+	br := mustBucketRegistry(b, buckets)
 	r := benchPresignedRequest(accessKey, secret)
 
 	b.ResetTimer()
 	for b.Loop() {
-		_, _, _ = br.AuthenticateAndResolveBucket(r)
+		_, _, _ = br.Authenticate(r)
 	}
 }
 
-// BenchmarkTokenAuth measures the token auth path by exercising fmt.Sprintf, http.NewRequestWithContext, context.Background.
-func BenchmarkTokenAuth(b *testing.B) {
-	tokens := []struct {
+// BenchmarkSecretAuth measures resolving a keypair presented whole, which is
+// the dashboard's login path.
+//
+// The bucket count is varied because the lookup is a map read and should not
+// depend on it: a result that grows with the fleet would mean the registry had
+// regressed to a scan.
+func BenchmarkSecretAuth(b *testing.B) {
+	for _, tc := range []struct {
 		name  string
 		count int
 	}{
 		{"1_bucket", 1},
 		{"5_buckets", 5},
 		{"20_buckets", 20},
-	}
-
-	for _, tc := range tokens {
+	} {
 		b.Run(tc.name, func(b *testing.B) {
 			buckets := make([]config.BucketConfig, tc.count)
 			for i := range tc.count {
 				buckets[i] = config.BucketConfig{
 					Name: fmt.Sprintf("bucket-%d", i),
 					Credentials: []config.CredentialConfig{{
-						Token: fmt.Sprintf("token-%032d", i),
+						AccessKeyID:     fmt.Sprintf("AKIA%028d", i),
+						SecretAccessKey: fmt.Sprintf("secret-%032d", i),
 					}},
 				}
 			}
-			br := NewBucketRegistry(buckets)
+			br := mustBucketRegistry(b, buckets)
 
-			// Use the last token so the loop iterates all entries
-			lastToken := buckets[tc.count-1].Credentials[0].Token
-			r, _ := http.NewRequestWithContext(context.Background(), "GET", "/bucket/key", nil)
-			r.Header.Set("X-Proxy-Token", lastToken)
-
+			last := buckets[tc.count-1].Credentials[0]
 			b.ResetTimer()
 			for b.Loop() {
-				_, _, _ = br.AuthenticateAndResolveBucket(r)
+				_, _ = br.AuthenticateSecret(last.AccessKeyID, last.SecretAccessKey)
 			}
 		})
 	}
