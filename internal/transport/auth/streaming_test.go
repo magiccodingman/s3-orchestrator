@@ -248,8 +248,9 @@ func TestChunkReader_SignedTrailer_HappyPath(t *testing.T) {
 	}
 }
 
-// TestChunkReader_UnsignedTrailer_HappyPath round-trips an unsigned body
-// with a signed trailer.
+// TestChunkReader_UnsignedTrailer_HappyPath round-trips the AWS unsigned
+// payload form: unsigned chunks followed by a checksum trailer and no
+// x-amz-trailer-signature.
 func TestChunkReader_UnsignedTrailer_HappyPath(t *testing.T) {
 	t.Parallel()
 	payload := []byte("the quick brown fox jumps over the lazy dog")
