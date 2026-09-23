@@ -670,7 +670,7 @@ func newTrailerChecksums(names []string) (map[string]trailerChecksum, error) {
 		case "x-amz-checksum-crc64nvme":
 			checksum = &hashTrailerChecksum{h: crc64.New(crc64.MakeTable(crc64NVMEReversed))}
 		case "x-amz-checksum-sha1":
-			checksum = &hashTrailerChecksum{h: sha1.New()}
+			checksum = &hashTrailerChecksum{h: sha1.New()} //nolint:gosec // S3 checksum algorithm, not authentication
 		case "x-amz-checksum-sha256":
 			checksum = &hashTrailerChecksum{h: sha256.New()}
 		default:
