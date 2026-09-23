@@ -472,11 +472,18 @@ func (r *chunkReader) readTrailerBlock() (string, string, error) {
 	if err != nil {
 		return "", "", err
 	}
+	parsedNames := trailerHeaderNames(headers)
 	if trailerSig == "" {
-		return "", "", ErrTrailerMalformed
+		return "", "", trailerMalformed(
+			"missing %s; declared=%v parsed=%v",
+			trailerSignatureHeader, r.trailerNames, parsedNames,
+		)
 	}
-	if !declaredTrailersPresent(r.trailerNames, headers) {
-		return "", "", ErrTrailerMalformed
+	if missing := missingDeclaredTrailers(r.trailerNames, headers); len(missing) > 0 {
+		return "", "", trailerMalformed(
+			"declared trailer headers missing; declared=%v parsed=%v missing=%v",
+			r.trailerNames, parsedNames, missing,
+		)
 	}
 	return canonicalizeTrailers(headers), trailerSig, nil
 }
@@ -491,11 +498,14 @@ func (r *chunkReader) parseTrailerLines() ([]trailerKV, string, error) {
 	for {
 		line, err := readBoundedLine(r.src, maxHeaderLineBytes)
 		if err != nil {
-			return nil, "", ErrTrailerMalformed
+			return nil, "", trailerMalformed("failed reading trailer line: %v", err)
 		}
 		consumed += len(line) + 2 // +2 for CRLF
 		if consumed > maxTrailerBlockBytes {
-			return nil, "", ErrTrailerMalformed
+			return nil, "", trailerMalformed(
+				"trailer block exceeds %d bytes; parsed=%v",
+				maxTrailerBlockBytes, trailerHeaderNames(headers),
+			)
 		}
 		if line == "" {
 			return headers, trailerSig, nil
@@ -503,7 +513,10 @@ func (r *chunkReader) parseTrailerLines() ([]trailerKV, string, error) {
 		var ok bool
 		headers, trailerSig, ok = appendTrailerLine(line, headers, trailerSig)
 		if !ok {
-			return nil, "", ErrTrailerMalformed
+			return nil, "", trailerMalformed(
+				"invalid trailer header framing; parsed=%v",
+				trailerHeaderNames(headers),
+			)
 		}
 	}
 }
@@ -540,9 +553,27 @@ func splitTrailerLine(line string) (name, value string, ok bool) {
 	return strings.ToLower(strings.TrimSpace(rawName)), strings.TrimSpace(rawValue), true
 }
 
-// declaredTrailersPresent reports whether every trailer name announced
-// by the request's x-amz-trailer header arrived in the trailer block.
-func declaredTrailersPresent(declared []string, headers []trailerKV) bool {
+// trailerMalformed keeps ErrTrailerMalformed discoverable via errors.Is while
+// adding only framing metadata safe for operational logs. It deliberately
+// excludes trailer values, signatures, payload bytes, and request credentials.
+func trailerMalformed(format string, args ...any) error {
+	return fmt.Errorf("%w: %s", ErrTrailerMalformed, fmt.Sprintf(format, args...))
+}
+
+// trailerHeaderNames returns only parsed trailer names. Values can contain
+// checksums and signatures, so diagnostics must never include them.
+func trailerHeaderNames(headers []trailerKV) []string {
+	names := make([]string, 0, len(headers))
+	for _, h := range headers {
+		names = append(names, h.name)
+	}
+	return names
+}
+
+// missingDeclaredTrailers returns the names announced by x-amz-trailer that
+// were absent from the body trailer block.
+func missingDeclaredTrailers(declared []string, headers []trailerKV) []string {
+	var missing []string
 	for _, name := range declared {
 		found := false
 		for _, h := range headers {
@@ -552,10 +583,10 @@ func declaredTrailersPresent(declared []string, headers []trailerKV) bool {
 			}
 		}
 		if !found {
-			return false
+			missing = append(missing, name)
 		}
 	}
-	return true
+	return missing
 }
 
 // canonicalizeTrailers sorts headers by name and renders them as
