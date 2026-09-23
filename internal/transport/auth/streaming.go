@@ -76,7 +76,7 @@ const emptyStringSHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca4959
 const trailerSignatureHeader = "x-amz-trailer-signature"
 
 // crc64NVMEReversed is the reflected CRC-64/NVME polynomial expected by
-// hash/crc64. CRC-64/NVME uses an all-ones initial value and final xor.
+// hash/crc64.
 const crc64NVMEReversed = 0x9a6c9329ac4bc9b5
 
 // -------------------------------------------------------------------------
@@ -658,28 +658,6 @@ func (c *crc32TrailerChecksum) SumBase64() string {
 	return base64.StdEncoding.EncodeToString(out[:])
 }
 
-type crc64NVMEChecksum struct {
-	table *crc64.Table
-	crc   uint64
-}
-
-func newCRC64NVMEChecksum() *crc64NVMEChecksum {
-	return &crc64NVMEChecksum{
-		table: crc64.MakeTable(crc64NVMEReversed),
-		crc:   ^uint64(0),
-	}
-}
-
-func (c *crc64NVMEChecksum) Write(p []byte) {
-	c.crc = crc64.Update(c.crc, c.table, p)
-}
-
-func (c *crc64NVMEChecksum) SumBase64() string {
-	var out [8]byte
-	binary.BigEndian.PutUint64(out[:], c.crc^uint64(^uint64(0)))
-	return base64.StdEncoding.EncodeToString(out[:])
-}
-
 func newTrailerChecksums(names []string) (map[string]trailerChecksum, error) {
 	checksums := make(map[string]trailerChecksum, len(names))
 	for _, name := range names {
@@ -690,7 +668,7 @@ func newTrailerChecksums(names []string) (map[string]trailerChecksum, error) {
 		case "x-amz-checksum-crc32c":
 			checksum = &crc32TrailerChecksum{h: crc32.New(crc32.MakeTable(crc32.Castagnoli))}
 		case "x-amz-checksum-crc64nvme":
-			checksum = newCRC64NVMEChecksum()
+			checksum = &hashTrailerChecksum{h: crc64.New(crc64.MakeTable(crc64NVMEReversed))}
 		case "x-amz-checksum-sha1":
 			checksum = &hashTrailerChecksum{h: sha1.New()}
 		case "x-amz-checksum-sha256":
