@@ -643,6 +643,33 @@ func TestChunkReader_TrailerVariants_RejectMissingSignature(t *testing.T) {
 	if !errors.Is(err, ErrTrailerMalformed) {
 		t.Errorf("err = %v, want ErrTrailerMalformed", err)
 	}
+	if err == nil || !strings.Contains(err.Error(), "missing x-amz-trailer-signature") {
+		t.Errorf("err = %v, want safe missing-signature diagnostic", err)
+	}
+	if err != nil && strings.Contains(err.Error(), "AAAAAA==") {
+		t.Errorf("diagnostic leaked trailer value: %v", err)
+	}
+}
+
+// TestChunkReader_TrailerDiagnosticsMissingDeclaredHeader verifies malformed
+// trailer diagnostics identify names only, while preserving ErrTrailerMalformed.
+func TestChunkReader_TrailerDiagnosticsMissingDeclaredHeader(t *testing.T) {
+	t.Parallel()
+	f := newFixture(StreamingUnsignedTrailer).withTrailers(map[string]string{
+		"x-amz-checksum-crc32": "AAAAAA==",
+	})
+	body := f.buildBody([]byte("xx"), 8)
+	body = removeTrailerHeader(t, body, "x-amz-checksum-crc32")
+	_, err := readAllFromBytes(t, body, f.material(2))
+	if !errors.Is(err, ErrTrailerMalformed) {
+		t.Errorf("err = %v, want ErrTrailerMalformed", err)
+	}
+	if err == nil || !strings.Contains(err.Error(), "missing=[x-amz-checksum-crc32]") {
+		t.Errorf("err = %v, want missing trailer name diagnostic", err)
+	}
+	if err != nil && strings.Contains(err.Error(), "AAAAAA==") {
+		t.Errorf("diagnostic leaked trailer value: %v", err)
+	}
 }
 
 // -------------------------------------------------------------------------
@@ -679,6 +706,22 @@ func removeTrailerSignature(t *testing.T, body []byte) []byte {
 	end := bytes.Index(body[start:], []byte("\r\n"))
 	if end < 0 {
 		t.Fatalf("removeTrailerSignature: line terminator not found")
+	}
+	return append(body[:start], body[start+end+2:]...)
+}
+
+// removeTrailerHeader strips one named trailer line while leaving the trailer
+// signature in place, so readTrailerBlock reaches declared-header validation.
+func removeTrailerHeader(t *testing.T, body []byte, name string) []byte {
+	t.Helper()
+	marker := []byte(strings.ToLower(name) + ":")
+	start := bytes.Index(body, marker)
+	if start < 0 {
+		t.Fatalf("removeTrailerHeader: marker %q not found", name)
+	}
+	end := bytes.Index(body[start:], []byte("\r\n"))
+	if end < 0 {
+		t.Fatalf("removeTrailerHeader: line terminator not found")
 	}
 	return append(body[:start], body[start+end+2:]...)
 }
